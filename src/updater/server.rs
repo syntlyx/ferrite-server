@@ -61,6 +61,11 @@ pub async fn apply(info: &UpdateInfo) -> Result<()> {
     let url = info.download_url.clone();
     let version = info.version.clone();
     let expected_sha256 = info.sha256.clone();
+    let current_exe = std::env::current_exe()?;
+    let checksum_path = checksum_path_for(&current_exe);
+
+    preflight_update_target(&current_exe)?;
+
     tracing::info!("downloading server update v{}", version);
 
     let bytes = with_release_auth(HTTP_CLIENT.get(&url))
@@ -77,9 +82,6 @@ pub async fn apply(info: &UpdateInfo) -> Result<()> {
     if let Some(expected) = &expected_sha256 {
         checksum::verify_bytes_sha256(&bytes, expected, "server update archive")?;
     }
-
-    let current_exe = std::env::current_exe()?;
-    let checksum_path = checksum_path_for(&current_exe);
 
     tokio::task::spawn_blocking(move || -> Result<()> {
         let tmp = current_exe.with_extension("update.tmp");
@@ -105,7 +107,7 @@ pub async fn apply(info: &UpdateInfo) -> Result<()> {
             if path.file_name().and_then(|n| n.to_str()) == Some("ferrite") {
                 entry
                     .unpack(&tmp)
-                    .map_err(|e| FeriteError::Internal(format!("unpack: {e}")))?;
+                    .map_err(|e| FeriteError::Update(format!("failed to unpack ferrite: {e}")))?;
                 found = true;
                 break;
             }
@@ -125,7 +127,9 @@ pub async fn apply(info: &UpdateInfo) -> Result<()> {
 
         // Atomic rename over the running binary (safe on Linux/macOS: the old
         // inode stays mapped until the process exits).
-        std::fs::rename(&tmp, &current_exe)?;
+        std::fs::rename(&tmp, &current_exe).map_err(|e| {
+            FeriteError::Update(format!("failed to replace {}: {e}", current_exe.display()))
+        })?;
 
         Ok(())
     })
@@ -151,6 +155,32 @@ fn checksum_path_for(current_exe: &Path) -> PathBuf {
     current_exe.with_extension("sha256")
 }
 
+fn preflight_update_target(current_exe: &Path) -> Result<()> {
+    let parent = current_exe.parent().ok_or_else(|| {
+        FeriteError::Update(format!(
+            "cannot determine parent directory for {}",
+            current_exe.display()
+        ))
+    })?;
+    let probe = parent.join(format!(".ferrite-update-probe-{}", std::process::id()));
+
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(file) => {
+            drop(file);
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(e) => Err(FeriteError::Update(format!(
+            "server self-update cannot write to {} ({e}). Install ferrite with a writable service binary path or rerun the installer as root.",
+            current_exe.display()
+        ))),
+    }
+}
+
 fn current_platform_target() -> &'static str {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     return "x86_64-unknown-linux-musl";
@@ -162,4 +192,36 @@ fn current_platform_target() -> &'static str {
     return "aarch64-apple-darwin";
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     return "unknown";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_preflight_allows_writable_executable_directory() {
+        let path = crate::test_support::temp_path("server-update-writable", "bin");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        preflight_update_target(&path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_preflight_reports_unwritable_executable_directory_as_update_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::test_support::temp_path("server-update-readonly", "dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let path = dir.join("ferrite");
+
+        let err = preflight_update_target(&path).unwrap_err();
+
+        assert!(matches!(err, FeriteError::Update(_)));
+        assert!(err.to_string().contains("server self-update cannot write"));
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

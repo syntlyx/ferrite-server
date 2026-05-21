@@ -20,6 +20,7 @@ GITHUB_REPO_SERVER="${GITHUB_REPO_SERVER:-ferrite-server}"
 GITHUB_REPO_WEB="${GITHUB_REPO_WEB:-ferrite-web}"
 
 BIN_DIR="/usr/local/bin"
+SYSTEMD_BIN_DIR="/usr/local/lib/ferrite/bin"
 CONFIG_DIR="/etc/ferrite"
 DATA_DIR="/var/lib/ferrite"
 WEB_PARENT="/usr/share/ferrite"
@@ -98,6 +99,14 @@ detect_init_system() {
 }
 INIT_SYSTEM=$(detect_init_system)
 
+if [ "$OS" = "linux" ] && [ "$INIT_SYSTEM" = "systemd" ]; then
+    SERVICE_BIN_DIR="$SYSTEMD_BIN_DIR"
+else
+    SERVICE_BIN_DIR="$BIN_DIR"
+fi
+SERVICE_BIN="${SERVICE_BIN_DIR}/ferrite"
+PUBLIC_BIN="${BIN_DIR}/ferrite"
+
 # ── Release helpers ───────────────────────────────────────────────────────────
 
 release_token() {
@@ -174,7 +183,9 @@ release_asset_field() {
 }
 
 release_tag() {
-    printf '%s' "$1" | grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/[^"]*"\([^"]*\)".*/\1/'
+    printf '%s' "$1" \
+        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        | head -1
 }
 
 download_asset() {
@@ -221,6 +232,8 @@ verify_download_sha256() {
 install_server() {
     bold "Installing ferrite server..."
 
+    mkdir -p "$SERVICE_BIN_DIR" "$BIN_DIR"
+
     json=$(release_latest "$GITHUB_REPO_SERVER") \
         || die "Failed to fetch release info from GitHub. Check your network and release assets."
 
@@ -259,20 +272,30 @@ install_server() {
         tar -xzf "$tmp" -C "$tmp_dir"
         bin_path=$(find "$tmp_dir" -name 'ferrite' -type f | head -1)
         [ -n "$bin_path" ] || die "Could not find 'ferrite' binary in the release archive."
-        install -m 755 "$bin_path" "${BIN_DIR}/ferrite"
+        install -m 755 "$bin_path" "$SERVICE_BIN"
         rm -rf "$tmp_dir" "$tmp"
     else
-        install -m 755 "$tmp" "${BIN_DIR}/ferrite"
+        install -m 755 "$tmp" "$SERVICE_BIN"
         rm -f "$tmp"
     fi
 
-    if [ -n "$expected_sha" ]; then
-        printf '%s\n' "$expected_sha" > "${BIN_DIR}/ferrite.sha256"
-    else
-        rm -f "${BIN_DIR}/ferrite.sha256"
+    if [ "$SERVICE_BIN" != "$PUBLIC_BIN" ]; then
+        ln -sfn "$SERVICE_BIN" "$PUBLIC_BIN"
     fi
 
-    ok "Installed ferrite ${version} → ${BIN_DIR}/ferrite"
+    if [ -n "$expected_sha" ]; then
+        printf '%s\n' "$expected_sha" > "${SERVICE_BIN}.sha256"
+        if [ "$SERVICE_BIN" != "$PUBLIC_BIN" ]; then
+            ln -sfn "${SERVICE_BIN}.sha256" "${PUBLIC_BIN}.sha256"
+        fi
+    else
+        rm -f "${SERVICE_BIN}.sha256" "${PUBLIC_BIN}.sha256"
+    fi
+
+    ok "Installed ferrite ${version} → ${SERVICE_BIN}"
+    if [ "$SERVICE_BIN" != "$PUBLIC_BIN" ]; then
+        ok "CLI link: ${PUBLIC_BIN} → ${SERVICE_BIN}"
+    fi
 }
 
 # ── Install web UI ────────────────────────────────────────────────────────────
@@ -363,6 +386,23 @@ service_owner() {
     fi
 }
 
+configured_api_port() {
+    awk '
+        /^\[api\]/ { in_api = 1; next }
+        /^\[/ { in_api = 0 }
+        in_api && /^[[:space:]]*bind_addr[[:space:]]*=/ {
+            value = $0
+            sub(/^[^"]*"/, "", value)
+            sub(/".*$/, "", value)
+            sub(/^.*:/, "", value)
+            if (value ~ /^[0-9]+$/) {
+                print value
+                exit
+            }
+        }
+    ' "${CONFIG_DIR}/config.toml"
+}
+
 create_user() {
     if [ "$OS" = "linux" ]; then
         ensure_linux_group
@@ -404,7 +444,7 @@ create_user() {
 install_dirs_and_config() {
     bold "Setting up directories and config..."
 
-    mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$WEB_PARENT" "$WEB_DIR"
+    mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$WEB_PARENT" "$WEB_DIR" "$SERVICE_BIN_DIR"
 
     if [ -f "${CONFIG_DIR}/config.toml" ]; then
         ok "Config already exists at ${CONFIG_DIR}/config.toml — skipping (not overwritten)"
@@ -456,6 +496,11 @@ EOF
     chown -R "$(service_owner)" "$CONFIG_DIR" "$DATA_DIR" "$WEB_PARENT" 2>/dev/null || true
     chmod 750 "$CONFIG_DIR" "$DATA_DIR" "$WEB_PARENT" "$WEB_DIR"
     chmod 640 "${CONFIG_DIR}/config.toml"
+
+    if [ "$SERVICE_BIN_DIR" != "$BIN_DIR" ]; then
+        chown -R "$(service_owner)" "$SERVICE_BIN_DIR" 2>/dev/null || true
+        chmod 755 "$SERVICE_BIN_DIR"
+    fi
 }
 
 # ── systemd-resolved conflict (Debian/Ubuntu) ────────────────────────────────
@@ -498,8 +543,8 @@ Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_GROUP}
 
-ExecStart=${BIN_DIR}/ferrite
-Restart=on-failure
+ExecStart=${SERVICE_BIN}
+Restart=always
 RestartSec=5
 TimeoutStopSec=30
 
@@ -512,7 +557,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=${DATA_DIR} ${CONFIG_DIR} ${WEB_PARENT}
+ReadWritePaths=${DATA_DIR} ${CONFIG_DIR} ${WEB_PARENT} ${SERVICE_BIN_DIR}
 RuntimeDirectory=ferrite
 
 StandardOutput=journal
@@ -541,7 +586,7 @@ install_openrc() {
 
 name="ferrite"
 description="Ferrite DNS ad-blocker"
-command="${BIN_DIR}/ferrite"
+command="${SERVICE_BIN}"
 command_user="${SERVICE_USER}:${SERVICE_GROUP}"
 command_background=yes
 pidfile="/run/\${RC_SVCNAME}.pid"
@@ -556,11 +601,11 @@ EOF
 
     # Grant port 53 binding capability without running as root.
     if command -v setcap >/dev/null 2>&1; then
-        setcap cap_net_bind_service=+ep "${BIN_DIR}/ferrite"
+        setcap cap_net_bind_service=+ep "$SERVICE_BIN"
         ok "setcap: ferrite can bind port 53 as '${SERVICE_USER}'"
     else
         warn "setcap not found — ferrite may not be able to bind port 53 as '${SERVICE_USER}'."
-        warn "Fix: apk add libcap && setcap cap_net_bind_service=+ep ${BIN_DIR}/ferrite"
+        warn "Fix: apk add libcap && setcap cap_net_bind_service=+ep ${SERVICE_BIN}"
     fi
 
     rc-update add ferrite default
@@ -584,7 +629,7 @@ install_launchd() {
     <string>com.syntlyx.ferrite</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${BIN_DIR}/ferrite</string>
+        <string>${SERVICE_BIN}</string>
     </array>
     <key>UserName</key>
     <string>${SERVICE_USER}</string>
@@ -672,7 +717,7 @@ start_service() {
                 fi
                 ;;
             *)
-                warn "Unknown init system. Start manually: ${BIN_DIR}/ferrite"
+                warn "Unknown init system. Start manually: ${SERVICE_BIN}"
                 ;;
         esac
 
@@ -705,7 +750,7 @@ main() {
             case "$INIT_SYSTEM" in
                 systemd) install_systemd ;;
                 openrc)  install_openrc  ;;
-                *)       warn "Unknown init system — skipping service setup. Start manually: ${BIN_DIR}/ferrite" ;;
+                *)       warn "Unknown init system — skipping service setup. Start manually: ${SERVICE_BIN}" ;;
             esac
             ;;
         darwin)
@@ -724,34 +769,35 @@ main() {
         lan_ip=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || printf "localhost")
     fi
     lan_ip="${lan_ip:-localhost}"
+    api_port=$(configured_api_port)
+    api_port="${api_port:-80}"
 
     echo
     bold "  ✓ Installation complete!"
     echo
     printf "  Config:    %s/config.toml\n" "$CONFIG_DIR"
     printf "  Database:  %s/ferrite.db\n"  "$DATA_DIR"
-    printf "  Web UI:    http://%s:8080\n" "$lan_ip"
+    printf "  Web UI:    http://%s:%s\n" "$lan_ip" "$api_port"
     echo
     printf "  Next steps:\n"
     printf "    1. Point your router's DNS to %s\n" "$lan_ip"
     printf "    2. Run 'ferrite setup' to auto-detect your local network zones\n"
     printf "    3. Run 'ferrite passwd' to set a web UI password\n"
     echo
-    if [ "$OS" = "linux" ]; then
-        printf "  Service commands:\n"
-        case "$INIT_SYSTEM" in
-            systemd)
-                printf "    systemctl status ferrite\n"
-                printf "    journalctl -u ferrite -f\n"
-                printf "    systemctl restart ferrite\n"
-                ;;
-            openrc)
-                printf "    rc-service ferrite status\n"
-                printf "    tail -f /var/log/ferrite.log\n"
-                printf "    rc-service ferrite restart\n"
-                ;;
-        esac
-    fi
+    case "$INIT_SYSTEM" in
+        systemd)
+            printf "  Service commands:\n"
+            printf "    systemctl status ferrite\n"
+            printf "    journalctl -u ferrite -f\n"
+            printf "    systemctl restart ferrite\n"
+            ;;
+        openrc)
+            printf "  Service commands:\n"
+            printf "    rc-service ferrite status\n"
+            printf "    tail -f /var/log/ferrite.log\n"
+            printf "    rc-service ferrite restart\n"
+            ;;
+    esac
     echo
 }
 

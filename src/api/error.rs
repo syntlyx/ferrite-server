@@ -29,6 +29,7 @@ impl IntoResponse for ApiError {
             FeriteError::Unauthorized => (StatusCode::UNAUTHORIZED, self.0.to_string()),
             FeriteError::Config(_) => (StatusCode::BAD_REQUEST, self.0.to_string()),
             FeriteError::NotFound(_) => (StatusCode::NOT_FOUND, self.0.to_string()),
+            FeriteError::Update(_) => (StatusCode::CONFLICT, self.0.to_string()),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string()),
         };
 

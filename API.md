@@ -881,10 +881,26 @@ Queries GitHub releases for both the server binary (`syntlyx/ferrite-server`) an
 
 ### `POST /api/update/server` — apply server update
 
-Downloads and replaces the running binary. The process supervisor will restart the server automatically if configured, otherwise restart manually.
+Downloads and replaces the running binary. After a successful update, ferrite
+saves a warm-restart snapshot, exits after the response is sent, and expects the
+process supervisor to start the new binary.
+
+On systemd installs, `install.sh` uses
+`/usr/local/lib/ferrite/bin/ferrite` as the service binary and
+`/usr/local/bin/ferrite` as a CLI link. The service binary directory is writable
+by the `ferrite` service user and listed in the unit `ReadWritePaths`, so web UI
+server updates can apply in place. Other install layouts must make the current
+executable directory writable by the running service user, or update the server
+by rerunning the installer with sudo/root.
 
 ```json
-{ "status": "updated", "version": "0.2.0", "sha256": "6a9f..." }
+{
+  "status": "updated",
+  "version": "0.2.0",
+  "sha256": "6a9f...",
+  "restart_required": true,
+  "note": "server is restarting to apply the update"
+}
 ```
 
 ### `POST /api/update/web` — apply web UI update

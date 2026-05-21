@@ -36,7 +36,21 @@ Requires Rust 1.88+. Key dependencies: `tokio`, `axum`, `hickory-resolver`, `fst
 
 ## Testing
 
-The server test gate and coverage backlog live in [TESTING.md](TESTING.md).
+Fast local gate:
+
+```bash
+cargo fmt --all -- --check
+cargo check --locked
+cargo check --locked --features storage-redis
+cargo test --all --locked
+cargo test --all --all-features --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo audit --deny warnings
+sh -n install.sh
+shellcheck install.sh
+git diff --check
+```
 
 ## Configuration
 
@@ -190,6 +204,26 @@ Or set it permanently in the config file:
 ```toml
 # Top-level setting.
 web_dir = "/path/to/ferrite-ui/dist"
+```
+
+## Updates
+
+`POST /api/update/web` can update the web UI in place because the installed web
+directory is writable by the `ferrite` service user.
+
+On systemd installs, `install.sh` runs ferrite from
+`/usr/local/lib/ferrite/bin/ferrite` and leaves `/usr/local/bin/ferrite` as a CLI
+link. That service binary is writable by the `ferrite` service user, so
+`POST /api/update/server` can replace it from the web UI. After a successful
+server update, ferrite exits and systemd restarts it on the new binary.
+
+If ferrite is installed from source, on OpenRC/macOS, or with a root-owned
+binary path, server self-update needs the executable directory to be writable by
+the running service user. Otherwise update the server by rerunning the installer
+with sudo/root:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/syntlyx/ferrite-server/main/install.sh | sudo sh
 ```
 
 ## Authentication

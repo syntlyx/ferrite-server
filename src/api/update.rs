@@ -53,7 +53,7 @@ pub async fn check_update(State(state): State<AppState>) -> Result<Json<Value>, 
 }
 
 /// POST /api/update/server — download and replace the server binary
-pub async fn update_server(State(_state): State<AppState>) -> Result<Json<Value>, ApiError> {
+pub async fn update_server(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let current = env!("CARGO_PKG_VERSION");
 
     let info = updater::server::check(current).await?;
@@ -66,14 +66,27 @@ pub async fn update_server(State(_state): State<AppState>) -> Result<Json<Value>
         Some(info) => {
             let version = info.version.clone();
             updater::server::apply(&info).await?;
+            restart_after_response(state);
             Ok(Json(json!({
                 "status": "updated",
                 "version": version,
                 "sha256": info.sha256,
-                "note": "restart the process to apply the update",
+                "restart_required": true,
+                "note": "server is restarting to apply the update",
             })))
         }
     }
+}
+
+fn restart_after_response(state: AppState) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let path = state.inner.snapshot_path.clone();
+        if let Err(e) = crate::snapshot::save::save(&state, &path) {
+            tracing::error!("snapshot save before server update restart failed: {}", e);
+        }
+        std::process::exit(0);
+    });
 }
 
 /// POST /api/update/web — download and replace the web UI assets
