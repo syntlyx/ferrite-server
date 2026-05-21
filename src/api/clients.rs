@@ -1,0 +1,242 @@
+use std::collections::HashMap;
+
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    Json,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::api::ApiError;
+use crate::app::AppState;
+use crate::clients::{format_mac, parse_ip, parse_mac, ClientRegistry};
+
+#[derive(Deserialize, Default)]
+pub struct ListClientsParams {
+    pub limit: Option<usize>,
+}
+
+/// Aggregated stats per logical client (one entry per resolved name).
+#[derive(Serialize)]
+struct ClientGroup {
+    name: String,
+    ips: Vec<String>,
+    macs: Vec<String>,
+    total: u64,
+    blocked: u64,
+    last_seen: i64,
+    /// `true` if the name came from a manual alias; `false` if from PTR.
+    is_alias: bool,
+}
+
+/// GET /api/clients
+///
+/// Returns clients grouped by resolved hostname (PTR or alias).
+/// IPv4 and IPv6 addresses belonging to the same host are merged into one entry.
+pub async fn list_clients(
+    State(state): State<AppState>,
+    Query(params): Query<ListClientsParams>,
+) -> Result<Json<Value>, ApiError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let from = now - 86400;
+    let limit = params.limit.unwrap_or(50).min(500);
+
+    // Fetch more raw IPs than the final limit because merging may reduce count.
+    let ip_stats = state
+        .inner
+        .storage
+        .top_clients(from, now, limit * 4)
+        .await?;
+
+    // Group by resolved name.
+    let mut groups: HashMap<String, ClientGroup> = HashMap::new();
+
+    for stat in &ip_stats {
+        let ip = match parse_ip(&stat.client_ip) {
+            Some(ip) => ip,
+            None => continue,
+        };
+
+        // Trigger background PTR resolution for IPs not yet in cache.
+        ClientRegistry::trigger_resolve(&state.inner.client_registry, ip);
+
+        let resolved_name = state.inner.client_registry.get_name(ip);
+        let name = resolved_name
+            .clone()
+            .unwrap_or_else(|| stat.client_ip.clone());
+        let mac = state.inner.client_registry.get_mac(ip);
+        let is_alias = state.inner.client_registry.is_aliased(ip);
+
+        let group = groups.entry(name.clone()).or_insert_with(|| ClientGroup {
+            name,
+            ips: vec![],
+            macs: vec![],
+            total: 0,
+            blocked: 0,
+            last_seen: 0,
+            is_alias,
+        });
+        group.ips.push(stat.client_ip.clone());
+        if let Some(mac) = mac {
+            if !group.macs.iter().any(|m| m == &mac) {
+                group.macs.push(mac);
+            }
+        }
+        group.total += stat.total;
+        group.blocked += stat.blocked;
+        group.last_seen = group.last_seen.max(stat.last_seen);
+        // An entry is an alias if *any* of its IPs has a manual alias.
+        if is_alias {
+            group.is_alias = true;
+        }
+    }
+
+    let mut clients: Vec<ClientGroup> = groups.into_values().collect();
+    clients.sort_by_key(|b| std::cmp::Reverse(b.total));
+    clients.truncate(limit);
+
+    Ok(Json(json!({ "clients": clients })))
+}
+
+// ── Alias management ─────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct AliasPayload {
+    pub ip: Option<String>,
+    pub mac: Option<String>,
+    pub name: String,
+}
+
+/// GET /api/clients/aliases
+pub async fn list_aliases(State(state): State<AppState>) -> Json<Value> {
+    let aliases: Vec<Value> = state
+        .inner
+        .client_registry
+        .list_aliases()
+        .into_iter()
+        .map(|(key, key_type, name)| {
+            if key_type == "mac" {
+                json!({ "mac": key, "name": name, "type": "mac" })
+            } else {
+                json!({ "ip": key, "name": name, "type": "ip" })
+            }
+        })
+        .collect();
+    Json(json!({ "aliases": aliases }))
+}
+
+/// POST /api/clients/aliases — add or update a manual alias
+pub async fn add_alias(
+    State(state): State<AppState>,
+    Json(payload): Json<AliasPayload>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let name = payload.name.trim().to_string();
+    if name.is_empty() {
+        return Err(ApiError(crate::error::FeriteError::Config(
+            "name must not be empty".into(),
+        )));
+    }
+
+    match (payload.ip, payload.mac) {
+        (Some(ip_str), None) => {
+            let ip = parse_ip(&ip_str)
+                .ok_or_else(|| crate::error::FeriteError::Config(format!("invalid IP: {}", ip_str)))
+                .map_err(ApiError)?;
+            state
+                .inner
+                .client_registry
+                .add_ip_alias(ip, name.clone())
+                .await?;
+            tracing::info!("IP alias set: {} → {}", ip, name);
+            Ok((
+                StatusCode::CREATED,
+                Json(json!({ "ip": ip.to_string(), "name": name, "type": "ip" })),
+            ))
+        }
+        (None, Some(mac_str)) => {
+            let mac = parse_mac(&mac_str)
+                .ok_or_else(|| {
+                    crate::error::FeriteError::Config(format!("invalid MAC: {}", mac_str))
+                })
+                .map_err(ApiError)?;
+            state
+                .inner
+                .client_registry
+                .add_mac_alias(mac, name.clone())
+                .await?;
+            tracing::info!("MAC alias set: {} → {}", mac_str, name);
+            Ok((
+                StatusCode::CREATED,
+                Json(json!({ "mac": format_mac(&mac), "name": name, "type": "mac" })),
+            ))
+        }
+        _ => Err(ApiError(crate::error::FeriteError::Config(
+            "provide exactly one of 'ip' or 'mac'".into(),
+        ))),
+    }
+}
+
+/// GET /api/clients/:ip/stats — per-client query stats
+pub async fn client_ip_stats(
+    State(state): State<AppState>,
+    Path(ip): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let stats = state
+        .inner
+        .storage
+        .client_stats(&ip)
+        .await?
+        .ok_or_else(|| {
+            ApiError(crate::error::FeriteError::NotFound(format!(
+                "client '{}' not found",
+                ip
+            )))
+        })?;
+
+    let parsed = parse_ip(&ip);
+    if let Some(addr) = parsed {
+        ClientRegistry::trigger_resolve(&state.inner.client_registry, addr);
+    }
+    let name = parsed.and_then(|addr| state.inner.client_registry.get_name(addr));
+    let mac = parsed.and_then(|addr| state.inner.client_registry.get_mac(addr));
+
+    Ok(Json(json!({
+        "client_ip": stats.client_ip,
+        "name": name,
+        "mac": mac,
+        "total": stats.total,
+        "blocked": stats.blocked,
+        "last_seen": stats.last_seen,
+    })))
+}
+
+/// DELETE /api/clients/aliases/:key — remove a manual alias (IP or MAC)
+pub async fn remove_alias(
+    State(state): State<AppState>,
+    Path(key_str): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    // Try parsing as MAC first, then as IP.
+    if let Some(mac) = parse_mac(&key_str) {
+        state.inner.client_registry.remove_mac_alias(mac).await?;
+        tracing::info!("MAC alias removed: {}", format_mac(&mac));
+        return Ok(Json(
+            json!({ "mac": format_mac(&mac), "status": "removed" }),
+        ));
+    }
+
+    if let Some(ip) = parse_ip(&key_str) {
+        state.inner.client_registry.remove_ip_alias(ip).await?;
+        tracing::info!("IP alias removed: {}", ip);
+        return Ok(Json(json!({ "ip": ip.to_string(), "status": "removed" })));
+    }
+
+    Err(ApiError(crate::error::FeriteError::Config(format!(
+        "'{}' is neither a valid IP nor a MAC address",
+        key_str
+    ))))
+}

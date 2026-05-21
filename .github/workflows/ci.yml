@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-cargo-
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.1
+
+      - name: cargo audit
+        run: cargo audit --deny warnings
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo clippy (all features)
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all --locked
+
+      - name: cargo test (all features)
+        run: cargo test --all --all-features --locked

@@ -1,0 +1,190 @@
+# ferrite configuration example
+# Copy to ~/.config/ferrite/config.toml  (macOS and Linux)
+# or   /etc/ferrite/config.toml          (system-wide, needs root)
+#
+# Quick start for local networks:
+#
+#   ferrite setup
+#
+# This command detects your gateway, subnet, and local search domain, then
+# writes the correct [[zones]] entries automatically.  Edit the rest as needed.
+
+# Override where static web UI files are served from (dev only).
+# This is a top-level setting, not part of [api].
+# web_dir = "/home/user/ferrite-ui/dist"
+
+
+# ── DNS server ────────────────────────────────────────────────────────────────
+
+[dns]
+# Interface and port to listen on (UDP + TCP).
+# Needs root / CAP_NET_BIND_SERVICE for port 53.
+bind_addr = "0.0.0.0:53"
+
+# DNS response cache.
+cache_size = 10000
+
+# Clamp upstream TTLs to this range (seconds).
+min_ttl = 60
+max_ttl = 3600
+
+# Domains to suppress from the query log entirely (still resolved normally).
+# Exact names or wildcard suffixes. Useful for noisy local/private zones.
+# `fe.te` is ferrite's built-in panel domain and is ignored by default.
+# log_ignore = ["fe.te", "*.test", "*.local", "*.lan"]
+
+
+# ── Default upstream resolvers ────────────────────────────────────────────────
+# Queries not matched by any [[zones]] entry go here.
+# ferrite tries upstreams round-robin, failing over on error.
+
+# Plain UDP/TCP (fastest, no encryption)
+[[upstream]]
+type    = "plain"
+address = "1.1.1.1"
+port    = 53
+
+[[upstream]]
+type    = "plain"
+address = "1.0.0.1"
+port    = 53
+
+# DNS-over-HTTPS (recommended — encrypted, no ISP snooping)
+# [[upstream]]
+# type         = "https"
+# url          = "https://cloudflare-dns.com/dns-query"
+# bootstrap_ip = "1.1.1.1"   # skip DNS for the resolver's own hostname
+
+# DNS-over-TLS
+# [[upstream]]
+# type     = "tls"
+# address  = "1.1.1.1"
+# port     = 853
+# tls_name = "cloudflare-dns.com"
+
+# DNS-over-QUIC
+# [[upstream]]
+# type     = "quic"
+# address  = "94.140.14.14"
+# port     = 853
+# tls_name = "dns.adguard-dns.com"
+
+
+# ── Zone routing (conditional forwarding) ─────────────────────────────────────
+# Route specific DNS zones to a dedicated upstream instead of the default pool.
+#
+#   ferrite setup   ← auto-detects and writes these for you
+#
+# Zones are matched by suffix; the longest (most specific) match wins.
+# Zone upstreams are plain UDP/TCP only.
+#
+# Why this matters:
+#   PTR queries for 192.168.x.x never resolve on public DNS — only your
+#   router knows those names.  Without zones, the client list in the UI
+#   shows raw IP addresses instead of hostnames.
+#
+# Typical home setup — adjust addresses to match your network:
+
+# [[zones]]
+# name     = "1.168.192.in-addr.arpa"   # PTR for 192.168.1.0/24
+# upstream = "192.168.1.1:53"
+
+# [[zones]]
+# name     = "localdomain"              # hostname.localdomain
+# upstream = "192.168.1.1:53"
+
+# [[zones]]
+# name     = "lan"                      # hostname.lan
+# upstream = "192.168.1.1:53"
+
+# IPv6 ULA reverse zone (replace with your actual prefix):
+# [[zones]]
+# name     = "b.a.1.1.b.0.0.0.0.4.f.2.0.1.a.2.ip6.arpa"
+# upstream = "192.168.1.1:53"
+
+# Other subnets:
+# [[zones]]
+# name     = "0.10.in-addr.arpa"        # PTR for 10.0.0.0/16
+# upstream = "10.0.0.1:53"
+
+
+# ── Storage ───────────────────────────────────────────────────────────────────
+
+[storage]
+backend = "sqlite"
+# Default: ~/.local/share/ferrite/ferrite.db
+# path = "/var/lib/ferrite/ferrite.db"
+
+
+# ── API / web UI ──────────────────────────────────────────────────────────────
+
+[api]
+bind_addr = "127.0.0.1:8080"
+
+# Optional API key — all /api/* requests must include:
+#   Authorization: Bearer <api_key>   or   X-Api-Key: <api_key>
+# api_key = "change-me"
+
+# Web UI password (set via `ferrite passwd`, stored as Argon2id hash):
+# password_hash = "..."
+
+
+# ── Blocklist ─────────────────────────────────────────────────────────────────
+
+[blocklist]
+# Recent block/allow decisions kept in RAM. Lower this on very small devices;
+# higher values reduce FST lookups on noisy networks.
+decision_cache_size = 50000
+
+# Domains never blocked, even if they appear in a list.
+# Wildcards: "*.example.com" matches all subdomains (not the apex itself).
+# Also manageable at runtime via POST /api/blocklist/whitelist.
+whitelist = [
+    # "safe.example.com",
+    # "*.internal.corp",
+]
+
+# Extra wildcard patterns to always block.
+# Also manageable at runtime via POST /api/blocklist/blacklist.
+wildcard_block = [
+    # "*.doubleclick.net",
+]
+
+# Remote blocklist subscriptions (hosts or Adblock format, auto-detected).
+[[blocklist.lists]]
+name    = "StevenBlack"
+url     = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+enabled = true
+
+# [[blocklist.lists]]
+# name    = "AdGuard Base"
+# url     = "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt"
+# enabled = true
+
+# [[blocklist.lists]]
+# name    = "Local custom"
+# url     = "file:///etc/ferrite/custom.hosts"
+# enabled = true
+
+
+# ── Custom DNS records ────────────────────────────────────────────────────────
+# Local A/AAAA/CNAME overrides — bypass blocklist and upstream entirely.
+# Also manageable at runtime via POST /api/custom-records.
+
+# [[custom_records]]
+# domain = "router.lan"
+# type   = "A"
+# value  = "192.168.1.1"
+# ttl    = 300
+
+# [[custom_records]]
+# domain = "nas.lan"
+# type   = "AAAA"
+# value  = "fd00::1"
+# ttl    = 300
+
+# [[custom_records]]
+# domain = "*.home.lan"
+# type   = "A"
+# value  = "192.168.1.100"
+# ttl    = 300

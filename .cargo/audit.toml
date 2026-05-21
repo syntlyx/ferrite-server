@@ -1,0 +1,5 @@
+[advisories]
+# RUSTSEC-2026-0097 is a warning for rand 0.8.5. Ferrite does not use rand
+# directly; the remaining edge is fred 10.1.0, where rand is a non-optional
+# upstream dependency for the optional Redis storage backend.
+ignore = ["RUSTSEC-2026-0097"]

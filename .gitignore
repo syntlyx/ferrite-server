@@ -1,0 +1,14 @@
+/target
+/dist
+.DS_Store
+
+# Env files
+.env
+*.env.local
+
+# IDE
+.idea/
+*.iml
+
+# Binaries in root (if you build locally with --out-dir)
+/dip

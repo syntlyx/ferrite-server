@@ -1,0 +1,57 @@
+[package]
+name = "ferrite"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+
+[[bin]]
+name = "ferrite"
+path = "src/main.rs"
+
+[features]
+default = []
+storage-redis = ["dep:fred"]
+
+[dependencies]
+fred = { version = "10", optional = true, features = ["i-keys", "i-hashes", "i-lists", "i-sorted-sets"] }
+tokio = { version = "1", features = ["full"] }
+hickory-resolver = { version = "0.26.1", features = ["tls-ring", "https-ring", "quic-ring"] }
+hickory-proto = "0.26.1"
+axum = { version = "0.8", features = ["macros"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+fst = "0.4"
+dashmap = "6"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+lru = "0.18"
+regex = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio-rusqlite = "0.6"
+chrono = { version = "0.4", features = ["serde"] }
+bytes = "1"
+parking_lot = "0.12"
+arc-swap = "1"
+dirs = "5"
+reqwest = { version = "0.12", features = ["rustls-tls", "json"], default-features = false }
+ring = "0.17"
+argon2 = "0.5"
+subtle = "2"
+socket2 = "0.5"
+flate2 = "1"
+tar = "0.4"
+sysinfo = "0.32"
+
+[dev-dependencies]
+tower = "0.5"
+
+[profile.release]
+# Line-table debug info: keeps release optimisations but lets gdb show file:line
+# in backtraces.  Negligible performance impact; small binary size increase.
+debug = 1
