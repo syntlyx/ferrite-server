@@ -130,6 +130,10 @@ pub async fn cached_update_check(state: &AppState, force: bool) -> Result<Update
     Ok(installed_versions_snapshot(state, None, true).await)
 }
 
+pub fn normalize_release_version(version: &str) -> String {
+    version.trim().trim_start_matches('v').to_string()
+}
+
 /// Perform a network update check, store it in the shared cache, and return it.
 pub async fn refresh_update_check_cache(state: &AppState) -> Result<UpdateCheckSnapshot> {
     match live_update_check(state).await {
@@ -188,9 +192,8 @@ async fn installed_versions_snapshot(
         .unwrap_or_else(|| crate::config::data_dir().join("web"));
     let current_web_version = tokio::fs::read_to_string(web_dir.with_extension("version"))
         .await
-        .unwrap_or_else(|_| "0.0.0".to_string())
-        .trim()
-        .to_string();
+        .map(|version| normalize_release_version(&version))
+        .unwrap_or_else(|_| "0.0.0".to_string());
     let current_web_sha256 = web::installed_sha256(&web_dir).await.ok().flatten();
 
     UpdateCheckSnapshot {
@@ -342,5 +345,12 @@ mod tests {
         );
         assert!(cached.stale);
         assert_eq!(cached.last_error.as_deref(), Some("rate limited"));
+    }
+
+    #[test]
+    fn normalizes_release_tag_version_for_component_state() {
+        assert_eq!(normalize_release_version("v0.1.0"), "0.1.0");
+        assert_eq!(normalize_release_version("0.1.0"), "0.1.0");
+        assert_eq!(normalize_release_version(" v0.1.0\n"), "0.1.0");
     }
 }

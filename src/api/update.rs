@@ -74,7 +74,7 @@ pub async fn update_web(State(state): State<AppState>) -> Result<Json<Value>, Ap
     let current_web = tokio::fs::read_to_string(web_dir.with_extension("version"))
         .await
         .unwrap_or_else(|_| "0.0.0".to_string());
-    let current_web = current_web.trim().to_string();
+    let current_web = updater::normalize_release_version(&current_web);
     let current_web_sha256 = updater::web::installed_sha256(&web_dir).await?;
 
     let latest =

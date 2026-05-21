@@ -182,6 +182,10 @@ release_tag() {
         | head -1
 }
 
+release_version() {
+    printf '%s' "$1" | sed 's/^v//'
+}
+
 download_asset() {
     token=$(release_token)
     if [ -n "$token" ]; then
@@ -305,6 +309,7 @@ install_web() {
     version=$(release_tag "$json")
     [ -n "$version" ] || { warn "No web UI release found. Skipping."; return 0; }
     info "Latest web UI version: ${version}"
+    installed_version=$(release_version "$version")
 
     asset_pattern="\\.tar\\.gz"
     url=$(release_asset_url "$json" "$asset_pattern")
@@ -335,7 +340,7 @@ install_web() {
     fi
     rm -f "$tmp"
 
-    printf '%s\n' "$version" > "${WEB_DIR}.version"
+    printf '%s\n' "$installed_version" > "${WEB_DIR}.version"
     if [ -n "$expected_sha" ]; then
         printf '%s\n' "$expected_sha" > "${WEB_DIR}.sha256"
     else
