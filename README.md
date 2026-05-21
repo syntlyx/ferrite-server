@@ -221,6 +221,10 @@ to public release download URLs and `.sha256` sidecar assets. For private repos
 or higher API limits, run the service with `FERRITE_RELEASE_TOKEN` or
 `GITHUB_TOKEN`.
 
+The server refreshes update state in the background once per hour. Opening the
+web UI reads the cached state; the manual "Check updates" action forces a live
+refresh.
+
 On systemd and OpenRC installs, `install.sh` runs ferrite from
 `/usr/local/lib/ferrite/bin/ferrite` and leaves `/usr/local/bin/ferrite` as a CLI
 link. That service binary is writable by the `ferrite` service user, so

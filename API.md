@@ -861,6 +861,11 @@ All fields are optional. Fields not provided are left unchanged.
 
 Queries GitHub releases for both the server binary (`syntlyx/ferrite-server`) and the web UI package (`syntlyx/ferrite-web`). Version labels are kept for display, but update availability also considers the GitHub release asset digest (`sha256:<hex>`). The release workflow publishes package archives and `.sha256` sidecars so checks can still verify artifacts when GitHub's release API digest is unavailable.
 
+By default, this endpoint returns the server's cached update state and does not
+contact GitHub on every request. The background updater refreshes the cache once
+per hour. Use `GET /api/update/check?force=true` for an explicit live refresh,
+for example from a "Check updates" button.
+
 If GitHub's REST API rate-limits unauthenticated requests, ferrite falls back to
 public release download URLs and `.sha256` sidecar assets. Set
 `FERRITE_RELEASE_TOKEN` or `GITHUB_TOKEN` in the service environment for private
@@ -878,11 +883,16 @@ repos or higher API limits.
     "release_notes": "...",
     "sha256": "6a9f..."
   },
-  "web_update": null
+  "web_update": null,
+  "checked_at": 1780000000,
+  "cache_ttl_seconds": 3600,
+  "stale": false,
+  "check_pending": false,
+  "last_error": null
 }
 ```
 
-`server_update` and `web_update` are `null` when that component is already up to date. If the release tag is recreated with the same semantic version but a different asset digest, the matching update object is returned so the same-version artifact can still be applied.
+`server_update` and `web_update` are `null` when that component is already up to date. If the release tag is recreated with the same semantic version but a different asset digest, the matching update object is returned so the same-version artifact can still be applied. `check_pending` is `true` before the first background check completes; `stale` is `true` when the cached result is older than the TTL or the latest refresh failed.
 
 ### `POST /api/update/server` — apply server update
 

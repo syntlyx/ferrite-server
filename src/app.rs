@@ -70,6 +70,9 @@ pub struct AppState {
     /// Cached result of the last /api/stats/system call (value + timestamp).
     /// Prevents concurrent sysinfo spawns when the dashboard polls frequently.
     pub system_stats_cache: Arc<Mutex<Option<(Instant, serde_json::Value)>>>,
+    /// Cached result of update checks. Prevents the web UI from hitting GitHub
+    /// every time a user opens the app.
+    pub update_check_cache: Arc<tokio::sync::Mutex<crate::updater::UpdateCheckCache>>,
 }
 
 impl AppState {
@@ -275,6 +278,9 @@ impl AppState {
             flush_done: Arc::new(Notify::new()),
             cpu_sampler: Arc::new(CpuSampler::new()),
             system_stats_cache: Arc::new(Mutex::new(None)),
+            update_check_cache: Arc::new(tokio::sync::Mutex::new(
+                crate::updater::UpdateCheckCache::new(),
+            )),
         })
     }
 }
