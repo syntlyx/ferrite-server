@@ -19,11 +19,15 @@ A Pi-hole alternative written in Rust. Blocks ads and trackers at the DNS level,
 
 ## Installation
 
-From release artifacts:
+From release artifacts on Linux:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/syntlyx/ferrite-server/main/install.sh | sudo sh
 ```
+
+Release binaries are also published for macOS, but the service installer is
+Linux-only until launchd, port 53 binding, and self-update semantics are handled
+cleanly.
 
 From source:
 

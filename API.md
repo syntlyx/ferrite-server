@@ -851,7 +851,7 @@ All fields are optional. Fields not provided are left unchanged.
 }
 ```
 
-> When `restart_required` is `true`, the server exits ~300 ms after sending the response. A process supervisor (`systemd` with `Restart=always`, `launchd`, etc.) is expected to restart it automatically.
+> When `restart_required` is `true`, the server exits ~300 ms after sending the response. A process supervisor (`systemd` with `Restart=always`, OpenRC `supervise-daemon`, etc.) is expected to restart it automatically.
 
 ---
 

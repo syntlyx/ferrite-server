@@ -1,8 +1,8 @@
 #!/usr/bin/env sh
 # ferrite — install script
-# Downloads pre-built binaries from GitHub Releases and sets up the system service.
+# Downloads pre-built Linux binaries from GitHub Releases and sets up the system service.
 #
-# Usage (Linux/macOS, run as root):
+# Usage (Linux, run as root):
 #   curl -fsSL https://raw.githubusercontent.com/syntlyx/ferrite-server/main/install.sh | sudo sh
 #
 # Or download and inspect first:
@@ -29,7 +29,6 @@ SERVICE_USER="ferrite"
 SERVICE_GROUP="ferrite"
 SYSTEMD_SERVICE="/etc/systemd/system/ferrite.service"
 OPENRC_SERVICE="/etc/init.d/ferrite"
-LAUNCHD_PLIST="/Library/LaunchDaemons/com.syntlyx.ferrite.plist"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 
@@ -63,9 +62,7 @@ detect_asset_pattern() {
     case "$(uname -s)-$(uname -m)" in
         Linux-x86_64)           printf "x86_64-unknown-linux-musl"  ;;
         Linux-aarch64)          printf "aarch64-unknown-linux-musl" ;;
-        Darwin-x86_64)          printf "x86_64-apple-darwin"        ;;
-        Darwin-arm64)           printf "aarch64-apple-darwin"       ;;
-        *) die "Unsupported platform: $(uname -s) $(uname -m). Only Linux x86_64/arm64 and macOS are supported." ;;
+        *) die "Unsupported platform: $(uname -s) $(uname -m). The installer currently supports Linux x86_64/arm64 only." ;;
     esac
 }
 ASSET_PATTERN=$(detect_asset_pattern)
@@ -75,8 +72,6 @@ detect_platform_display() {
     case "$(uname -s)-$(uname -m)" in
         Linux-x86_64)           printf "linux-x86_64"  ;;
         Linux-aarch64)          printf "linux-arm64"   ;;
-        Darwin-x86_64)          printf "macos-x86_64"  ;;
-        Darwin-arm64)           printf "macos-arm64"   ;;
         *)                      printf "unknown"        ;;
     esac
 }
@@ -88,7 +83,6 @@ IS_ALPINE=false
 
 # Detect init system.
 detect_init_system() {
-    [ "$OS" = "darwin" ] && { printf "launchd"; return; }
     if [ -d /run/systemd/system ] || (command -v systemctl >/dev/null 2>&1 && systemctl --version >/dev/null 2>&1); then
         printf "systemd"
     elif command -v rc-service >/dev/null 2>&1; then
@@ -420,22 +414,6 @@ create_user() {
                 --home-dir "$DATA_DIR" "$SERVICE_USER"
         fi
         ok "Created system user: ${SERVICE_USER}"
-
-    elif [ "$OS" = "darwin" ]; then
-        if id "$SERVICE_USER" >/dev/null 2>&1; then
-            ok "System user '${SERVICE_USER}' already exists"
-            return 0
-        fi
-        uid=450
-        while dscl . -list /Users UniqueID | awk '{print $2}' | grep -q "^${uid}$"; do
-            uid=$((uid - 1))
-        done
-        dscl . -create "/Users/${SERVICE_USER}"
-        dscl . -create "/Users/${SERVICE_USER}" UserShell /usr/bin/false
-        dscl . -create "/Users/${SERVICE_USER}" RealName "Ferrite DNS"
-        dscl . -create "/Users/${SERVICE_USER}" UniqueID "$uid"
-        dscl . -create "/Users/${SERVICE_USER}" PrimaryGroupID 20
-        ok "Created system user: ${SERVICE_USER} (uid=${uid})"
     fi
 }
 
@@ -608,44 +586,6 @@ EOF
     ok "OpenRC service installed and enabled (default runlevel, supervise-daemon)"
 }
 
-# ── launchd service (macOS) ───────────────────────────────────────────────────
-
-install_launchd() {
-    [ "$OS" = "darwin" ] || return 0
-
-    bold "Installing launchd service (macOS)..."
-
-    cat > "$LAUNCHD_PLIST" << EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.syntlyx.ferrite</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>${SERVICE_BIN}</string>
-    </array>
-    <key>UserName</key>
-    <string>${SERVICE_USER}</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/var/log/ferrite.log</string>
-    <key>StandardErrorPath</key>
-    <string>/var/log/ferrite.log</string>
-</dict>
-</plist>
-EOF
-
-    launchctl load -w "$LAUNCHD_PLIST" 2>/dev/null || true
-    ok "launchd service installed: ${LAUNCHD_PLIST}"
-    warn "On macOS, binding port 53 may require additional entitlements or running as root."
-}
-
 # ── Firewall: open port 53 ────────────────────────────────────────────────────
 
 open_port_53() {
@@ -716,10 +656,6 @@ start_service() {
                 warn "Unknown init system. Start manually: ${SERVICE_BIN}"
                 ;;
         esac
-
-    elif [ "$OS" = "darwin" ]; then
-        launchctl start com.syntlyx.ferrite 2>/dev/null || true
-        ok "Service started"
     fi
 }
 
@@ -748,9 +684,6 @@ main() {
                 openrc)  install_openrc  ;;
                 *)       warn "Unknown init system — skipping service setup. Start manually: ${SERVICE_BIN}" ;;
             esac
-            ;;
-        darwin)
-            install_launchd
             ;;
     esac
     echo

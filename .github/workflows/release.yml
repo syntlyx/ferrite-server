@@ -9,19 +9,32 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    name: Build and Release
-    runs-on: ubuntu-latest
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+
     steps:
       - uses: actions/checkout@v6.0.2
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
-      - name: Add Linux musl targets
-        run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-
-      - name: Install cargo-zigbuild + zig
+      - name: Install cargo-zigbuild + zig (Linux musl)
+        if: runner.os == 'Linux'
         run: |
           python3 -m venv "$RUNNER_TEMP/ziglang"
           "$RUNNER_TEMP/ziglang/bin/python" -m pip install --upgrade pip
@@ -36,28 +49,49 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: linux-musl-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            linux-musl-cargo-
+            ${{ matrix.target }}-cargo-
 
-      - name: Build and package Linux musl archives
+      - name: Build release binary (Linux)
+        if: runner.os == 'Linux'
+        run: cargo zigbuild --release --all-features --locked --target "${{ matrix.target }}"
+
+      - name: Build release binary (macOS)
+        if: runner.os == 'macOS'
+        run: cargo build --release --all-features --locked --target "${{ matrix.target }}"
+
+      - name: Package archive
         shell: bash
         env:
           VERSION: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
-            cargo zigbuild --release --all-features --locked --target "$target"
-            archive="artifacts/ferrite-${VERSION}-${target}.tar.gz"
-            tarball="${archive%.gz}"
-            # The archive contains a single `ferrite` binary at the root.
-            # Both install.sh and the self-updater (updater/server.rs) rely on this layout.
-            tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@0" \
-              -cf "$tarball" -C "target/${target}/release" ferrite
-            gzip -n -f "$tarball"
-          done
-          ls -lh artifacts
+          archive="artifacts/ferrite-${VERSION}-${TARGET}.tar.gz"
+          tar -czf "$archive" -C "target/${TARGET}/release" ferrite
+          ls -lh "$archive"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ferrite-${{ matrix.target }}
+          path: artifacts/*.tar.gz
+          retention-days: 1
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
 
       - name: Publish GitHub release
         shell: bash
@@ -67,7 +101,7 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          files=(artifacts/*)
+          files=(artifacts/*.tar.gz)
           if [ "${#files[@]}" -eq 0 ]; then
             echo "No release artifacts found" >&2
             exit 1
@@ -83,6 +117,6 @@ jobs:
           else
             gh release create "$VERSION" "${files[@]}" \
               --title "$VERSION" \
-              --notes "" \
+              --generate-notes \
               "${flags[@]}"
           fi
