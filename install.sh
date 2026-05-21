@@ -20,7 +20,7 @@ GITHUB_REPO_SERVER="${GITHUB_REPO_SERVER:-ferrite-server}"
 GITHUB_REPO_WEB="${GITHUB_REPO_WEB:-ferrite-web}"
 
 BIN_DIR="/usr/local/bin"
-SYSTEMD_BIN_DIR="/usr/local/lib/ferrite/bin"
+SERVICE_UPDATE_BIN_DIR="/usr/local/lib/ferrite/bin"
 CONFIG_DIR="/etc/ferrite"
 DATA_DIR="/var/lib/ferrite"
 WEB_PARENT="/usr/share/ferrite"
@@ -99,8 +99,8 @@ detect_init_system() {
 }
 INIT_SYSTEM=$(detect_init_system)
 
-if [ "$OS" = "linux" ] && [ "$INIT_SYSTEM" = "systemd" ]; then
-    SERVICE_BIN_DIR="$SYSTEMD_BIN_DIR"
+if [ "$OS" = "linux" ] && { [ "$INIT_SYSTEM" = "systemd" ] || [ "$INIT_SYSTEM" = "openrc" ]; }; then
+    SERVICE_BIN_DIR="$SERVICE_UPDATE_BIN_DIR"
 else
     SERVICE_BIN_DIR="$BIN_DIR"
 fi
@@ -586,30 +586,26 @@ install_openrc() {
 
 name="ferrite"
 description="Ferrite DNS ad-blocker"
+supervisor=supervise-daemon
 command="${SERVICE_BIN}"
 command_user="${SERVICE_USER}:${SERVICE_GROUP}"
-command_background=yes
+capabilities="^cap_net_bind_service"
+respawn_delay=5
+respawn_max=3
+respawn_period=60
 pidfile="/run/\${RC_SVCNAME}.pid"
 output_log="/var/log/ferrite.log"
 error_log="/var/log/ferrite.log"
 
 depend() {
     need net
+    after firewall
 }
 EOF
     chmod +x "$OPENRC_SERVICE"
 
-    # Grant port 53 binding capability without running as root.
-    if command -v setcap >/dev/null 2>&1; then
-        setcap cap_net_bind_service=+ep "$SERVICE_BIN"
-        ok "setcap: ferrite can bind port 53 as '${SERVICE_USER}'"
-    else
-        warn "setcap not found — ferrite may not be able to bind port 53 as '${SERVICE_USER}'."
-        warn "Fix: apk add libcap && setcap cap_net_bind_service=+ep ${SERVICE_BIN}"
-    fi
-
     rc-update add ferrite default
-    ok "OpenRC service installed and enabled (default runlevel)"
+    ok "OpenRC service installed and enabled (default runlevel, supervise-daemon)"
 }
 
 # ── launchd service (macOS) ───────────────────────────────────────────────────

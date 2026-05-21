@@ -885,11 +885,13 @@ Downloads and replaces the running binary. After a successful update, ferrite
 saves a warm-restart snapshot, exits after the response is sent, and expects the
 process supervisor to start the new binary.
 
-On systemd installs, `install.sh` uses
+On systemd and OpenRC installs, `install.sh` uses
 `/usr/local/lib/ferrite/bin/ferrite` as the service binary and
 `/usr/local/bin/ferrite` as a CLI link. The service binary directory is writable
-by the `ferrite` service user and listed in the unit `ReadWritePaths`, so web UI
-server updates can apply in place. Other install layouts must make the current
+by the `ferrite` service user, so web UI server updates can apply in place.
+Systemd lists the directory in the unit `ReadWritePaths`; OpenRC uses
+`supervise-daemon` with ambient `cap_net_bind_service` so the updated binary does
+not depend on file `setcap`. Other install layouts must make the current
 executable directory writable by the running service user, or update the server
 by rerunning the installer with sudo/root.
 

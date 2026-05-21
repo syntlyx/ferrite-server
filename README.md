@@ -211,16 +211,19 @@ web_dir = "/path/to/ferrite-ui/dist"
 `POST /api/update/web` can update the web UI in place because the installed web
 directory is writable by the `ferrite` service user.
 
-On systemd installs, `install.sh` runs ferrite from
+On systemd and OpenRC installs, `install.sh` runs ferrite from
 `/usr/local/lib/ferrite/bin/ferrite` and leaves `/usr/local/bin/ferrite` as a CLI
 link. That service binary is writable by the `ferrite` service user, so
 `POST /api/update/server` can replace it from the web UI. After a successful
-server update, ferrite exits and systemd restarts it on the new binary.
+server update, ferrite exits and the process supervisor restarts it on the new
+binary. OpenRC uses `supervise-daemon` with ambient `cap_net_bind_service`
+instead of file `setcap`, so the capability is not lost when the binary is
+replaced.
 
-If ferrite is installed from source, on OpenRC/macOS, or with a root-owned
-binary path, server self-update needs the executable directory to be writable by
-the running service user. Otherwise update the server by rerunning the installer
-with sudo/root:
+If ferrite is installed from source, on macOS, or with a root-owned binary path,
+server self-update needs the executable directory to be writable by the running
+service user. Otherwise update the server by rerunning the installer with
+sudo/root:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/syntlyx/ferrite-server/main/install.sh | sudo sh
