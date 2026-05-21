@@ -94,13 +94,16 @@ pub async fn login(
     State(state): State<AppState>,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let hash = match state.live_config.read().api.password_hash.clone() {
-        Some(h) => h,
-        None => {
-            // No password set — nothing to authenticate against.
-            return Err(ApiError(FeriteError::Config(
-                "no password configured; set one with `ferrite passwd`".into(),
-            )));
+    let hash = {
+        let cfg = state.live_config.read();
+        match cfg.api.password_hash() {
+            Some(hash) => hash.to_string(),
+            None => {
+                // No password set — nothing to authenticate against.
+                return Err(ApiError(FeriteError::Config(
+                    "no password configured; set one with `ferrite passwd`".into(),
+                )));
+            }
         }
     };
 
@@ -155,7 +158,7 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Json<V
 
 /// GET /api/auth — check if the caller has a valid session.
 pub async fn check_auth(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let has_password = state.live_config.read().api.password_hash.is_some();
+    let has_password = state.live_config.read().api.has_password();
 
     if !has_password {
         return (
@@ -240,6 +243,29 @@ mod tests {
         let Json(body) = logout(State(state.clone()), headers).await;
         assert_eq!(body["status"], "ok");
         assert!(!state.sessions.contains_key(&token));
+
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
+    }
+
+    #[tokio::test]
+    async fn blank_password_hash_behaves_like_no_password_configured() {
+        let (state, db_path) = test_support::app_state("auth-empty-password").await;
+        state.live_config.write().api.password_hash = Some("  ".to_string());
+
+        let err = login(
+            State(state.clone()),
+            Json(LoginRequest {
+                password: "secret".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.0.to_string().contains("no password configured"));
+
+        let response = check_auth(State(state.clone()), HeaderMap::new()).await;
+        assert_eq!(response.into_response().status(), StatusCode::OK);
 
         drop(state);
         test_support::cleanup_sqlite(&db_path);

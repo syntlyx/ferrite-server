@@ -58,7 +58,7 @@ fn cmd_passwd() -> anyhow::Result<()> {
     // Load existing config (or default).
     let mut cfg = if config_path.exists() {
         let raw = std::fs::read_to_string(&config_path)?;
-        toml::from_str(&raw)?
+        toml::from_str::<config::Config>(&raw)?.normalized()
     } else {
         config::Config::default()
     };

@@ -717,7 +717,7 @@ DELETE /api/custom-records/printer.lan
 
 ### `GET /api/settings` — current configuration
 
-Returns the full parsed config. `api_key` and `password_hash` are redacted to `"***"` if set.
+Returns the full parsed config. Non-empty `api_key` and `password_hash` values are redacted to `"***"`; unset or blank values are returned as `null`.
 
 ```json
 {
@@ -738,7 +738,11 @@ Returns the full parsed config. `api_key` and `password_hash` are redacted to `"
     "path": "/path/to/ferrite.db",
     "log_retention_days": 30
   },
-  "api": { "bind_addr": "127.0.0.1:8080", "api_key": "***" },
+  "api": {
+    "bind_addr": "127.0.0.1:8080",
+    "api_key": "***",
+    "password_hash": null
+  },
   "blocklist": {
     "decision_cache_size": 50000,
     "lists": [],
@@ -757,8 +761,8 @@ All fields are optional. Fields not provided are left unchanged.
 
 | Field                | Type             | Description                                                                                                                                                                                                     |
 | -------------------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `api_key`            | `string \| null` | API key for Bearer/X-Api-Key auth; `null` disables key auth                                                                                                                                                     |
-| `password`           | `string \| null` | Web UI password (hashed server-side, Argon2id); `null` disables password auth                                                                                                                                   |
+| `api_key`            | `string \| null` | API key for Bearer/X-Api-Key auth; blank values are rejected; `null` disables key auth                                                                                                                          |
+| `password`           | `string \| null` | Web UI password (hashed server-side, Argon2id); empty values are rejected; `null` disables password auth                                                                                                        |
 | `dns_min_ttl`        | int              | Minimum TTL clamp for cached DNS responses, 60–3600 seconds                                                                                                                                                     |
 | `dns_max_ttl`        | int              | Maximum TTL clamp for cached DNS responses, 60–3600 seconds                                                                                                                                                     |
 | `dns_log_ignore`     | `string[]`       | Domain patterns to suppress from the query log entirely. Replaces the full list. Supports exact names (`fe.te`) and wildcard suffixes (`*.local`). Queries matching these patterns are still resolved normally. |

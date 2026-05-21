@@ -285,7 +285,7 @@ impl Config {
                 let raw = std::fs::read_to_string(path)
                     .map_err(|e| FeriteError::Config(format!("read {}: {}", path.display(), e)))?;
                 let config: Config = toml::from_str(&raw)?;
-                return Ok(config);
+                return Ok(config.normalized());
             }
         }
 
@@ -300,6 +300,15 @@ impl Config {
         Ok(Config::default())
     }
 
+    pub fn normalized(mut self) -> Self {
+        self.normalize();
+        self
+    }
+
+    pub fn normalize(&mut self) {
+        self.api.normalize();
+    }
+
     pub fn config_candidates() -> Vec<PathBuf> {
         vec![
             config_dir().join("config.toml"),
@@ -312,13 +321,51 @@ impl Config {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let raw = toml::to_string_pretty(self)?;
+        let raw = toml::to_string_pretty(&self.clone().normalized())?;
         // Write to a temp file then atomically rename to avoid corrupting config on crash.
         let tmp = path.with_extension("toml.tmp");
         std::fs::write(&tmp, &raw)?;
         std::fs::rename(&tmp, path)?;
         Ok(())
     }
+}
+
+impl ApiConfig {
+    pub fn normalize(&mut self) {
+        self.api_key = normalize_secret(self.api_key.take());
+        self.password_hash = normalize_secret(self.password_hash.take());
+    }
+
+    pub fn api_key(&self) -> Option<&str> {
+        configured_secret(self.api_key.as_deref())
+    }
+
+    pub fn password_hash(&self) -> Option<&str> {
+        configured_secret(self.password_hash.as_deref())
+    }
+
+    pub fn has_api_key(&self) -> bool {
+        self.api_key().is_some()
+    }
+
+    pub fn has_password(&self) -> bool {
+        self.password_hash().is_some()
+    }
+}
+
+fn normalize_secret(value: Option<String>) -> Option<String> {
+    value.and_then(|v| {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn configured_secret(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
@@ -336,7 +383,7 @@ mod tests {
 
     #[test]
     fn minimal_config_toml_loads_with_defaults() {
-        let cfg: Config = toml::from_str(
+        let cfg: Config = toml::from_str::<Config>(
             r#"
             [dns]
             min_ttl = 120
@@ -345,7 +392,8 @@ mod tests {
             bind_addr = "127.0.0.1:18080"
             "#,
         )
-        .unwrap();
+        .unwrap()
+        .normalized();
 
         assert_eq!(cfg.dns.min_ttl, 120);
         assert_eq!(cfg.dns.max_ttl, 3600);
@@ -370,5 +418,31 @@ mod tests {
         assert!(raw.contains("api_key = \"secret\""));
         assert!(raw.contains("password_hash = \"hash\""));
         assert!(raw.contains("bootstrap_ip = \"192.0.2.53\""));
+    }
+
+    #[test]
+    fn blank_api_secrets_are_treated_as_unset_and_not_saved() {
+        let cfg = toml::from_str::<Config>(
+            r#"
+            [api]
+            api_key = "   "
+            password_hash = ""
+            "#,
+        )
+        .unwrap()
+        .normalized();
+
+        assert!(!cfg.api.has_api_key());
+        assert!(!cfg.api.has_password());
+        assert!(cfg.api.api_key.is_none());
+        assert!(cfg.api.password_hash.is_none());
+
+        let mut cfg = Config::default();
+        cfg.api.api_key = Some("   ".to_string());
+        cfg.api.password_hash = Some("\t".to_string());
+        let raw = toml::to_string_pretty(&cfg.normalized()).unwrap();
+
+        assert!(!raw.contains("api_key"));
+        assert!(!raw.contains("password_hash"));
     }
 }

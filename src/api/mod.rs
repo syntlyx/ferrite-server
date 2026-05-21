@@ -141,6 +141,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protected_api_allows_requests_when_auth_secrets_are_blank() {
+        let (state, db_path) = test_support::app_state("api-empty-auth").await;
+        {
+            let mut cfg = state.live_config.write();
+            cfg.api.api_key = Some("   ".to_string());
+            cfg.api.password_hash = Some("".to_string());
+        }
+
+        let response = build_router(state.clone())
+            .oneshot(request("/api/settings"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
+    }
+
+    #[tokio::test]
     async fn api_key_middleware_accepts_x_api_key_and_bearer_token() {
         let (state, db_path) = test_support::app_state("api-key-auth").await;
         state.live_config.write().api.api_key = Some("secret-key".to_string());

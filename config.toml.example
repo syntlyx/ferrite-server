@@ -123,9 +123,11 @@ bind_addr = "127.0.0.1:8080"
 
 # Optional API key — all /api/* requests must include:
 #   Authorization: Bearer <api_key>   or   X-Api-Key: <api_key>
+# Leave unset (or set to null via PATCH /api/settings) to disable key auth.
 # api_key = "change-me"
 
-# Web UI password (set via `ferrite passwd`, stored as Argon2id hash):
+# Web UI password (set via `ferrite passwd`, stored as Argon2id hash).
+# Leave unset (or set to null via PATCH /api/settings) to disable password auth.
 # password_hash = "..."
 
 

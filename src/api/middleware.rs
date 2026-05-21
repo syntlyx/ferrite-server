@@ -27,8 +27,8 @@ pub async fn require_api_key(
     next: Next,
 ) -> Response {
     let cfg = state.live_config.read().api.clone();
-    let password_set = cfg.password_hash.is_some();
-    let api_key = cfg.api_key.clone();
+    let password_set = cfg.has_password();
+    let api_key = cfg.api_key().map(str::to_string);
 
     // No auth configured at all — allow everything.
     if !password_set && api_key.is_none() {

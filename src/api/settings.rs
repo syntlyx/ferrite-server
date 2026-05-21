@@ -12,11 +12,11 @@ use crate::dns::cache::{MAX_TTL, MIN_TTL};
 use crate::error::FeriteError;
 
 /// GET /api/settings — return the current live configuration.
-/// `api_key` and `password_hash`: `"***"` if set, `null` if not — always present.
+/// `api_key` and `password_hash`: `"***"` if non-empty, `null` if not — always present.
 pub async fn get_settings(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let cfg = state.live_config.read().clone();
-    let has_api_key = cfg.api.api_key.is_some();
-    let has_password = cfg.api.password_hash.is_some();
+    let has_api_key = cfg.api.has_api_key();
+    let has_password = cfg.api.has_password();
 
     let mut val = serde_json::to_value(&cfg).map_err(|e| {
         ApiError(FeriteError::Internal(format!(
@@ -127,12 +127,13 @@ pub async fn update_settings(
         if let Some(key) = patch.api_key {
             cfg.api.api_key = match key {
                 Some(k) => {
-                    if k.is_empty() {
+                    let key = k.trim().to_string();
+                    if key.is_empty() {
                         return Err(ApiError(FeriteError::Config(
                             "api_key cannot be empty; use null to disable key auth".into(),
                         )));
                     }
-                    Some(k)
+                    Some(key)
                 }
                 None => None,
             };
@@ -356,6 +357,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_settings_treats_blank_secret_fields_as_unset() {
+        let (state, db_path) = test_support::app_state("settings-mask-empty").await;
+        {
+            let mut cfg = state.live_config.write();
+            cfg.api.api_key = Some("   ".to_string());
+            cfg.api.password_hash = Some("".to_string());
+        }
+
+        let Json(value) = get_settings(State(state.clone())).await.unwrap();
+
+        assert!(value["api"]["api_key"].is_null());
+        assert!(value["api"]["password_hash"].is_null());
+
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
+    }
+
+    #[tokio::test]
     async fn hot_settings_patch_updates_runtime_state_and_persists_config() {
         let (state, db_path, config_path) =
             test_support::app_state_with_config_path("settings-hot-patch").await;
@@ -452,6 +471,29 @@ mod tests {
         assert!(!config_path.exists());
 
         drop(cfg);
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
+    }
+
+    #[tokio::test]
+    async fn blank_api_key_patch_is_rejected_without_persisting() {
+        let (state, db_path, config_path) =
+            test_support::app_state_with_config_path("settings-empty-api-key").await;
+
+        let err = update_settings(
+            State(state.clone()),
+            Json(SettingsPatch {
+                api_key: Some(Some("  ".to_string())),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.0.to_string().contains("api_key cannot be empty"));
+        assert!(state.live_config.read().api.api_key.is_none());
+        assert!(!config_path.exists());
+
         drop(state);
         test_support::cleanup_sqlite(&db_path);
     }
