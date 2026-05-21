@@ -215,6 +215,12 @@ web_dir = "/path/to/ferrite-ui/dist"
 `POST /api/update/web` can update the web UI in place because the installed web
 directory is writable by the `ferrite` service user.
 
+Update checks prefer GitHub's release API because it exposes asset SHA256
+digests. If GitHub rate-limits unauthenticated API requests, ferrite falls back
+to public release download URLs and `.sha256` sidecar assets. For private repos
+or higher API limits, run the service with `FERRITE_RELEASE_TOKEN` or
+`GITHUB_TOKEN`.
+
 On systemd and OpenRC installs, `install.sh` runs ferrite from
 `/usr/local/lib/ferrite/bin/ferrite` and leaves `/usr/local/bin/ferrite` as a CLI
 link. That service binary is writable by the `ferrite` service user, so

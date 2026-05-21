@@ -859,7 +859,12 @@ All fields are optional. Fields not provided are left unchanged.
 
 ### `GET /api/update/check` — check for new versions
 
-Queries GitHub releases for both the server binary (`syntlyx/ferrite-server`) and the web UI package (`syntlyx/ferrite-web`). Version labels are kept for display, but update availability also considers the GitHub release asset digest (`sha256:<hex>`). The release workflow publishes only the real package archives; updater-side `.sha256` support is a fallback for legacy/manual releases.
+Queries GitHub releases for both the server binary (`syntlyx/ferrite-server`) and the web UI package (`syntlyx/ferrite-web`). Version labels are kept for display, but update availability also considers the GitHub release asset digest (`sha256:<hex>`). The release workflow publishes package archives and `.sha256` sidecars so checks can still verify artifacts when GitHub's release API digest is unavailable.
+
+If GitHub's REST API rate-limits unauthenticated requests, ferrite falls back to
+public release download URLs and `.sha256` sidecar assets. Set
+`FERRITE_RELEASE_TOKEN` or `GITHUB_TOKEN` in the service environment for private
+repos or higher API limits.
 
 ```json
 {

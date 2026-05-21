@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use crate::error::{FeriteError, Result};
 use crate::updater::checksum;
 use crate::updater::github::{
-    fetch_latest_release, resolve_asset_sha256, update_available, with_release_auth, HTTP_CLIENT,
-    RELEASE_OWNER, RELEASE_REPO_SERVER,
+    current_platform_target, fetch_latest_release, resolve_asset_sha256, update_available,
+    with_release_auth, HTTP_CLIENT, RELEASE_OWNER, RELEASE_REPO_SERVER,
 };
 
 /// Information about an available update.
@@ -25,7 +25,9 @@ pub async fn check(current_version: &str) -> Result<Option<UpdateInfo>> {
 
     let latest = release.tag_name.trim_start_matches('v');
 
-    let target = current_platform_target();
+    let Some(target) = current_platform_target() else {
+        return Ok(None);
+    };
     let asset = release
         .assets
         .iter()
@@ -179,19 +181,6 @@ fn preflight_update_target(current_exe: &Path) -> Result<()> {
             current_exe.display()
         ))),
     }
-}
-
-fn current_platform_target() -> &'static str {
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    return "x86_64-unknown-linux-musl";
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    return "aarch64-unknown-linux-musl";
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    return "x86_64-apple-darwin";
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    return "aarch64-apple-darwin";
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    return "unknown";
 }
 
 #[cfg(test)]

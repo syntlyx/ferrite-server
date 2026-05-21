@@ -71,13 +71,18 @@ jobs:
           mkdir -p artifacts
           archive="artifacts/ferrite-${VERSION}-${TARGET}.tar.gz"
           tar -czf "$archive" -C "target/${TARGET}/release" ferrite
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive" > "${archive}.sha256"
+          else
+            shasum -a 256 "$archive" > "${archive}.sha256"
+          fi
           ls -lh "$archive"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: ferrite-${{ matrix.target }}
-          path: artifacts/*.tar.gz
+          path: artifacts/*
           retention-days: 1
 
   release:
@@ -101,7 +106,7 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          files=(artifacts/*.tar.gz)
+          files=(artifacts/*)
           if [ "${#files[@]}" -eq 0 ]; then
             echo "No release artifacts found" >&2
             exit 1

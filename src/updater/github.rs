@@ -1,4 +1,4 @@
-use reqwest::{Client, RequestBuilder};
+use reqwest::{redirect::Policy, Client, RequestBuilder};
 use serde::Deserialize;
 
 use crate::error::{FeriteError, Result};
@@ -13,6 +13,15 @@ pub static HTTP_CLIENT: std::sync::LazyLock<Client> = std::sync::LazyLock::new(|
     Client::builder()
         .user_agent(concat!("ferrite/", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .expect("failed to build updater HTTP client")
+});
+
+static NO_REDIRECT_HTTP_CLIENT: std::sync::LazyLock<Client> = std::sync::LazyLock::new(|| {
+    Client::builder()
+        .user_agent(concat!("ferrite/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(Policy::none())
         .build()
         .expect("failed to build updater HTTP client")
 });
@@ -79,13 +88,27 @@ pub async fn fetch_latest_release(owner: &str, repo: &str) -> Result<Option<Rele
         repo
     );
 
-    let resp = with_release_auth(HTTP_CLIENT.get(&url).header("accept", "application/json"))
-        .send()
-        .await
-        .map_err(FeriteError::Http)?;
+    let resp = with_release_auth(
+        HTTP_CLIENT
+            .get(&url)
+            .header("accept", "application/vnd.github+json")
+            .header("x-github-api-version", "2022-11-28"),
+    )
+    .send()
+    .await
+    .map_err(FeriteError::Http)?;
 
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
+    }
+
+    if is_rate_limited(resp.status()) {
+        tracing::warn!(
+            "GitHub release API is rate limited for {}/{}; falling back to release download URLs",
+            owner,
+            repo
+        );
+        return fetch_latest_release_from_downloads(owner, repo).await;
     }
 
     let release: Release = resp
@@ -96,6 +119,111 @@ pub async fn fetch_latest_release(owner: &str, repo: &str) -> Result<Option<Rele
         .map_err(FeriteError::Http)?;
 
     Ok(Some(release))
+}
+
+async fn fetch_latest_release_from_downloads(owner: &str, repo: &str) -> Result<Option<Release>> {
+    let Some(tag) = fetch_latest_release_tag(owner, repo).await? else {
+        return Ok(None);
+    };
+    let Some(asset_name) = fallback_asset_name(repo, &tag) else {
+        return Ok(None);
+    };
+
+    let base = format!(
+        "https://github.com/{owner}/{repo}/releases/download/{tag}/{asset_name}",
+        owner = owner,
+        repo = repo,
+        tag = tag,
+        asset_name = asset_name
+    );
+
+    Ok(Some(Release {
+        tag_name: tag,
+        body: None,
+        assets: vec![
+            ReleaseAsset {
+                name: asset_name.clone(),
+                browser_download_url: base.clone(),
+                digest: None,
+            },
+            ReleaseAsset {
+                name: format!("{asset_name}.sha256"),
+                browser_download_url: format!("{base}.sha256"),
+                digest: None,
+            },
+        ],
+    }))
+}
+
+async fn fetch_latest_release_tag(owner: &str, repo: &str) -> Result<Option<String>> {
+    let url = format!("https://github.com/{owner}/{repo}/releases/latest");
+    let resp = with_release_auth(NO_REDIRECT_HTTP_CLIENT.get(&url))
+        .send()
+        .await
+        .map_err(FeriteError::Http)?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+
+    if !resp.status().is_redirection() {
+        return Err(FeriteError::Update(format!(
+            "GitHub latest release redirect for {owner}/{repo} returned {}",
+            resp.status()
+        )));
+    }
+
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            FeriteError::Update(format!(
+                "GitHub latest release redirect for {owner}/{repo} did not include Location"
+            ))
+        })?;
+
+    latest_tag_from_location(location).ok_or_else(|| {
+        FeriteError::Update(format!(
+            "GitHub latest release redirect for {owner}/{repo} had an unexpected Location: {location}"
+        ))
+    }).map(Some)
+}
+
+fn latest_tag_from_location(location: &str) -> Option<String> {
+    let path = location.split('?').next().unwrap_or(location);
+    let marker = "/releases/tag/";
+    let tag = path.split(marker).nth(1)?.trim_matches('/');
+    (!tag.is_empty()).then(|| tag.to_string())
+}
+
+fn fallback_asset_name(repo: &str, tag: &str) -> Option<String> {
+    if repo == RELEASE_REPO_SERVER {
+        return current_platform_target().map(|target| format!("ferrite-{tag}-{target}.tar.gz"));
+    }
+
+    if repo == RELEASE_REPO_WEB {
+        return Some("dist.tar.gz".to_string());
+    }
+
+    None
+}
+
+fn is_rate_limited(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
+pub fn current_platform_target() -> Option<&'static str> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    return Some("x86_64-unknown-linux-musl");
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    return Some("aarch64-unknown-linux-musl");
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    return Some("x86_64-apple-darwin");
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    return Some("aarch64-apple-darwin");
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return None;
 }
 
 pub async fn resolve_asset_sha256(
@@ -117,10 +245,16 @@ pub async fn resolve_asset_sha256(
         return Ok(None);
     };
 
-    let text = with_release_auth(HTTP_CLIENT.get(&asset.browser_download_url))
+    let resp = with_release_auth(HTTP_CLIENT.get(&asset.browser_download_url))
         .send()
         .await
-        .map_err(FeriteError::Http)?
+        .map_err(FeriteError::Http)?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+
+    let text = resp
         .error_for_status()
         .map_err(FeriteError::Http)?
         .text()
@@ -158,6 +292,35 @@ mod tests {
             browser_download_url: format!("https://example.test/{name}"),
             digest: digest.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn parses_latest_release_redirect_location() {
+        assert_eq!(
+            latest_tag_from_location(
+                "https://github.com/syntlyx/ferrite-server/releases/tag/v0.1.0"
+            )
+            .as_deref(),
+            Some("v0.1.0")
+        );
+        assert_eq!(
+            latest_tag_from_location("/syntlyx/ferrite-server/releases/tag/v0.1.1").as_deref(),
+            Some("v0.1.1")
+        );
+        assert!(latest_tag_from_location("/syntlyx/ferrite-server/releases").is_none());
+    }
+
+    #[test]
+    fn builds_known_fallback_asset_names() {
+        let server = fallback_asset_name(RELEASE_REPO_SERVER, "v0.1.0").unwrap();
+        assert!(server.starts_with("ferrite-v0.1.0-"));
+        assert!(server.ends_with(".tar.gz"));
+
+        assert_eq!(
+            fallback_asset_name(RELEASE_REPO_WEB, "v0.1.0").as_deref(),
+            Some("dist.tar.gz")
+        );
+        assert!(fallback_asset_name("unknown", "v0.1.0").is_none());
     }
 
     #[test]
