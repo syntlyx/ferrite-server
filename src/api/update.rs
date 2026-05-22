@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 
 use crate::api::ApiError;
 use crate::app::AppState;
+use crate::error::FeriteError;
 use crate::updater;
 
 #[derive(Debug, Deserialize, Default)]
@@ -77,14 +78,24 @@ pub async fn update_web(State(state): State<AppState>) -> Result<Json<Value>, Ap
     let current_web = updater::normalize_release_version(&current_web);
     let current_web_sha256 = updater::web::installed_sha256(&web_dir).await?;
 
-    let latest =
-        updater::web::check_web_update(&current_web, current_web_sha256.as_deref()).await?;
+    let latest = updater::web::check_web_update_for_server(
+        &current_web,
+        current_web_sha256.as_deref(),
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await?;
 
-    match latest {
-        None => Ok(Json(json!({
-            "status": "up_to_date",
-            "version": current_web,
-        }))),
+    match latest.update {
+        None => {
+            if let Some(blocked) = latest.incompatible_latest {
+                return Err(ApiError(FeriteError::Update(blocked.reason)));
+            }
+
+            Ok(Json(json!({
+                "status": "up_to_date",
+                "version": current_web,
+            })))
+        }
         Some(info) => {
             let version = info.version.clone();
             let sha256 = info.sha256.clone();

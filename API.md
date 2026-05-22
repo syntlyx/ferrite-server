@@ -397,7 +397,8 @@ IPv4 and IPv6 addresses resolving to the same PTR hostname are merged into one e
       "total": 4812,
       "blocked": 932,
       "last_seen": 1745008923,
-      "is_alias": false
+      "is_alias": false,
+      "blocking_bypassed": false
     }
   ]
 }
@@ -406,6 +407,7 @@ IPv4 and IPv6 addresses resolving to the same PTR hostname are merged into one e
 - `name` — PTR hostname (local suffixes stripped), manual alias, or raw IP if unresolved.
 - `macs` — MAC addresses learned from ARP/NDP/EUI-64; use one as a MAC alias key when available.
 - `is_alias` — `true` if the name was set manually via `POST /api/clients/aliases`.
+- `blocking_bypassed` — `true` if this client is exempt from blocklist filtering.
 - `last_seen` — Unix timestamp of the most recent query from any of this client's IPs.
 
 > PTR lookups run in the background on first sight. A new IP shows `name == ip` immediately and gets a resolved name within seconds.
@@ -744,10 +746,12 @@ Returns the full parsed config. Non-empty `api_key` and `password_hash` values a
     "password_hash": null
   },
   "blocklist": {
+    "enabled": true,
     "decision_cache_size": 50000,
     "lists": [],
     "wildcard_block": [],
-    "whitelist": []
+    "whitelist": [],
+    "client_bypass": ["192.168.1.50", "aa:bb:cc:dd:ee:ff"]
   },
   "custom_records": []
 }
@@ -768,6 +772,8 @@ All fields are optional. Fields not provided are left unchanged.
 | `dns_log_ignore`     | `string[]`       | Domain patterns to suppress from the query log entirely. Replaces the full list. Supports exact names (`fe.te`) and wildcard suffixes (`*.local`). Queries matching these patterns are still resolved normally. |
 | `web_dir`            | `string \| null` | Override static web UI directory; `null` resets to `~/.local/share/ferrite/web`                                                                                                                                 |
 | `log_retention_days` | int              | Automatically delete query log entries older than N days; `0` disables retention. Applied once ~30 s after startup and every 24 h thereafter.                                                                   |
+| `blocklist_enabled`  | bool             | Master switch for DNS blocklist filtering. DNS resolution, custom records, caching, and logging continue to work while filtering is disabled.                                                                    |
+| `blocklist_client_bypass` | `string[]` | Full replacement list of client IP/MAC keys that bypass blocklist filtering. IPs are normalized; MACs use `aa:bb:cc:dd:ee:ff`. No groups yet.                                                                   |
 
 #### Restart-required — saved to disk, server exits so supervisor can restart it
 
@@ -865,6 +871,12 @@ All fields are optional. Fields not provided are left unchanged.
 
 Queries GitHub releases for both the server binary (`syntlyx/ferrite-server`) and the web UI package (`syntlyx/ferrite-web`). Version labels are kept for display, but update availability also considers the GitHub release asset digest (`sha256:<hex>`). The release workflow publishes package archives and `.sha256` sidecars so checks can still verify artifacts when GitHub's release API digest is unavailable.
 
+Web UI releases also publish `dist.manifest.json` with a `server_compat` range.
+Ferrite only offers the newest web release compatible with the running server.
+By convention, `0.1.x` web releases are compatible with `>=0.1.0 <0.2.0`
+servers, `0.2.x` web releases with `>=0.2.0 <0.3.0`, and so on. The manifest
+can override that range for exceptional releases.
+
 By default, this endpoint returns the server's cached update state and does not
 contact GitHub on every request. The background updater refreshes the cache once
 per hour. Use `GET /api/update/check?force=true` for an explicit live refresh,
@@ -877,9 +889,9 @@ repos or higher API limits.
 
 ```json
 {
-  "current_server_version": "0.1.0",
+  "current_server_version": "0.1.1",
   "current_server_sha256": "6a9f4dca6f9f3b8e2d5b5d5e7a6f8c9b5b3f9a6d7e8c9b0a1d2e3f4a5b6c7d8e",
-  "current_web_version": "0.1.0",
+  "current_web_version": "0.1.1",
   "current_web_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "server_update": {
     "version": "0.2.0",
@@ -888,6 +900,11 @@ repos or higher API limits.
     "sha256": "6a9f..."
   },
   "web_update": null,
+  "incompatible_web_update": {
+    "version": "0.3.0",
+    "required_server": ">=0.3.0 <0.4.0",
+    "reason": "web UI v0.3.0 requires server >=0.3.0 <0.4.0; running server is v0.2.4"
+  },
   "checked_at": 1780000000,
   "cache_ttl_seconds": 3600,
   "stale": false,
@@ -896,7 +913,7 @@ repos or higher API limits.
 }
 ```
 
-`server_update` and `web_update` are `null` when that component is already up to date. If the release tag is recreated with the same semantic version but a different asset digest, the matching update object is returned so the same-version artifact can still be applied. `check_pending` is `true` before the first background check completes; `stale` is `true` when the cached result is older than the TTL or the latest refresh failed.
+`server_update` and `web_update` are `null` when that component is already up to date. If the release tag is recreated with the same semantic version but a different asset digest, the matching update object is returned so the same-version artifact can still be applied. `web_update.server_compat` is included when a compatible web release is available. `incompatible_web_update` is present when a newer web release exists but requires a different server version range. `check_pending` is `true` before the first background check completes; `stale` is `true` when the cached result is older than the TTL or the latest refresh failed.
 
 ### `POST /api/update/server` — apply server update
 
@@ -927,6 +944,9 @@ by rerunning the installer with sudo/root.
 ### `POST /api/update/web` — apply web UI update
 
 Downloads and extracts the new web bundle to `~/.local/share/ferrite/web/`.
+Only a web bundle compatible with the running server is applied. If the newest
+available web bundle requires a newer server and no compatible web update is
+available, the endpoint returns `409 Conflict` with the compatibility reason.
 
 ```json
 { "status": "updated", "version": "0.2.0", "sha256": "f12b..." }
@@ -939,15 +959,24 @@ Downloads and extracts the new web bundle to `~/.local/share/ferrite/web/`.
 All errors follow the same shape:
 
 ```json
-{ "error": "human-readable description" }
+{
+  "error": "human-readable description",
+  "code": "stable_error_code",
+  "kind": "config",
+  "details": "raw server detail"
+}
 ```
 
-| HTTP status | Meaning                                |
-| ----------- | -------------------------------------- |
-| `400`       | Bad request (invalid input)            |
-| `401`       | Unauthorized (missing or invalid auth) |
-| `404`       | Resource not found                     |
-| `500`       | Internal server error                  |
+`error` remains for compatibility with older clients. New clients should prefer
+`code` for localized UI copy and keep `details` only as a fallback/debug hint.
+
+| HTTP status | Meaning                                           |
+| ----------- | ------------------------------------------------- |
+| `400`       | Bad request (invalid input or config)             |
+| `401`       | Unauthorized (missing or invalid auth)            |
+| `404`       | Resource not found                                |
+| `409`       | Conflict (for example incompatible update bundle) |
+| `500`       | Internal server error                             |
 
 ---
 

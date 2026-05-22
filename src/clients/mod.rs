@@ -85,6 +85,19 @@ pub fn parse_ip(s: &str) -> Option<IpAddr> {
     s.split('%').next()?.parse().ok()
 }
 
+/// Normalize a client identity key accepted by policy/settings APIs.
+/// Supports IP addresses and MAC addresses.
+pub fn normalize_client_key(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(ip) = parse_ip(s) {
+        return Some(unmap_v4(ip).to_string());
+    }
+    parse_mac(s).map(|mac| format_mac(&mac))
+}
+
 /// Convert IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to plain IPv4.
 pub fn unmap_v4(ip: IpAddr) -> IpAddr {
     if let IpAddr::V6(v6) = ip {

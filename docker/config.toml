@@ -1,0 +1,15 @@
+# Container default config. The entrypoint copies this file into
+# /var/lib/ferrite/.config/ferrite/config.toml on first start so settings
+# persist when /var/lib/ferrite is mounted to appdata.
+
+web_dir = "/var/lib/ferrite/web"
+
+[dns]
+bind_addr = "0.0.0.0:53"
+
+[api]
+bind_addr = "0.0.0.0:80"
+
+[storage]
+backend = "sqlite"
+path = "/var/lib/ferrite/ferrite.db"

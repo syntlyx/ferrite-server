@@ -1,5 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -9,6 +10,7 @@ use regex::Regex;
 
 use crate::blocklist::cache::BlocklistCache;
 use crate::blocklist::refresh;
+use crate::clients::normalize_client_key;
 use crate::config::{BlocklistConfig, ListConfig};
 use crate::error::{FeriteError, Result};
 
@@ -28,7 +30,10 @@ struct BlocklistData {
 /// - LRU decision cache: avoids re-querying the FST on every packet.
 /// - Lists: the set of remote subscriptions, mutable at runtime.
 pub struct Blocklist {
+    enabled: AtomicBool,
+    has_client_bypass: AtomicBool,
     data: ArcSwap<BlocklistData>,
+    client_bypass: ArcSwap<HashSet<String>>,
     whitelist: RwLock<HashSet<String>>,
     /// Wildcard entries for the whitelist, e.g. `*.safe.example.com`.
     whitelist_wildcards: RwLock<Vec<(String, Regex)>>,
@@ -45,6 +50,10 @@ pub struct Blocklist {
 impl Blocklist {
     pub fn new(config: BlocklistConfig, fst_path: PathBuf) -> Self {
         let empty_fst = empty_fst();
+
+        let client_bypass: HashSet<String> = normalize_client_keys(&config.client_bypass)
+            .into_iter()
+            .collect();
 
         let whitelist: HashSet<String> = config
             .whitelist
@@ -71,10 +80,13 @@ impl Blocklist {
             .unwrap_or_else(|| PathBuf::from("lists"));
 
         Self {
+            enabled: AtomicBool::new(config.enabled),
+            has_client_bypass: AtomicBool::new(!client_bypass.is_empty()),
             data: ArcSwap::from_pointee(BlocklistData {
                 fst: empty_fst,
                 wildcards,
             }),
+            client_bypass: ArcSwap::from_pointee(client_bypass),
             whitelist: RwLock::new(whitelist),
             whitelist_wildcards: RwLock::new(whitelist_wildcards),
             blacklist: RwLock::new(HashSet::new()),
@@ -116,6 +128,49 @@ impl Blocklist {
     }
 
     // ── Blocking checks ──────────────────────────────────────────────────────
+
+    pub fn blocking_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_blocking_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn has_client_bypass(&self) -> bool {
+        self.has_client_bypass.load(Ordering::Relaxed)
+    }
+
+    pub fn set_client_bypass(&self, entries: &[String]) {
+        let normalized: HashSet<String> = normalize_client_keys(entries).into_iter().collect();
+        let has_entries = !normalized.is_empty();
+        self.client_bypass.store(Arc::new(normalized));
+        self.has_client_bypass.store(has_entries, Ordering::Relaxed);
+    }
+
+    pub fn client_bypasses_blocking(&self, client_ip: &str, mac: Option<&str>) -> bool {
+        if !self.has_client_bypass() {
+            return false;
+        }
+
+        let entries = self.client_bypass.load();
+        normalize_client_key(client_ip)
+            .as_ref()
+            .is_some_and(|key| entries.contains(key))
+            || mac
+                .and_then(normalize_client_key)
+                .as_ref()
+                .is_some_and(|key| entries.contains(key))
+    }
+
+    pub fn client_bypasses_blocking_normalized(&self, client_ip: &str, mac: Option<&str>) -> bool {
+        if !self.has_client_bypass() {
+            return false;
+        }
+
+        let entries = self.client_bypass.load();
+        entries.contains(client_ip) || mac.is_some_and(|key| entries.contains(key))
+    }
 
     pub fn is_blocked(&self, domain: &str) -> bool {
         let domain = normalise(domain);
@@ -396,6 +451,14 @@ impl Blocklist {
     }
 }
 
+fn normalize_client_keys(entries: &[String]) -> Vec<String> {
+    let normalized: BTreeSet<String> = entries
+        .iter()
+        .filter_map(|key| normalize_client_key(key))
+        .collect();
+    normalized.into_iter().collect()
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 fn normalise(domain: &str) -> String {
@@ -454,10 +517,12 @@ mod tests {
     async fn refresh_preserves_wildcard_block_rules() {
         let blocklist = Blocklist::new(
             BlocklistConfig {
+                enabled: true,
                 decision_cache_size: 50_000,
                 lists: vec![],
                 wildcard_block: vec!["*.ads.test".to_string()],
                 whitelist: vec![],
+                client_bypass: vec![],
             },
             temp_fst_path("ferrite-blocklist-wildcard"),
         );
@@ -471,10 +536,12 @@ mod tests {
     fn config_entries_are_normalized_once_for_hot_path_lookups() {
         let blocklist = Blocklist::new(
             BlocklistConfig {
+                enabled: true,
                 decision_cache_size: 128,
                 lists: vec![],
                 wildcard_block: vec!["*.Ads.Test.".to_string()],
                 whitelist: vec!["Safe.Test.".to_string(), "*.Trusted.Test.".to_string()],
+                client_bypass: vec![],
             },
             temp_fst_path("ferrite-blocklist-normalized"),
         );

@@ -38,6 +38,52 @@ cp target/release/ferrite /usr/local/bin/ferrite
 
 Requires Rust 1.88+. Key dependencies: `tokio`, `axum`, `hickory-resolver`, `fst`, `rusqlite`, `argon2`.
 
+### Container image
+
+Container images are published to GitHub Container Registry, not Docker Hub:
+
+```bash
+docker pull ghcr.io/syntlyx/ferrite-server:latest
+```
+
+Run ferrite with persistent config/data volumes:
+
+```bash
+docker run -d --name ferrite \
+  --restart unless-stopped \
+  -p 53:53/tcp \
+  -p 53:53/udp \
+  -p 80:80/tcp \
+  -v ferrite-data:/var/lib/ferrite \
+  ghcr.io/syntlyx/ferrite-server:latest
+```
+
+The image runs Ferrite as the unprivileged `ferrite` user and ships a container default
+config with DNS on `0.0.0.0:53`, API/web on `0.0.0.0:80`, SQLite storage under
+`/var/lib/ferrite`, and web assets under `/var/lib/ferrite/web`. Mount
+`/var/lib/ferrite` to persistent storage. On first start, the entrypoint copies
+the default config to `/var/lib/ferrite/.config/ferrite/config.toml`, so settings
+changed through the API survive image updates. If your runtime strips file
+capabilities and port 53 fails to bind, add `--cap-add=NET_BIND_SERVICE`.
+If host port 80 is already taken, keep Ferrite on container port 80 and map a
+different host port, for example `-p 8080:80`.
+
+Container system stats reflect the container/VM view of the host. CPU and memory
+usually work, but CPU temperature is normally unavailable unless the Linux host
+explicitly exposes hardware sensor files; ferrite reports it as `null` when the
+runtime hides sensors.
+
+For containers, update the server by pulling a newer image and recreating the
+container. The `/api/update/server` self-update path is intended for host
+installs from `install.sh`; `/api/update/web` can still update the mounted web
+directory.
+
+Build locally:
+
+```bash
+docker build -t ferrite:local .
+```
+
 ## Testing
 
 Fast local gate:
@@ -155,10 +201,16 @@ Both support exact domains and wildcard patterns. Wildcards use `*` as the only 
 
 ```toml
 [blocklist]
+enabled = true
 decision_cache_size = 50000
 whitelist = ["safe.example.com", "*.internal.corp"]
 wildcard_block = ["*.doubleclick.net"]
+client_bypass = ["192.168.1.50", "aa:bb:cc:dd:ee:ff"]
 ```
+
+Set `enabled = false` to turn off DNS blocking globally without disabling DNS
+resolution, logging, custom records, or the web UI. `client_bypass` disables
+blocking for specific IP/MAC clients without introducing groups.
 
 Lower `decision_cache_size` on very small devices if you prefer a smaller RAM footprint over fewer FST lookups.
 
@@ -220,6 +272,10 @@ digests. If GitHub rate-limits unauthenticated API requests, ferrite falls back
 to public release download URLs and `.sha256` sidecar assets. For private repos
 or higher API limits, run the service with `FERRITE_RELEASE_TOKEN` or
 `GITHUB_TOKEN`.
+
+Web UI releases include a small compatibility manifest. Ferrite only offers the
+newest web bundle compatible with the running server, so `0.1.x` web builds stay
+on the `0.1.x` server line while `0.2.x` can require a `0.2.x` server.
 
 The server refreshes update state in the background once per hour. Opening the
 web UI reads the cached state; the manual "Check updates" action forces a live

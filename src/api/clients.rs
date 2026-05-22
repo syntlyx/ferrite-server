@@ -29,6 +29,8 @@ struct ClientGroup {
     last_seen: i64,
     /// `true` if the name came from a manual alias; `false` if from PTR.
     is_alias: bool,
+    /// `true` when this client is explicitly exempt from blocklist filtering.
+    blocking_bypassed: bool,
 }
 
 /// GET /api/clients
@@ -71,6 +73,10 @@ pub async fn list_clients(
             .unwrap_or_else(|| stat.client_ip.clone());
         let mac = state.inner.client_registry.get_mac(ip);
         let is_alias = state.inner.client_registry.is_aliased(ip);
+        let blocking_bypassed = state
+            .inner
+            .blocklist
+            .client_bypasses_blocking(&stat.client_ip, mac.as_deref());
 
         let group = groups.entry(name.clone()).or_insert_with(|| ClientGroup {
             name,
@@ -80,6 +86,7 @@ pub async fn list_clients(
             blocked: 0,
             last_seen: 0,
             is_alias,
+            blocking_bypassed,
         });
         group.ips.push(stat.client_ip.clone());
         if let Some(mac) = mac {
@@ -93,6 +100,9 @@ pub async fn list_clients(
         // An entry is an alias if *any* of its IPs has a manual alias.
         if is_alias {
             group.is_alias = true;
+        }
+        if blocking_bypassed {
+            group.blocking_bypassed = true;
         }
     }
 

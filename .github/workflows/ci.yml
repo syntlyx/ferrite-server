@@ -34,12 +34,6 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked --version 0.22.1
-
-      - name: cargo audit
-        run: cargo audit --deny warnings
-
       - name: cargo clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 

@@ -39,11 +39,15 @@ pub fn with_release_auth(request: RequestBuilder) -> RequestBuilder {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct Release {
     pub tag_name: String,
     pub body: Option<String>,
     pub assets: Vec<ReleaseAsset>,
+    #[serde(default)]
+    pub draft: bool,
+    #[serde(default)]
+    pub prerelease: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -77,6 +81,50 @@ pub fn update_available(
     };
 
     version_newer || checksum_changed
+}
+
+/// Fetch recent releases for the given GitHub repo. Returns an empty list if no releases exist.
+pub async fn fetch_releases(owner: &str, repo: &str, limit: usize) -> Result<Vec<Release>> {
+    let per_page = limit.clamp(1, 100);
+    let url = format!(
+        "{}/repos/{}/{}/releases?per_page={}",
+        RELEASE_API_BASE.trim_end_matches('/'),
+        owner,
+        repo,
+        per_page
+    );
+
+    let resp = with_release_auth(
+        HTTP_CLIENT
+            .get(&url)
+            .header("accept", "application/vnd.github+json")
+            .header("x-github-api-version", "2022-11-28"),
+    )
+    .send()
+    .await
+    .map_err(FeriteError::Http)?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(Vec::new());
+    }
+
+    if is_rate_limited(resp.status()) {
+        tracing::warn!(
+            "GitHub release API is rate limited for {}/{}; falling back to latest release only",
+            owner,
+            repo
+        );
+        return Ok(fetch_latest_release(owner, repo)
+            .await?
+            .into_iter()
+            .collect());
+    }
+
+    resp.error_for_status()
+        .map_err(FeriteError::Http)?
+        .json()
+        .await
+        .map_err(FeriteError::Http)
 }
 
 /// Fetch the latest release for the given GitHub repo. Returns `None` if no releases exist.
@@ -140,6 +188,8 @@ async fn fetch_latest_release_from_downloads(owner: &str, repo: &str) -> Result<
     Ok(Some(Release {
         tag_name: tag,
         body: None,
+        draft: false,
+        prerelease: false,
         assets: vec![
             ReleaseAsset {
                 name: asset_name.clone(),
@@ -153,6 +203,28 @@ async fn fetch_latest_release_from_downloads(owner: &str, repo: &str) -> Result<
             },
         ],
     }))
+}
+
+pub async fn fetch_asset_text(release: &Release, asset_name: &str) -> Result<Option<String>> {
+    let Some(asset) = release.assets.iter().find(|a| a.name == asset_name) else {
+        return Ok(None);
+    };
+
+    let resp = with_release_auth(HTTP_CLIENT.get(&asset.browser_download_url))
+        .send()
+        .await
+        .map_err(FeriteError::Http)?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+
+    resp.error_for_status()
+        .map_err(FeriteError::Http)?
+        .text()
+        .await
+        .map(Some)
+        .map_err(FeriteError::Http)
 }
 
 async fn fetch_latest_release_tag(owner: &str, repo: &str) -> Result<Option<String>> {
@@ -282,6 +354,8 @@ mod tests {
         Release {
             tag_name: "v0.1.0".to_string(),
             body: None,
+            draft: false,
+            prerelease: false,
             assets,
         }
     }

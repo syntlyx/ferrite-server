@@ -3,10 +3,12 @@ use std::path::PathBuf;
 use axum::{extract::State, Json};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 
 use crate::api::auth::hash_password;
 use crate::api::ApiError;
 use crate::app::AppState;
+use crate::clients::normalize_client_key;
 use crate::config::{UpstreamConfig, ZoneConfig};
 use crate::dns::cache::{MAX_TTL, MIN_TTL};
 use crate::error::FeriteError;
@@ -62,7 +64,9 @@ mod nullable {
 
 /// All fields that can be changed via PATCH /api/settings.
 ///
-/// Hot-patchable (no restart): `api_key`, `password`, `dns_min_ttl`, `dns_max_ttl`, `web_dir`.
+/// Hot-patchable (no restart): `api_key`, `password`, `dns_min_ttl`, `dns_max_ttl`,
+///                             `dns_log_ignore`, `web_dir`, `log_retention_days`,
+///                             `blocklist_enabled`, `blocklist_client_bypass`.
 /// Restart-required:           `dns_bind_addr`, `dns_cache_size`, `api_bind_addr`,
 ///                             `blocklist_decision_cache_size`, `upstream`, `zones`.
 #[derive(Debug, Deserialize, Default)]
@@ -78,6 +82,8 @@ pub struct SettingsPatch {
     #[serde(default, deserialize_with = "nullable::deserialize")]
     pub web_dir: Option<Option<PathBuf>>,
     pub log_retention_days: Option<u32>,
+    pub blocklist_enabled: Option<bool>,
+    pub blocklist_client_bypass: Option<Vec<String>>,
 
     // ── Restart-required ─────────────────────────────────────────────────────
     pub dns_bind_addr: Option<String>,
@@ -118,6 +124,8 @@ pub async fn update_settings(
     let mut hot_changed: Vec<&'static str> = Vec::new();
     let mut restart_changed: Vec<&'static str> = Vec::new();
     let mut ttl_bounds_to_apply: Option<(u64, u64)> = None;
+    let mut blocklist_enabled_to_apply: Option<bool> = None;
+    let mut blocklist_client_bypass_to_apply: Option<Vec<String>> = None;
 
     {
         let mut cfg = state.live_config.write();
@@ -198,6 +206,19 @@ pub async fn update_settings(
             hot_changed.push("log_retention_days");
         }
 
+        if let Some(enabled) = patch.blocklist_enabled {
+            cfg.blocklist.enabled = enabled;
+            blocklist_enabled_to_apply = Some(enabled);
+            hot_changed.push("blocklist_enabled");
+        }
+
+        if let Some(ref entries) = patch.blocklist_client_bypass {
+            let normalized = normalize_client_bypass(entries)?;
+            cfg.blocklist.client_bypass = normalized.clone();
+            blocklist_client_bypass_to_apply = Some(normalized);
+            hot_changed.push("blocklist_client_bypass");
+        }
+
         // ── Restart-required ─────────────────────────────────────────────────
 
         if let Some(ref addr) = patch.dns_bind_addr {
@@ -259,6 +280,14 @@ pub async fn update_settings(
         state.inner.dns_cache.set_ttl_bounds(min, max);
     }
 
+    if let Some(enabled) = blocklist_enabled_to_apply {
+        state.inner.blocklist.set_blocking_enabled(enabled);
+    }
+
+    if let Some(entries) = blocklist_client_bypass_to_apply {
+        state.inner.blocklist.set_client_bypass(&entries);
+    }
+
     let all_changed = hot_changed.len() + restart_changed.len();
     if all_changed == 0 {
         return Ok(Json(json!({
@@ -298,6 +327,20 @@ pub async fn update_settings(
         "persisted": saved_path.is_some(),
         "saved_to": saved_path,
     })))
+}
+
+fn normalize_client_bypass(entries: &[String]) -> Result<Vec<String>, ApiError> {
+    let mut normalized = BTreeSet::new();
+    for entry in entries {
+        let key = normalize_client_key(entry).ok_or_else(|| {
+            ApiError(FeriteError::Config(format!(
+                "invalid blocklist_client_bypass entry: {}",
+                entry
+            )))
+        })?;
+        normalized.insert(key);
+    }
+    Ok(normalized.into_iter().collect())
 }
 
 async fn persist_config(state: &AppState) -> Option<String> {
@@ -390,6 +433,11 @@ mod tests {
                 dns_log_ignore: Some(log_ignore.clone()),
                 web_dir: Some(Some(web_dir.clone())),
                 log_retention_days: Some(14),
+                blocklist_enabled: Some(false),
+                blocklist_client_bypass: Some(vec![
+                    "::ffff:192.0.2.10".to_string(),
+                    "AA-BB-CC-DD-EE-FF".to_string(),
+                ]),
                 ..Default::default()
             }),
         )
@@ -407,12 +455,28 @@ mod tests {
         assert_eq!(cfg.dns.max_ttl, 240);
         assert_eq!(cfg.storage.log_retention_days, 14);
         assert_eq!(cfg.web_dir.as_ref(), Some(&web_dir));
+        assert!(!cfg.blocklist.enabled);
+        assert_eq!(
+            cfg.blocklist.client_bypass,
+            vec!["192.0.2.10".to_string(), "aa:bb:cc:dd:ee:ff".to_string()]
+        );
+        assert!(!state.inner.blocklist.blocking_enabled());
+        assert!(state
+            .inner
+            .blocklist
+            .client_bypasses_blocking("192.0.2.10", None));
+        assert!(state
+            .inner
+            .blocklist
+            .client_bypasses_blocking("192.0.2.99", Some("aa:bb:cc:dd:ee:ff")));
 
         let saved: Config = toml::from_str(&std::fs::read_to_string(&config_path).unwrap())
             .expect("persisted config should parse");
         assert_eq!(saved.api.api_key.as_deref(), Some("new-key"));
         assert_eq!(saved.dns.log_ignore, log_ignore);
         assert_eq!(saved.web_dir.as_ref(), Some(&web_dir));
+        assert!(!saved.blocklist.enabled);
+        assert_eq!(saved.blocklist.client_bypass, cfg.blocklist.client_bypass);
 
         drop(state);
         test_support::cleanup_sqlite(&db_path);
@@ -492,6 +556,36 @@ mod tests {
 
         assert!(err.0.to_string().contains("api_key cannot be empty"));
         assert!(state.live_config.read().api.api_key.is_none());
+        assert!(!config_path.exists());
+
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
+    }
+
+    #[tokio::test]
+    async fn invalid_client_bypass_patch_is_rejected_without_mutating_config() {
+        let (state, db_path, config_path) =
+            test_support::app_state_with_config_path("settings-invalid-client-bypass").await;
+
+        let err = update_settings(
+            State(state.clone()),
+            Json(SettingsPatch {
+                blocklist_client_bypass: Some(vec!["not-an-ip-or-mac".to_string()]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err
+            .0
+            .to_string()
+            .contains("invalid blocklist_client_bypass"));
+        assert!(state.live_config.read().blocklist.client_bypass.is_empty());
+        assert!(!state
+            .inner
+            .blocklist
+            .client_bypasses_blocking("192.0.2.10", None));
         assert!(!config_path.exists());
 
         drop(state);

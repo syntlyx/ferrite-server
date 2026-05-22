@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use crate::clients::normalize_client_key;
 use crate::error::{FeriteError, Result};
 
 /// XDG-style config dir: always `~/.config/ferrite` on every platform.
@@ -179,11 +181,13 @@ pub struct ApiConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct BlocklistConfig {
+    pub enabled: bool,
     #[serde(default = "default_blocklist_decision_cache_size")]
     pub decision_cache_size: usize,
     pub lists: Vec<ListConfig>,
     pub wildcard_block: Vec<String>,
     pub whitelist: Vec<String>,
+    pub client_bypass: Vec<String>,
 }
 
 fn default_blocklist_decision_cache_size() -> usize {
@@ -239,6 +243,7 @@ impl Default for ApiConfig {
 impl Default for BlocklistConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             decision_cache_size: default_blocklist_decision_cache_size(),
             lists: vec![ListConfig {
                 url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts".to_string(),
@@ -247,6 +252,7 @@ impl Default for BlocklistConfig {
             }],
             wildcard_block: vec![],
             whitelist: vec![],
+            client_bypass: vec![],
         }
     }
 }
@@ -307,6 +313,7 @@ impl Config {
 
     pub fn normalize(&mut self) {
         self.api.normalize();
+        self.blocklist.normalize();
     }
 
     pub fn config_candidates() -> Vec<PathBuf> {
@@ -350,6 +357,17 @@ impl ApiConfig {
 
     pub fn has_password(&self) -> bool {
         self.password_hash().is_some()
+    }
+}
+
+impl BlocklistConfig {
+    pub fn normalize(&mut self) {
+        let normalized: BTreeSet<String> = self
+            .client_bypass
+            .iter()
+            .filter_map(|key| normalize_client_key(key))
+            .collect();
+        self.client_bypass = normalized.into_iter().collect();
     }
 }
 

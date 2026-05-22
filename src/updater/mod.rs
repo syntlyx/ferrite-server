@@ -22,6 +22,15 @@ pub struct AvailableUpdate {
     pub download_url: String,
     pub release_notes: String,
     pub sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_compat: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct IncompatibleUpdate {
+    pub version: String,
+    pub required_server: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -32,6 +41,7 @@ pub struct UpdateCheckSnapshot {
     pub current_web_sha256: Option<String>,
     pub server_update: Option<AvailableUpdate>,
     pub web_update: Option<AvailableUpdate>,
+    pub incompatible_web_update: Option<IncompatibleUpdate>,
     pub checked_at: Option<i64>,
     pub cache_ttl_seconds: u64,
     pub stale: bool,
@@ -159,18 +169,22 @@ async fn live_update_check(state: &AppState) -> Result<UpdateCheckSnapshot> {
 
     let (server_info, web_info) = tokio::join!(
         server::check(&current.current_server_version),
-        web::check_web_update(
+        web::check_web_update_for_server(
             &current.current_web_version,
-            current.current_web_sha256.as_deref()
+            current.current_web_sha256.as_deref(),
+            &current.current_server_version,
         ),
     );
 
     let server_update = server_info?.map(AvailableUpdate::from);
-    let web_update = web_info?.map(AvailableUpdate::from);
+    let web_info = web_info?;
+    let web_update = web_info.update.map(AvailableUpdate::from);
+    let incompatible_web_update = web_info.incompatible_latest.map(IncompatibleUpdate::from);
 
     Ok(UpdateCheckSnapshot {
         server_update,
         web_update,
+        incompatible_web_update,
         checked_at: Some(now_ts()),
         ..current
     })
@@ -203,6 +217,7 @@ async fn installed_versions_snapshot(
         current_web_sha256,
         server_update: None,
         web_update: None,
+        incompatible_web_update: None,
         checked_at: None,
         cache_ttl_seconds: CHECK_CACHE_TTL.as_secs(),
         stale: check_pending,
@@ -218,6 +233,7 @@ impl From<server::UpdateInfo> for AvailableUpdate {
             download_url: info.download_url,
             release_notes: info.release_notes,
             sha256: info.sha256,
+            server_compat: None,
         }
     }
 }
@@ -229,6 +245,17 @@ impl From<web::WebUpdateInfo> for AvailableUpdate {
             download_url: info.download_url,
             release_notes: info.release_notes,
             sha256: info.sha256,
+            server_compat: Some(info.server_compat),
+        }
+    }
+}
+
+impl From<web::IncompatibleWebUpdate> for IncompatibleUpdate {
+    fn from(info: web::IncompatibleWebUpdate) -> Self {
+        Self {
+            version: info.version,
+            required_server: info.required_server,
+            reason: info.reason,
         }
     }
 }
@@ -294,6 +321,7 @@ mod tests {
             current_web_sha256: None,
             server_update: None,
             web_update: None,
+            incompatible_web_update: None,
             checked_at: Some(123),
             cache_ttl_seconds: CHECK_CACHE_TTL.as_secs(),
             stale: true,
@@ -331,6 +359,7 @@ mod tests {
             download_url: "https://example.test/ferrite.tar.gz".to_string(),
             release_notes: String::new(),
             sha256: None,
+            server_compat: None,
         });
         cache.store(previous);
 

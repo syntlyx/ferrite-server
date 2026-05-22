@@ -55,34 +55,24 @@ pub async fn handle_query(
     let name = name.trim_end_matches('.').to_string();
     // Normalise IPv4-mapped IPv6 (::ffff:a.b.c.d) to plain IPv4 so the DB
     // stores clean addresses and PTR grouping works correctly.
-    let client_ip = unmap_v4(src.ip()).to_string();
+    let client_addr = unmap_v4(src.ip());
+    let client_ip = client_addr.to_string();
+    let blocking_enabled = state.blocklist.blocking_enabled();
+    let client_mac = if blocking_enabled && state.blocklist.has_client_bypass() {
+        state.client_registry.get_mac(client_addr)
+    } else {
+        None
+    };
+    let filtering_enabled = blocking_enabled
+        && !state
+            .blocklist
+            .client_bypasses_blocking_normalized(&client_ip, client_mac.as_deref());
     let qtype: u16 = question.query_type().into();
     let log_ignored = is_log_ignored(&name, &state.log_ignore.read());
 
     tracing::debug!("query {:?} {} from {}", question.query_type(), name, src);
 
-    // ── Step 1: DNS response cache ────────────────────────────────────────
-    if let Some(cached) = state.dns_cache.get(&name, qtype) {
-        if !log_ignored {
-            let elapsed = start.elapsed().as_millis() as u32;
-            emit(
-                &state,
-                &query_tx,
-                make_entry(
-                    &name,
-                    qtype,
-                    &client_ip,
-                    QueryStatus::Cached,
-                    elapsed,
-                    None,
-                    0,
-                ),
-            );
-        }
-        return Ok(patch_id(&cached.bytes, query.metadata.id));
-    }
-
-    // ── Step 2: Custom DNS records (local overrides, beat blocklist) ──────
+    // ── Step 1: Custom DNS records (local overrides, beat blocklist) ──────
     if let Some(custom_resp) = state.custom_records.lookup(&query, &name, qtype) {
         state.dns_cache.insert(&name, qtype, custom_resp.clone());
         if !log_ignored {
@@ -104,8 +94,9 @@ pub async fn handle_query(
         return Ok(patch_id(&custom_resp.bytes, query.metadata.id));
     }
 
-    // ── Step 3: Blocklist (skipped for whitelisted domains) ───────────────
-    if !state.blocklist.is_whitelisted_normalized(&name)
+    // ── Step 2: Blocklist (skipped when globally disabled or client bypasses filtering) ──
+    if filtering_enabled
+        && !state.blocklist.is_whitelisted_normalized(&name)
         && state.blocklist.is_blocked_normalized(&name)
     {
         tracing::debug!("blocked: {}", name);
@@ -128,6 +119,52 @@ pub async fn handle_query(
         return Ok(build_nxdomain(&query));
     }
 
+    // ── Step 3: DNS response cache ────────────────────────────────────────
+    if let Some(cached) = state.dns_cache.get(&name, qtype) {
+        if filtering_enabled {
+            if let Some(blocked_cname) =
+                cname_blocked_target(&cached.bytes, &name, &state.blocklist)
+            {
+                tracing::debug!("CNAME-blocked from cache: {} → {}", name, blocked_cname);
+                if !log_ignored {
+                    let elapsed = start.elapsed().as_millis() as u32;
+                    emit(
+                        &state,
+                        &query_tx,
+                        make_entry(
+                            &name,
+                            qtype,
+                            &client_ip,
+                            QueryStatus::Blocked,
+                            elapsed,
+                            Some(format!("cname:{}", blocked_cname)),
+                            3,
+                        ),
+                    );
+                }
+                return Ok(build_nxdomain(&query));
+            }
+        }
+
+        if !log_ignored {
+            let elapsed = start.elapsed().as_millis() as u32;
+            emit(
+                &state,
+                &query_tx,
+                make_entry(
+                    &name,
+                    qtype,
+                    &client_ip,
+                    QueryStatus::Cached,
+                    elapsed,
+                    None,
+                    0,
+                ),
+            );
+        }
+        return Ok(patch_id(&cached.bytes, query.metadata.id));
+    }
+
     // ── Step 4: Forward to upstream ───────────────────────────────────────
     let (response_bytes, rcode, upstream_label) =
         match state.upstream_pool.resolve_raw(raw.clone()).await {
@@ -144,7 +181,7 @@ pub async fn handle_query(
     // ── Step 5: CNAME inspection ───────────────────────────────────────────
     // Walk the answer section. If any CNAME target is blocked (and the queried
     // name is not whitelisted), return NXDOMAIN without caching.
-    if rcode == 0 {
+    if rcode == 0 && filtering_enabled {
         if let Some(blocked_cname) = cname_blocked_target(&response_bytes, &name, &state.blocklist)
         {
             tracing::debug!("CNAME-blocked: {} → {}", name, blocked_cname);
@@ -385,10 +422,12 @@ mod tests {
     fn blocklist() -> Blocklist {
         Blocklist::new(
             BlocklistConfig {
+                enabled: true,
                 decision_cache_size: 128,
                 lists: vec![],
                 wildcard_block: vec![],
                 whitelist: vec![],
+                client_bypass: vec![],
             },
             temp_fst_path("ferrite-dns-handler"),
         )
@@ -573,6 +612,89 @@ mod tests {
         assert_eq!(entry.status, QueryStatus::Blocked);
         assert_eq!(entry.rcode, 3);
         assert_eq!(state.inner.live_stats.blocked(), 1);
+
+        drop(rx);
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
+    }
+
+    #[tokio::test]
+    async fn blocklist_check_precedes_cached_response_for_filtered_clients() {
+        let (state, db_path) = test_support::app_state("dns-blocked-cache").await;
+        state.inner.blocklist.add_blacklist("ads.test").unwrap();
+        state.inner.dns_cache.insert(
+            "ads.test",
+            1,
+            DnsResponse {
+                bytes: bytes::Bytes::from(a_response(
+                    0x1111,
+                    "ads.test",
+                    Ipv4Addr::new(192, 0, 2, 9),
+                    120,
+                )),
+                ttl: 120,
+            },
+        );
+        let mut rx = state.query_rx.lock().take().unwrap();
+
+        let response = handle_query(
+            query("ads.test", RecordType::A).to_bytes().unwrap(),
+            SocketAddr::from(([192, 0, 2, 10], 53_000)),
+            Arc::clone(&state.inner),
+            state.query_tx.clone(),
+        )
+        .await
+        .unwrap();
+        let msg = Message::from_bytes(&response).unwrap();
+        let entry = rx.try_recv().unwrap();
+
+        assert_eq!(msg.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(entry.status, QueryStatus::Blocked);
+
+        drop(rx);
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
+    }
+
+    #[tokio::test]
+    async fn client_bypass_allows_cached_blacklisted_domain() {
+        let (state, db_path) = test_support::app_state("dns-client-bypass").await;
+        state.inner.blocklist.add_blacklist("ads.test").unwrap();
+        state
+            .inner
+            .blocklist
+            .set_client_bypass(&["192.0.2.10".to_string()]);
+        state.inner.dns_cache.insert(
+            "ads.test",
+            1,
+            DnsResponse {
+                bytes: bytes::Bytes::from(a_response(
+                    0x1111,
+                    "ads.test",
+                    Ipv4Addr::new(192, 0, 2, 9),
+                    120,
+                )),
+                ttl: 120,
+            },
+        );
+        let mut rx = state.query_rx.lock().take().unwrap();
+
+        let response = handle_query(
+            query_with_id(0x2222, "ads.test", RecordType::A)
+                .to_bytes()
+                .unwrap(),
+            SocketAddr::from(([192, 0, 2, 10], 53_000)),
+            Arc::clone(&state.inner),
+            state.query_tx.clone(),
+        )
+        .await
+        .unwrap();
+        let msg = Message::from_bytes(&response).unwrap();
+        let entry = rx.try_recv().unwrap();
+
+        assert_eq!(msg.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(msg.metadata.id, 0x2222);
+        assert_eq!(entry.status, QueryStatus::Cached);
 
         drop(rx);
         drop(state);
