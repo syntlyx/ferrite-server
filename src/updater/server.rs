@@ -18,6 +18,11 @@ pub struct UpdateInfo {
 /// Check GitHub Releases for a newer server artifact.
 /// Returns `Ok(Some(info))` if an update is available, `Ok(None)` if up-to-date.
 pub async fn check(current_version: &str) -> Result<Option<UpdateInfo>> {
+    if !server_self_update_enabled() {
+        tracing::debug!("server self-update is disabled by FERRITE_SERVER_SELF_UPDATE");
+        return Ok(None);
+    }
+
     let release = match fetch_latest_release(RELEASE_OWNER, RELEASE_REPO_SERVER).await? {
         Some(r) => r,
         None => return Ok(None),
@@ -65,6 +70,7 @@ pub async fn apply(info: &UpdateInfo) -> Result<()> {
     let expected_sha256 = info.sha256.clone();
     let current_exe = std::env::current_exe()?;
     let checksum_path = checksum_path_for(&current_exe);
+    let version_path = version_path_for(&current_exe);
 
     preflight_update_target(&current_exe)?;
 
@@ -143,6 +149,7 @@ pub async fn apply(info: &UpdateInfo) -> Result<()> {
     } else {
         checksum::remove_file_if_exists(&checksum_path).await?;
     }
+    tokio::fs::write(&version_path, format!("{version}\n")).await?;
 
     tracing::info!("server updated to v{} — restart to apply", version);
     Ok(())
@@ -153,8 +160,29 @@ pub async fn installed_sha256() -> Result<Option<String>> {
     checksum::read_sha256_file(&checksum_path_for(&current_exe)).await
 }
 
+fn server_self_update_enabled() -> bool {
+    let Ok(value) = std::env::var("FERRITE_SERVER_SELF_UPDATE") else {
+        return true;
+    };
+    env_flag_enabled(Some(&value))
+}
+
+fn env_flag_enabled(value: Option<&str>) -> bool {
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(value) => !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off" | "disabled"
+        ),
+        None => true,
+    }
+}
+
 fn checksum_path_for(current_exe: &Path) -> PathBuf {
     current_exe.with_extension("sha256")
+}
+
+fn version_path_for(current_exe: &Path) -> PathBuf {
+    current_exe.with_extension("version")
 }
 
 fn preflight_update_target(current_exe: &Path) -> Result<()> {
@@ -193,6 +221,22 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
 
         preflight_update_target(&path).unwrap();
+    }
+
+    #[test]
+    fn server_self_update_flag_defaults_enabled() {
+        assert!(env_flag_enabled(None));
+        assert!(env_flag_enabled(Some("")));
+        assert!(env_flag_enabled(Some("true")));
+    }
+
+    #[test]
+    fn server_self_update_flag_accepts_common_disabled_values() {
+        assert!(!env_flag_enabled(Some("0")));
+        assert!(!env_flag_enabled(Some("false")));
+        assert!(!env_flag_enabled(Some("off")));
+        assert!(!env_flag_enabled(Some("no")));
+        assert!(!env_flag_enabled(Some("disabled")));
     }
 
     #[cfg(unix)]

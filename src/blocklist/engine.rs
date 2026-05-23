@@ -406,6 +406,12 @@ impl Blocklist {
             }
         }
 
+        if !lists.is_empty() && per_list_fsts.is_empty() {
+            return Err(FeriteError::Fst(
+                "all enabled blocklists failed and no cached domains are available".to_string(),
+            ));
+        }
+
         *self.domain_counts.write() = counts;
 
         let fst_path = self.fst_path.clone();
@@ -530,6 +536,45 @@ mod tests {
         assert!(blocklist.is_blocked("tracker.ads.test"));
         blocklist.refresh().await.unwrap();
         assert!(blocklist.is_blocked("tracker.ads.test"));
+    }
+
+    #[tokio::test]
+    async fn refresh_keeps_existing_fst_when_enabled_lists_all_fail() {
+        let fst_path = temp_fst_path("ferrite-blocklist-all-fail");
+        std::fs::create_dir_all(fst_path.parent().unwrap()).unwrap();
+        let original =
+            crate::blocklist::loader::build_fst(vec!["blocked.test".to_string()]).unwrap();
+        std::fs::write(&fst_path, original).unwrap();
+
+        let blocklist = Blocklist::new(
+            BlocklistConfig {
+                enabled: true,
+                decision_cache_size: 50_000,
+                lists: vec![ListConfig {
+                    name: "Missing".to_string(),
+                    url: "file:///this/path/does/not/exist".to_string(),
+                    enabled: true,
+                }],
+                wildcard_block: vec![],
+                whitelist: vec![],
+                client_bypass: vec![],
+            },
+            fst_path.clone(),
+        );
+
+        assert!(blocklist.load_from_disk());
+        assert!(blocklist.is_blocked("blocked.test"));
+
+        let err = blocklist.refresh().await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("all enabled blocklists failed and no cached domains are available"));
+        assert!(blocklist.is_blocked("blocked.test"));
+
+        let persisted = std::fs::read(fst_path).unwrap();
+        let map = Map::new(persisted).unwrap();
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("blocked.test".as_bytes()));
     }
 
     #[test]

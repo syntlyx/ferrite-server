@@ -73,10 +73,14 @@ pub fn update_available(
     latest_sha256: Option<&str>,
     installed_sha256: Option<&str>,
 ) -> bool {
-    let version_newer = parse_semver(latest_version) > parse_semver(current_version);
+    let latest = parse_semver(latest_version);
+    let current = parse_semver(current_version);
+    let version_newer = latest > current;
     let checksum_changed = match (latest_sha256, installed_sha256) {
-        (Some(latest), Some(current)) => latest != current,
-        (Some(_), None) => true,
+        (Some(latest_sha256), Some(current_sha256)) => {
+            latest == current && latest_sha256 != current_sha256
+        }
+        (Some(_), None) => latest == current,
         _ => false,
     };
 
@@ -415,6 +419,16 @@ mod tests {
     #[test]
     fn update_available_when_newer_version_has_no_installed_checksum() {
         assert!(update_available("0.1.1", "0.1.0", Some(SHA_A), None));
+    }
+
+    #[test]
+    fn update_not_available_when_release_is_older_even_if_checksum_differs() {
+        assert!(!update_available(
+            "0.1.0",
+            "0.1.1",
+            Some(SHA_A),
+            Some(SHA_B)
+        ));
     }
 
     #[test]

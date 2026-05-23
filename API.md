@@ -913,7 +913,7 @@ repos or higher API limits.
 }
 ```
 
-`server_update` and `web_update` are `null` when that component is already up to date. If the release tag is recreated with the same semantic version but a different asset digest, the matching update object is returned so the same-version artifact can still be applied. `web_update.server_compat` is included when a compatible web release is available. `incompatible_web_update` is present when a newer web release exists but requires a different server version range. `check_pending` is `true` before the first background check completes; `stale` is `true` when the cached result is older than the TTL or the latest refresh failed.
+`server_update` and `web_update` are `null` when that component is already up to date. If the release tag is recreated with the same semantic version but a different asset digest, the matching update object is returned so the same-version artifact can still be applied; older releases are ignored even when their digest differs. `web_update.server_compat` is included when a compatible web release is available. `incompatible_web_update` is present when a newer web release exists but requires a different server version range. `check_pending` is `true` before the first background check completes; `stale` is `true` when the cached result is older than the TTL or the latest refresh failed.
 
 ### `POST /api/update/server` — apply server update
 
@@ -930,6 +930,13 @@ Systemd lists the directory in the unit `ReadWritePaths`; OpenRC uses
 not depend on file `setcap`. Other install layouts must make the current
 executable directory writable by the running service user, or update the server
 by rerunning the installer with sudo/root.
+
+Container images run the server from the mounted
+`/var/lib/ferrite/bin/ferrite` path. The Alpine entrypoint installs or refreshes
+that binary from GitHub releases on startup, so application releases do not
+require rebuilding the image. `POST /api/update/server` can also replace the
+mounted binary in place, then ferrite exits so the container runtime can restart
+it on the updated binary.
 
 ```json
 {

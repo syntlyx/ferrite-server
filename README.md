@@ -58,13 +58,19 @@ docker run -d --name ferrite \
   ghcr.io/syntlyx/ferrite-server:latest
 ```
 
-The image runs Ferrite as the unprivileged `ferrite` user and ships a container default
-config with DNS on `0.0.0.0:53`, API/web on `0.0.0.0:80`, SQLite storage under
-`/var/lib/ferrite`, and web assets under `/var/lib/ferrite/web`. Mount
-`/var/lib/ferrite` to persistent storage. On first start, the entrypoint copies
-the default config to `/var/lib/ferrite/.config/ferrite/config.toml`, so settings
-changed through the API survive image updates. If your runtime strips file
-capabilities and port 53 fails to bind, add `--cap-add=NET_BIND_SERVICE`.
+Docker publishes TCP and UDP with separate rules, but Ferrite uses one DNS
+listener address: keep both rules on the same host/container port (`53:53`).
+
+The image is a small Alpine runtime. On startup, the entrypoint downloads the
+latest Ferrite server and web release assets, verifies their `.sha256` sidecars
+when available, installs them under `/var/lib/ferrite`, and then runs Ferrite as
+the unprivileged `ferrite` user. The container default config listens for DNS on
+`0.0.0.0:53`, API/web on `0.0.0.0:80`, stores SQLite data under
+`/var/lib/ferrite`, runs the server binary from `/var/lib/ferrite/bin/ferrite`,
+and serves web assets from `/var/lib/ferrite/web`. Mount `/var/lib/ferrite` to
+persistent storage so config, data, server updates, and web updates survive
+container restarts. If your runtime strips file capabilities and port 53 fails
+to bind, add `--cap-add=NET_BIND_SERVICE`.
 If host port 80 is already taken, keep Ferrite on container port 80 and map a
 different host port, for example `-p 8080:80`.
 
@@ -73,10 +79,19 @@ usually work, but CPU temperature is normally unavailable unless the Linux host
 explicitly exposes hardware sensor files; ferrite reports it as `null` when the
 runtime hides sensors.
 
-For containers, update the server by pulling a newer image and recreating the
-container. The `/api/update/server` self-update path is intended for host
-installs from `install.sh`; `/api/update/web` can still update the mounted web
-directory.
+For containers, application releases do not require rebuilding or pulling a new
+image. Restarting the container after a release is enough: the entrypoint checks
+GitHub releases and refreshes `/var/lib/ferrite/bin/ferrite` and
+`/var/lib/ferrite/web` when a newer release, or a same-version checksum change,
+is available. `POST /api/update/server` still works too: it updates the mounted
+server binary in place, then exits so Docker can restart the container on the new
+binary. Use a restart policy such as `--restart unless-stopped` if you want that
+restart to be automatic.
+
+Pin startup installs with `FERRITE_SERVER_VERSION=0.1.1`; `FERRITE_WEB_VERSION`
+defaults to the same value unless set separately. Leave both unset to track the
+latest releases. For private repos or higher API limits, pass
+`FERRITE_RELEASE_TOKEN` or `GITHUB_TOKEN`.
 
 Build locally:
 
