@@ -8,12 +8,7 @@ rust-version = "1.88"
 name = "ferrite"
 path = "src/main.rs"
 
-[features]
-default = []
-storage-redis = ["dep:fred"]
-
 [dependencies]
-fred = { version = "10", optional = true, features = ["i-keys", "i-hashes", "i-lists", "i-sorted-sets"] }
 tokio = { version = "1", features = ["full"] }
 hickory-resolver = { version = "0.26.1", features = ["tls-ring", "https-ring", "quic-ring"] }
 hickory-proto = "0.26.1"

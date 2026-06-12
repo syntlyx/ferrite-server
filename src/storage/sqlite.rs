@@ -105,13 +105,16 @@ impl Storage for SqliteStorage {
                 let mut client_buckets: HashMap<(i64, String), ClientBucketAgg> = HashMap::new();
 
                 {
+                    // Explicit id: keeps SQLite ids identical to in-memory ids
+                    // (counter is seeded from MAX(id) at startup, so no collisions).
                     let mut stmt = tx.prepare_cached(
-                        "INSERT INTO queries (timestamp, domain, query_type, client_ip, status, latency_ms, upstream, rcode)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        "INSERT INTO queries (id, timestamp, domain, query_type, client_ip, status, latency_ms, upstream, rcode)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     )?;
                     for e in &entries {
                         let ts = e.timestamp.timestamp();
                         stmt.execute(rusqlite::params![
+                            e.id as i64,
                             ts,
                             e.domain,
                             e.query_type as i64,
@@ -818,8 +821,11 @@ mod tests {
     }
 
     fn query_entry(ts: i64, domain: &str, client_ip: &str, status: QueryStatus) -> QueryEntry {
+        // Unique monotonic ids: write_batch persists entry ids verbatim,
+        // and queries.id is a PRIMARY KEY.
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         QueryEntry {
-            id: 0,
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             timestamp: chrono::DateTime::from_timestamp(ts, 0).unwrap(),
             domain: domain.to_string(),
             query_type: 1,

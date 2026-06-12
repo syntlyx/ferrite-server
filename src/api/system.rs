@@ -11,10 +11,16 @@ use crate::error::FeriteError;
 /// Cache TTL for system stats — sysinfo is expensive (200ms sleep + hwmon reads).
 const SYSTEM_STATS_TTL: Duration = Duration::from_secs(3);
 
+/// Sampling window for network throughput (delta between two refreshes).
+const NET_SAMPLE_WINDOW: Duration = Duration::from_millis(200);
+
 /// GET /api/stats/system — CPU, memory, swap, network I/O, disk, temperature, uptime.
 ///
 /// Result is cached for 3 seconds to prevent concurrent sysinfo spawns when the
 /// dashboard polls frequently (multiple tabs, reconnects, etc.).
+///
+/// Both CPU values come from the shared `CpuSampler` (same tick, same window),
+/// so global and process usage are directly comparable.
 pub async fn get_system_stats(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     // Return cached value if still fresh.
     {
@@ -26,9 +32,10 @@ pub async fn get_system_stats(State(state): State<AppState>) -> Result<Json<Valu
         }
     }
 
-    let cpu_percent = state.cpu_sampler.cpu_percent();
+    let global_cpu = state.cpu_sampler.global_cpu_percent();
+    let process_cpu = state.cpu_sampler.process_cpu_percent();
 
-    let stats = tokio::task::spawn_blocking(move || system_snapshot(cpu_percent))
+    let stats = tokio::task::spawn_blocking(move || system_snapshot(global_cpu, process_cpu))
         .await
         .map_err(|e| ApiError(FeriteError::Internal(e.to_string())))?;
 
@@ -37,25 +44,23 @@ pub async fn get_system_stats(State(state): State<AppState>) -> Result<Json<Valu
     Ok(Json(stats))
 }
 
-fn system_snapshot(process_cpu: f32) -> Value {
+fn system_snapshot(global_cpu: f32, process_cpu: f32) -> Value {
     use sysinfo::{Components, Networks, ProcessesToUpdate, System};
 
     let mut sys = System::new();
     let mut networks = Networks::new_with_refreshed_list();
     let self_pid = sysinfo::get_current_pid().ok();
 
-    if let Some(pid) = self_pid {
-        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), false);
-    }
-
-    let cpu = sampled_global_cpu_usage(&mut sys);
     sys.refresh_memory();
     if let Some(pid) = self_pid {
         sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), false);
     }
+
+    // Network throughput needs a delta between two refreshes.
+    std::thread::sleep(NET_SAMPLE_WINDOW);
     networks.refresh(true);
 
-    let interval_secs = sysinfo::MINIMUM_CPU_UPDATE_INTERVAL.as_secs_f64();
+    let interval_secs = NET_SAMPLE_WINDOW.as_secs_f64();
 
     let total_mem = sys.total_memory();
     let available_mem = sys.available_memory();
@@ -95,7 +100,7 @@ fn system_snapshot(process_cpu: f32) -> Value {
     let disk = collect_disk();
 
     serde_json::json!({
-        "cpu_usage_percent": cpu,
+        "cpu_usage_percent": global_cpu,
         "cpu_temp_celsius":  cpu_temp,
         "memory": memory_snapshot(total_mem, available_mem, free_mem),
         "swap": {
@@ -116,16 +121,6 @@ fn system_snapshot(process_cpu: f32) -> Value {
         "load_avg": { "one": load.one, "five": load.five, "fifteen": load.fifteen },
         "uptime_seconds": uptime,
     })
-}
-
-fn sampled_global_cpu_usage(sys: &mut sysinfo::System) -> f32 {
-    // sysinfo CPU usage is computed from the delta between two refreshes.
-    // A fresh System needs a baseline refresh, a short wait, then another
-    // refresh before global_cpu_usage() contains the sampled interval.
-    sys.refresh_cpu_usage();
-    std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
-    sys.refresh_cpu_usage();
-    sys.global_cpu_usage()
 }
 
 fn memory_snapshot(total: u64, available: u64, free: u64) -> Value {

@@ -37,11 +37,5 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
-      - name: cargo clippy (all features)
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
-
       - name: cargo test
         run: cargo test --all --locked
-
-      - name: cargo test (all features)
-        run: cargo test --all --all-features --locked

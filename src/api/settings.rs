@@ -42,16 +42,6 @@ pub async fn get_settings(State(state): State<AppState>) -> Result<Json<Value>, 
         };
     }
 
-    // The redis/valkey storage URL can embed credentials (redis://user:pass@host);
-    // mask the password in the userinfo so it isn't returned in plaintext.
-    if let Some(storage) = val.get_mut("storage") {
-        if let Some(url) = storage.get("url").and_then(|u| u.as_str()) {
-            if let Some(masked) = mask_url_password(url) {
-                storage["url"] = json!(masked);
-            }
-        }
-    }
-
     Ok(Json(val))
 }
 
@@ -383,25 +373,6 @@ pub async fn update_settings(
     })))
 }
 
-/// Replace the password in a `scheme://user:password@host...` URL with `***`.
-/// Returns `None` when there is no embedded password to mask (so the caller
-/// leaves the value untouched). Best-effort string surgery: it never errors,
-/// and on any unexpected shape it leaves the URL as-is.
-fn mask_url_password(url: &str) -> Option<String> {
-    let (scheme, rest) = url.split_once("://")?;
-    let (authority, tail) = match rest.split_once('/') {
-        Some((a, t)) => (a, Some(t)),
-        None => (rest, None),
-    };
-    let (userinfo, host) = authority.split_once('@')?;
-    let (user, _pass) = userinfo.split_once(':')?;
-    let masked_authority = format!("{}:***@{}", user, host);
-    Some(match tail {
-        Some(t) => format!("{}://{}/{}", scheme, masked_authority, t),
-        None => format!("{}://{}", scheme, masked_authority),
-    })
-}
-
 fn normalize_client_bypass(entries: &[String]) -> Result<Vec<String>, ApiError> {
     let mut normalized = BTreeSet::new();
     for entry in entries {
@@ -447,22 +418,6 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::test_support;
-
-    #[test]
-    fn mask_url_password_redacts_only_the_password() {
-        assert_eq!(
-            mask_url_password("redis://user:s3cret@host:6379"),
-            Some("redis://user:***@host:6379".to_string())
-        );
-        assert_eq!(
-            mask_url_password("redis://user:s3cret@host:6379/0"),
-            Some("redis://user:***@host:6379/0".to_string())
-        );
-        // No credentials → nothing to mask.
-        assert_eq!(mask_url_password("redis://127.0.0.1:6379"), None);
-        // Username only (no password) → leave untouched.
-        assert_eq!(mask_url_password("redis://user@host:6379"), None);
-    }
 
     #[tokio::test]
     async fn get_settings_masks_secret_fields_but_keeps_shape_stable() {

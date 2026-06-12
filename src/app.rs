@@ -12,11 +12,9 @@ use crate::config::{Config, CustomRecordConfig};
 use crate::dns::cache::DnsCache;
 use crate::dns::custom::CustomRecords;
 use crate::dns::types::QueryEntry;
-use crate::error::{FeriteError, Result};
+use crate::error::Result;
 use crate::stats::live::LiveStats;
 use crate::stats::CpuSampler;
-#[cfg(feature = "storage-redis")]
-use crate::storage::RedisStorage;
 use crate::storage::{SqliteStorage, Storage};
 use crate::upstream::{UpstreamPool, ZoneRouter};
 
@@ -78,25 +76,7 @@ impl AppState {
     /// Construct the full application state from configuration.
     pub async fn init(config: &Config, persistent_config: Config) -> Result<Self> {
         // Storage
-        let storage: Arc<dyn Storage> = match config.storage.backend.as_str() {
-            "sqlite" | "" => SqliteStorage::open(&config.storage.path).await?,
-            #[cfg(feature = "storage-redis")]
-            "redis" | "valkey" => {
-                RedisStorage::connect(&config.storage.url, &config.storage.key_prefix).await?
-            }
-            #[cfg(not(feature = "storage-redis"))]
-            "redis" | "valkey" => {
-                return Err(FeriteError::Config(
-                    "storage backend 'redis'/'valkey' requires --features storage-redis".into(),
-                ));
-            }
-            other => {
-                return Err(FeriteError::Config(format!(
-                    "unknown storage backend: {}",
-                    other
-                )));
-            }
-        };
+        let storage: Arc<dyn Storage> = SqliteStorage::open(&config.storage.path).await?;
 
         let data_dir = crate::config::data_dir();
 
@@ -220,6 +200,9 @@ impl AppState {
         {
             Ok(mut entries) => {
                 tracing::info!("seeded recent_queries with {} entries", entries.len());
+                if let Some(max_id) = entries.iter().map(|e| e.id).max() {
+                    crate::dns::handler::seed_query_counter(max_id);
+                }
                 entries.reverse(); // query_range returns newest-first; ring buffer needs oldest-first
                 live_stats.recent_queries.seed(entries);
             }
@@ -476,8 +459,11 @@ mod tests {
     }
 
     fn query_entry(ts: i64, domain: &str, client_ip: &str, status: QueryStatus) -> QueryEntry {
+        // Unique monotonic ids: write_batch persists entry ids verbatim,
+        // and queries.id is a PRIMARY KEY.
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         QueryEntry {
-            id: 0,
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             timestamp: chrono::DateTime::from_timestamp(ts, 0).unwrap(),
             domain: domain.to_string(),
             query_type: 1,

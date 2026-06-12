@@ -8,11 +8,6 @@ pub enum FeriteError {
     #[error("DNS error: {0}")]
     Dns(String),
 
-    // Only constructed by the Redis backend (storage-redis feature).
-    #[allow(dead_code)]
-    #[error("storage error: {0}")]
-    Storage(String),
-
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 

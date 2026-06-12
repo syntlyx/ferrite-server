@@ -16,6 +16,13 @@ use crate::error::Result;
 
 static QUERY_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Bump the query id counter above the highest persisted id so that ids stay
+/// monotonic across restarts (ring buffer is seeded with old entries, and the
+/// `after_id` API cursor relies on strictly increasing ids).
+pub fn seed_query_counter(max_persisted_id: u64) {
+    QUERY_COUNTER.fetch_max(max_persisted_id + 1, Ordering::Relaxed);
+}
+
 /// DNS query pipeline (per query, runs in its own tokio task):
 ///
 ///  1. Parse wire bytes.

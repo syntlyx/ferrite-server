@@ -133,16 +133,8 @@ pub enum UpstreamConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct StorageConfig {
-    /// Storage backend: `"sqlite"` (default) or `"redis"` / `"valkey"`.
-    pub backend: String,
-    /// SQLite database path. Ignored when backend is redis/valkey.
+    /// SQLite database path.
     pub path: PathBuf,
-    /// Redis/Valkey connection URL. Used when backend is `"redis"` or `"valkey"`.
-    #[serde(skip_serializing_if = "is_default_redis_url")]
-    pub url: String,
-    /// Key prefix for all Redis keys (default: `"ferrite"`).
-    #[serde(skip_serializing_if = "is_default_key_prefix")]
-    pub key_prefix: String,
     /// Automatically delete query log entries older than this many days.
     /// 0 = disabled (default). Applied once at startup and then every 24 hours.
     #[serde(skip_serializing_if = "is_retention_disabled")]
@@ -151,22 +143,6 @@ pub struct StorageConfig {
 
 fn is_retention_disabled(d: &u32) -> bool {
     *d == 0
-}
-
-fn is_default_redis_url(s: &str) -> bool {
-    s == default_redis_url()
-}
-
-fn is_default_key_prefix(s: &str) -> bool {
-    s == default_key_prefix()
-}
-
-fn default_redis_url() -> String {
-    "redis://127.0.0.1:6379".to_string()
-}
-
-fn default_key_prefix() -> String {
-    "ferrite".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -239,10 +215,7 @@ impl Default for DnsConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            backend: "sqlite".to_string(),
             path: data_dir().join("ferrite.db"),
-            url: default_redis_url(),
-            key_prefix: default_key_prefix(),
             log_retention_days: 0,
         }
     }
@@ -461,7 +434,7 @@ mod tests {
         assert_eq!(cfg.dns.max_ttl, 3600);
         assert_eq!(cfg.dns.cache_size, 10_000);
         assert_eq!(cfg.api.bind_addr.to_string(), "127.0.0.1:18080");
-        assert_eq!(cfg.storage.backend, "sqlite");
+        assert!(cfg.storage.path.ends_with("ferrite.db"));
         assert!(!cfg.upstream.is_empty());
         assert!(cfg.panel.enabled);
         assert_eq!(cfg.panel.domain, "fe.te");

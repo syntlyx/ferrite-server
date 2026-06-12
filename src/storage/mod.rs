@@ -1,5 +1,3 @@
-#[cfg(feature = "storage-redis")]
-pub mod redis;
 pub mod schema;
 pub mod sqlite;
 
@@ -124,6 +122,4 @@ pub trait Storage: Send + Sync {
     async fn load_custom_records(&self) -> Result<Vec<crate::config::CustomRecordConfig>>;
 }
 
-#[cfg(feature = "storage-redis")]
-pub use redis::RedisStorage;
 pub use sqlite::SqliteStorage;

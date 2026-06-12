@@ -220,6 +220,7 @@ CPU and network are measured over the same ~200 ms sample window, so this endpoi
 }
 ```
 
+- `cpu_usage_percent` — global CPU usage averaged over all cores, sampled by a background task every 2 seconds.
 - `cpu_temp_celsius` — `null` if hardware sensors are unavailable (common on macOS and some VMs).
 - `memory.used_bytes` — RAM pressure value: `total_bytes - available_bytes`. On Linux this follows `MemAvailable`, so reclaimable filesystem cache does not make the machine look fully loaded.
 - `memory.allocated_bytes` — raw allocated RAM: `total_bytes - free_bytes`. This includes kernel/page-cache allocations and can be much higher than real pressure.
@@ -227,7 +228,7 @@ CPU and network are measured over the same ~200 ms sample window, so this endpoi
 - `network.interfaces` — list of active interface names used for the measurement. Interfaces with `operstate == down` (e.g. unplugged secondary NICs) are excluded. Loopback is always excluded.
 - `network.link_speed_mbps` — read from `/sys/class/net/<iface>/speed` of the first active interface (Linux only); `null` on macOS and most VMs.
 - `network.rx_utilization_percent`, `tx_utilization_percent` — `null` if `link_speed_mbps` is unknown. When available, use these for 0–100 % bars; otherwise display raw bytes/sec.
-- `process` — ferrite's own resource usage. `memory_bytes` is RSS (resident set size). `memory_percent` = process RSS / total RAM × 100. `cpu_percent` is measured over the same 200 ms sample window. `null` if PID lookup fails.
+- `process` — ferrite's own resource usage. `memory_bytes` is RSS (resident set size). `memory_percent` = process RSS / total RAM × 100. `cpu_percent` is ferrite's share of the **whole machine** (normalized by core count) and is sampled in the same tick and over the same window as `cpu_usage_percent`, so the two are directly comparable (`process <= global`). `null` if PID lookup fails.
 - `disk` — root filesystem `/`; falls back to the first detected disk. `null` if no disks are found.
 - `load_avg` — 1 / 5 / 15-minute load averages; always `0` on Windows.
 
@@ -323,9 +324,12 @@ All params are optional.
 | `limit`     | int    | Max results (default 100, max 1000)              |
 | `before_ts` | int    | Cursor timestamp for the next page               |
 | `before_id` | int    | Cursor row id for the next page                  |
+| `after_id`  | int    | Delta cursor: only entries with `id > after_id`  |
 | `offset`    | int    | Legacy pagination offset; slower on large logs   |
 
 **Without any filters and without pagination params** — served from the in-memory ring buffer (last 2 000 entries). Always live, no SQLite read. Results are returned newest-first.
+
+**With `after_id`** — delta polling for a live tail: returns only ring-buffer entries newer than the cursor (typically an empty array or a handful of rows). All other filters are ignored on this path. Pass the highest `id` seen so far; if the response length equals `limit`, do a full refresh — older unseen entries may have been cut off. Entry ids are monotonic across server restarts (the id counter is seeded from storage at startup).
 
 **With any filter, `before_ts`/`before_id`, or `offset > 0`** — queries storage. Use this path for search, filtering by status/domain/client, or paginating beyond the ring buffer.
 
@@ -340,6 +344,7 @@ GET /api/queries?limit=100&before_ts=1745323392&before_id=4821
 ```
 GET /api/queries                               → live ring buffer, newest first
 GET /api/queries?limit=50                      → live ring buffer, up to 50
+GET /api/queries?after_id=4821                 → live ring buffer, only entries newer than id 4821
 GET /api/queries?status=blocked&limit=50       → SQLite (filter present)
 GET /api/queries?client_ip=192.168.1.42        → SQLite (filter present)
 GET /api/queries?limit=100&before_ts=1745323392&before_id=4821

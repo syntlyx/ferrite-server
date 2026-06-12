@@ -118,11 +118,8 @@ Fast local gate:
 ```bash
 cargo fmt --all -- --check
 cargo check --locked
-cargo check --locked --features storage-redis
 cargo test --all --locked
-cargo test --all --all-features --locked
 cargo clippy --all-targets --locked -- -D warnings
-cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo audit --deny warnings
 sh -n install.sh
 shellcheck install.sh

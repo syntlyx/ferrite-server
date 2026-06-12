@@ -23,6 +23,7 @@ pub struct ListQueriesParams {
     pub offset: Option<usize>,
     pub before_id: Option<u64>,
     pub before_ts: Option<i64>,
+    pub after_id: Option<u64>,
 }
 
 /// `QueryEntry` enriched with a resolved client hostname.
@@ -37,11 +38,24 @@ struct QueryEntryResponse {
 /// GET /api/queries
 ///
 /// Without filters or pagination: served from the in-memory ring buffer (always live).
+/// With `after_id`: delta poll — only ring-buffer entries newer than the cursor
+/// (all other filters are ignored; if the response hits `limit`, the client
+/// should fall back to a full refresh because older unseen entries may exist).
 /// With any filter, offset, or before_* cursor: falls through to storage for historical queries.
 pub async fn list_queries(
     State(state): State<AppState>,
     Query(params): Query<ListQueriesParams>,
 ) -> Result<Json<Value>, ApiError> {
+    if let Some(after_id) = params.after_id {
+        let limit = params.limit.unwrap_or(100).min(1000);
+        let entries = state
+            .inner
+            .live_stats
+            .recent_queries
+            .recent_after(after_id, limit);
+        return Ok(Json(serde_json::to_value(enrich(&state, entries))?));
+    }
+
     let has_filters = params.from_ts.is_some()
         || params.to_ts.is_some()
         || params.domain.is_some()
@@ -103,9 +117,13 @@ pub async fn list_queries(
         }
     };
 
-    // Trigger background PTR resolution for any IP not yet in cache, then
-    // read whatever name is already available (non-blocking).
-    let enriched: Vec<QueryEntryResponse> = entries
+    Ok(Json(serde_json::to_value(enrich(&state, entries))?))
+}
+
+/// Trigger background PTR resolution for any IP not yet in cache, then
+/// read whatever name is already available (non-blocking).
+fn enrich(state: &AppState, entries: Vec<QueryEntry>) -> Vec<QueryEntryResponse> {
+    entries
         .into_iter()
         .map(|entry| {
             let client_name = parse_ip(&entry.client_ip).and_then(|ip| {
@@ -114,9 +132,7 @@ pub async fn list_queries(
             });
             QueryEntryResponse { entry, client_name }
         })
-        .collect();
-
-    Ok(Json(serde_json::to_value(enriched)?))
+        .collect()
 }
 
 /// DELETE /api/queries — purge the entire query log (SQLite + in-memory).
