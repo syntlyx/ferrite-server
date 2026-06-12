@@ -53,7 +53,7 @@ fn system_snapshot(process_cpu: f32) -> Value {
     if let Some(pid) = self_pid {
         sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), false);
     }
-    networks.refresh();
+    networks.refresh(true);
 
     let interval_secs = sysinfo::MINIMUM_CPU_UPDATE_INTERVAL.as_secs_f64();
 
@@ -67,11 +67,7 @@ fn system_snapshot(process_cpu: f32) -> Value {
 
     let cpu_temp: Option<f32> = Components::new_with_refreshed_list()
         .iter()
-        .find(|c| {
-            let t = c.temperature();
-            t.is_finite() && t > 0.0
-        })
-        .map(|c| c.temperature());
+        .find_map(|c| c.temperature().filter(|t| t.is_finite() && *t > 0.0));
 
     let (rx_bytes, tx_bytes, link_speed_mbps, active_ifaces) = collect_network(&networks);
 

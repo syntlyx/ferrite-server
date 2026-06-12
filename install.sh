@@ -464,6 +464,10 @@ log_retention_days = 30
 [api]
 bind_addr = "0.0.0.0:80"
 
+[panel]
+enabled = true
+domain = "fe.te"
+
 [blocklist]
 whitelist      = []
 wildcard_block = []

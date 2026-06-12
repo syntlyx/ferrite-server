@@ -29,4 +29,12 @@ VOLUME ["/var/lib/ferrite"]
 # Docker exposes protocols separately; Ferrite still binds one DNS address.
 EXPOSE 53/tcp 53/udp 80/tcp
 
+# Liveness probe against the always-public auth endpoint (returns 200 even when
+# no auth is configured). The container always binds the API on port 80
+# internally, so 127.0.0.1:80 is correct regardless of host port mapping.
+# start-period is generous because the first start downloads the server and web
+# release assets before the API comes up.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:80/api/auth >/dev/null 2>&1 || exit 1
+
 ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/ferrite-entrypoint"]

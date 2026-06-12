@@ -120,7 +120,7 @@ pub async fn handle_query(
     }
 
     // ── Step 3: DNS response cache ────────────────────────────────────────
-    if let Some(cached) = state.dns_cache.get(&name, qtype) {
+    if let Some((cached, remaining_ttl)) = state.dns_cache.get_with_remaining(&name, qtype) {
         if filtering_enabled {
             if let Some(blocked_cname) =
                 cname_blocked_target(&cached.bytes, &name, &state.blocklist)
@@ -162,16 +162,22 @@ pub async fn handle_query(
                 ),
             );
         }
-        return Ok(patch_id(&cached.bytes, query.metadata.id));
+        return Ok(patch_cached(&cached.bytes, query.metadata.id, remaining_ttl));
     }
 
     // ── Step 4: Forward to upstream ───────────────────────────────────────
     let (response_bytes, rcode, upstream_label) =
         match state.upstream_pool.resolve_raw(raw.clone()).await {
-            Ok((bytes, label)) => {
-                let rc = parse_rcode(&bytes);
-                (bytes, rc, Some(label))
-            }
+            // Only trust a response we can actually decode. Unparseable bytes
+            // are turned into SERVFAIL so they're never cached (step 6 caches
+            // rcode==0 only) or served as if they were a valid NOERROR answer.
+            Ok((bytes, label)) => match parse_rcode(&bytes) {
+                Some(rc) => (bytes, rc, Some(label)),
+                None => {
+                    tracing::warn!("undecodable response from upstream {} for {}", label, name);
+                    (build_servfail(&query), 2u8, None)
+                }
+            },
             Err(e) => {
                 tracing::warn!("upstream error for {}: {}", name, e);
                 (build_servfail(&query), 2u8, None)
@@ -206,16 +212,25 @@ pub async fn handle_query(
     }
 
     // ── Step 6: Cache NOERROR responses ───────────────────────────────────
+    // A TTL of 0 means "do not cache" (RFC 1035/2181) — caching it would break
+    // failover/GeoDNS that relies on near-zero TTLs. Skip those. Responses with
+    // no answer records (NODATA) fall back to the configured minimum.
     if rcode == 0 && !response_bytes.is_empty() {
-        let ttl = extract_min_ttl(&response_bytes).unwrap_or(state.dns_cache.min_ttl_secs() as u32);
-        state.dns_cache.insert(
-            &name,
-            qtype,
-            DnsResponse {
-                bytes: bytes::Bytes::copy_from_slice(&response_bytes),
-                ttl,
-            },
-        );
+        match extract_min_ttl(&response_bytes) {
+            Some(0) => {
+                tracing::debug!("not caching {} (answer TTL is 0)", name);
+            }
+            ttl => {
+                state.dns_cache.insert(
+                    &name,
+                    qtype,
+                    DnsResponse {
+                        bytes: bytes::Bytes::copy_from_slice(&response_bytes),
+                        ttl: ttl.unwrap_or(state.dns_cache.min_ttl_secs() as u32),
+                    },
+                );
+            }
+        }
     }
 
     if !log_ignored {
@@ -318,11 +333,12 @@ fn cname_blocked_target(
     None
 }
 
-/// Extract RCODE from raw DNS response bytes.
-fn parse_rcode(bytes: &[u8]) -> u8 {
+/// Extract RCODE from raw DNS response bytes, or `None` if the bytes can't be
+/// decoded as a DNS message (so the caller can avoid trusting/caching garbage).
+fn parse_rcode(bytes: &[u8]) -> Option<u8> {
     Message::from_bytes(bytes)
+        .ok()
         .map(|m| u16::from(m.metadata.response_code).min(255) as u8)
-        .unwrap_or(0)
 }
 
 /// Patch the DNS message ID in raw wire bytes (bytes 0-1 = ID, big-endian).
@@ -334,6 +350,28 @@ fn patch_id(bytes: &[u8], id: u16) -> Vec<u8> {
         out[1] = lo;
     }
     out
+}
+
+/// Prepare a cached response for delivery: rewrite the transaction ID to the
+/// current query's, and rewrite each answer record's TTL down to the entry's
+/// remaining lifetime. Without the TTL rewrite, a response cached with TTL
+/// 3600 and served 3500s later would still advertise 3600, causing downstream
+/// clients to over-cache well past the authoritative expiry (RFC 2181 §5.1).
+///
+/// EDNS OPT records live in `Message::edns`, not in `answers`, so rewriting
+/// answer TTLs never corrupts the OPT pseudo-record. If the bytes can't be
+/// decoded we fall back to an ID-only patch.
+fn patch_cached(bytes: &[u8], id: u16, remaining_ttl: u32) -> Vec<u8> {
+    match Message::from_bytes(bytes) {
+        Ok(mut msg) => {
+            msg.metadata.id = id;
+            for rr in &mut msg.answers {
+                rr.ttl = remaining_ttl;
+            }
+            msg.to_bytes().unwrap_or_else(|_| patch_id(bytes, id))
+        }
+        Err(_) => patch_id(bytes, id),
+    }
 }
 
 /// Returns true if the domain should be silently dropped from the query log.
@@ -495,8 +533,8 @@ mod tests {
     fn parse_rcode_reads_response_code_from_wire_bytes() {
         let bytes = build_servfail(&query("broken.test", RecordType::A));
 
-        assert_eq!(parse_rcode(&bytes), 2);
-        assert_eq!(parse_rcode(b"not dns"), 0);
+        assert_eq!(parse_rcode(&bytes), Some(2));
+        assert_eq!(parse_rcode(b"not dns"), None);
     }
 
     #[test]
@@ -771,7 +809,13 @@ mod tests {
         let entry = rx.try_recv().unwrap();
 
         assert_eq!(msg.metadata.id, 0x2222);
-        assert_eq!(&response[2..], &cached_bytes[2..]);
+        // The answer is preserved, but its TTL is rewritten down to the entry's
+        // remaining lifetime (<= the original 120s it was cached with).
+        assert!(matches!(
+            msg.answers[0].data,
+            RData::A(A(ip)) if ip == Ipv4Addr::new(192, 0, 2, 9)
+        ));
+        assert!(msg.answers[0].ttl <= 120);
         assert_eq!(entry.status, QueryStatus::Cached);
         assert_eq!(entry.domain, "cache.test");
         assert_eq!(state.inner.live_stats.total(), 1);

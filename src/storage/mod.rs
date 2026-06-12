@@ -33,6 +33,15 @@ pub struct ClientStats {
     pub last_seen: i64,
 }
 
+/// Aggregated DNS query counters.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SummaryStats {
+    pub total: u64,
+    pub blocked: u64,
+    pub cached: u64,
+    pub upstream: u64,
+}
+
 /// Abstract storage backend.
 #[async_trait]
 #[allow(dead_code)]
@@ -65,6 +74,9 @@ pub trait Storage: Send + Sync {
 
     /// Return summary stats: (total, blocked) for the last `secs` seconds.
     async fn summary(&self, secs: u64) -> Result<(u64, u64)>;
+
+    /// Return summary stats for a timestamp range.
+    async fn summary_counts(&self, from_ts: i64, to_ts: i64) -> Result<SummaryStats>;
 
     /// Delete all query log entries.
     async fn delete_all_queries(&self) -> Result<()>;

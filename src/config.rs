@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
 use crate::clients::normalize_client_key;
@@ -30,6 +30,8 @@ pub struct Config {
     pub storage: StorageConfig,
     #[serde(default)]
     pub api: ApiConfig,
+    #[serde(default)]
+    pub panel: PanelConfig,
     #[serde(default)]
     pub blocklist: BlocklistConfig,
     #[serde(default)]
@@ -180,6 +182,22 @@ pub struct ApiConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+pub struct PanelConfig {
+    pub enabled: bool,
+    pub domain: String,
+    /// Optional IPv4 address for the built-in panel shortcut A record.
+    /// Useful in Docker bridge mode, where interface auto-detection sees the
+    /// container IP instead of the host/LAN IP.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ipv4: Option<Ipv4Addr>,
+    /// Optional display URL used in startup logs. DNS A records cannot carry a
+    /// port, so set this when the web UI is published on a non-80 host port.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct BlocklistConfig {
     pub enabled: bool,
     #[serde(default = "default_blocklist_decision_cache_size")]
@@ -240,6 +258,17 @@ impl Default for ApiConfig {
     }
 }
 
+impl Default for PanelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            domain: "fe.te".to_string(),
+            ipv4: None,
+            url: None,
+        }
+    }
+}
+
 impl Default for BlocklistConfig {
     fn default() -> Self {
         Self {
@@ -273,6 +302,7 @@ impl Default for Config {
             ],
             storage: StorageConfig::default(),
             api: ApiConfig::default(),
+            panel: PanelConfig::default(),
             blocklist: BlocklistConfig::default(),
             zones: vec![],
             custom_records: vec![],
@@ -313,6 +343,7 @@ impl Config {
 
     pub fn normalize(&mut self) {
         self.api.normalize();
+        self.panel.normalize();
         self.blocklist.normalize();
     }
 
@@ -357,6 +388,19 @@ impl ApiConfig {
 
     pub fn has_password(&self) -> bool {
         self.password_hash().is_some()
+    }
+}
+
+impl PanelConfig {
+    pub fn normalize(&mut self) {
+        let domain = self.domain.trim().trim_end_matches('.');
+        if domain.is_empty() {
+            self.domain = "fe.te".to_string();
+        } else {
+            self.domain = domain.to_ascii_lowercase();
+        }
+
+        self.url = normalize_secret(self.url.take());
     }
 }
 
@@ -419,6 +463,8 @@ mod tests {
         assert_eq!(cfg.api.bind_addr.to_string(), "127.0.0.1:18080");
         assert_eq!(cfg.storage.backend, "sqlite");
         assert!(!cfg.upstream.is_empty());
+        assert!(cfg.panel.enabled);
+        assert_eq!(cfg.panel.domain, "fe.te");
     }
 
     #[test]
@@ -462,5 +508,21 @@ mod tests {
 
         assert!(!raw.contains("api_key"));
         assert!(!raw.contains("password_hash"));
+    }
+
+    #[test]
+    fn panel_config_normalizes_blank_domain_and_url() {
+        let cfg = toml::from_str::<Config>(
+            r#"
+            [panel]
+            domain = "  "
+            url = "   "
+            "#,
+        )
+        .unwrap()
+        .normalized();
+
+        assert_eq!(cfg.panel.domain, "fe.te");
+        assert!(cfg.panel.url.is_none());
     }
 }

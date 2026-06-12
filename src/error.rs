@@ -51,6 +51,9 @@ pub enum FeriteError {
     #[error("unauthorized")]
     Unauthorized,
 
+    #[error("too many requests; slow down and try again")]
+    RateLimited,
+
     #[error("not found: {0}")]
     NotFound(String),
 

@@ -46,6 +46,7 @@ impl IntoResponse for ApiError {
 fn api_error_status(error: &FeriteError) -> StatusCode {
     match error {
         FeriteError::Unauthorized => StatusCode::UNAUTHORIZED,
+        FeriteError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
         FeriteError::Config(_) => StatusCode::BAD_REQUEST,
         FeriteError::NotFound(_) => StatusCode::NOT_FOUND,
         FeriteError::Update(_) => StatusCode::CONFLICT,
@@ -56,6 +57,7 @@ fn api_error_status(error: &FeriteError) -> StatusCode {
 fn api_error_kind(error: &FeriteError) -> &'static str {
     match error {
         FeriteError::Unauthorized => "unauthorized",
+        FeriteError::RateLimited => "rate_limited",
         FeriteError::Config(_) => "config",
         FeriteError::NotFound(_) => "not_found",
         FeriteError::Update(_) => "update",
@@ -66,6 +68,7 @@ fn api_error_kind(error: &FeriteError) -> &'static str {
 fn api_error_code(error: &FeriteError) -> &'static str {
     match error {
         FeriteError::Unauthorized => "unauthorized",
+        FeriteError::RateLimited => "rate_limited",
         FeriteError::Config(message) => config_error_code(message),
         FeriteError::NotFound(_) => "not_found",
         FeriteError::Update(message) => update_error_code(message),

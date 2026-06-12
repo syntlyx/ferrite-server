@@ -104,6 +104,8 @@ pub async fn check_web_update_for_server(
 /// Download the web UI dist archive and extract it to `dest_dir`.
 /// The archive is expected to be a `dist.tar.gz` containing a `dist/` folder.
 pub async fn apply_web_update(info: &WebUpdateInfo, dest_dir: &Path) -> Result<()> {
+    let expected_sha256 = require_verified_checksum(info.sha256.as_deref())?;
+
     tracing::info!(
         "downloading web UI v{} from {}",
         info.version,
@@ -120,9 +122,7 @@ pub async fn apply_web_update(info: &WebUpdateInfo, dest_dir: &Path) -> Result<(
         .await
         .map_err(FeriteError::Http)?;
 
-    if let Some(expected) = &info.sha256 {
-        checksum::verify_bytes_sha256(&bytes, expected, "web UI update archive")?;
-    }
+    checksum::verify_bytes_sha256(&bytes, &expected_sha256, "web UI update archive")?;
 
     // Extract into a staging dir first, then move the prepared dist into place.
     let staging = dest_dir.with_extension("tmp");
@@ -201,6 +201,18 @@ pub async fn persist_installed_sha256(web_dir: &Path, sha256: Option<&str>) -> R
 
 fn sha256_path(web_dir: &Path) -> std::path::PathBuf {
     web_dir.with_extension("sha256")
+}
+
+/// Fail-closed precondition for applying a web UI update: a verified SHA-256
+/// checksum is mandatory. Returns the checksum to verify against, or an error
+/// if the release published neither an asset digest nor a `.sha256` sidecar.
+fn require_verified_checksum(sha256: Option<&str>) -> Result<String> {
+    match sha256.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(expected) => Ok(expected.to_string()),
+        None => Err(FeriteError::Update(
+            "refusing to apply update without a verified SHA-256 checksum".into(),
+        )),
+    }
 }
 
 async fn fetch_release_manifest(
@@ -293,5 +305,23 @@ mod tests {
     #[test]
     fn invalid_compat_is_not_accepted() {
         assert!(!server_satisfies_compat("0.1.0", "~0.1"));
+    }
+
+    #[test]
+    fn apply_requires_a_verified_checksum() {
+        let err = require_verified_checksum(None).unwrap_err();
+        assert!(matches!(err, FeriteError::Update(_)));
+        assert!(err
+            .to_string()
+            .contains("refusing to apply update without a verified SHA-256 checksum"));
+
+        // Blank/whitespace-only values are treated as absent.
+        assert!(require_verified_checksum(Some("   ")).is_err());
+
+        // A present checksum is accepted and returned trimmed.
+        assert_eq!(
+            require_verified_checksum(Some("  abc123  ")).unwrap(),
+            "abc123"
+        );
     }
 }

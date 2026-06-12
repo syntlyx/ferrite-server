@@ -18,7 +18,7 @@ use axum::{
     routing::{delete, get, patch, post},
     Router,
 };
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::trace::TraceLayer;
 
 use crate::app::AppState;
 
@@ -95,13 +95,30 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/api", api)
         .fallback(crate::web::static_handler)
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
+        // No CORS layer: the web UI is served same-origin by this very server,
+        // so browsers enforce same-origin access automatically. Permissive CORS
+        // would let any website the operator visits drive the local API.
         .with_state(state)
 }
 
 /// Bind the HTTP listener and serve the router.
 pub async fn serve(state: AppState) -> anyhow::Result<()> {
     let bind_addr = state.inner.config.api.bind_addr;
+
+    // Warn loudly if the API is reachable with no authentication: every mutating
+    // endpoint (settings, lists, custom records, self-update) is then open to
+    // anyone who can reach this address.
+    {
+        let api = state.live_config.read().api.clone();
+        if !api.has_password() && api.api_key().is_none() {
+            tracing::warn!(
+                "API authentication is NOT configured — all endpoints on {} are open. \
+                 Set a web UI password or API key to restrict access.",
+                bind_addr
+            );
+        }
+    }
+
     let router = build_router(state);
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;

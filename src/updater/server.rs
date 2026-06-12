@@ -67,7 +67,7 @@ pub async fn check(current_version: &str) -> Result<Option<UpdateInfo>> {
 pub async fn apply(info: &UpdateInfo) -> Result<()> {
     let url = info.download_url.clone();
     let version = info.version.clone();
-    let expected_sha256 = info.sha256.clone();
+    let expected_sha256 = require_verified_checksum(info.sha256.as_deref())?;
     let current_exe = std::env::current_exe()?;
     let checksum_path = checksum_path_for(&current_exe);
     let version_path = version_path_for(&current_exe);
@@ -87,9 +87,7 @@ pub async fn apply(info: &UpdateInfo) -> Result<()> {
         .map_err(FeriteError::Http)?
         .to_vec();
 
-    if let Some(expected) = &expected_sha256 {
-        checksum::verify_bytes_sha256(&bytes, expected, "server update archive")?;
-    }
+    checksum::verify_bytes_sha256(&bytes, &expected_sha256, "server update archive")?;
 
     tokio::task::spawn_blocking(move || -> Result<()> {
         let tmp = current_exe.with_extension("update.tmp");
@@ -144,11 +142,7 @@ pub async fn apply(info: &UpdateInfo) -> Result<()> {
     .await
     .map_err(|e| FeriteError::Internal(e.to_string()))??;
 
-    if let Some(expected) = expected_sha256 {
-        checksum::write_sha256_file(&checksum_path, &expected).await?;
-    } else {
-        checksum::remove_file_if_exists(&checksum_path).await?;
-    }
+    checksum::write_sha256_file(&checksum_path, &expected_sha256).await?;
     tokio::fs::write(&version_path, format!("{version}\n")).await?;
 
     tracing::info!("server updated to v{} — restart to apply", version);
@@ -174,6 +168,18 @@ fn env_flag_enabled(value: Option<&str>) -> bool {
             "0" | "false" | "no" | "off" | "disabled"
         ),
         None => true,
+    }
+}
+
+/// Fail-closed precondition for applying a server update: a verified SHA-256
+/// checksum is mandatory. Returns the checksum to verify against, or an error
+/// if the release published neither an asset digest nor a `.sha256` sidecar.
+fn require_verified_checksum(sha256: Option<&str>) -> Result<String> {
+    match sha256.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(expected) => Ok(expected.to_string()),
+        None => Err(FeriteError::Update(
+            "refusing to apply update without a verified SHA-256 checksum".into(),
+        )),
     }
 }
 
@@ -221,6 +227,24 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
 
         preflight_update_target(&path).unwrap();
+    }
+
+    #[test]
+    fn apply_requires_a_verified_checksum() {
+        let err = require_verified_checksum(None).unwrap_err();
+        assert!(matches!(err, FeriteError::Update(_)));
+        assert!(err
+            .to_string()
+            .contains("refusing to apply update without a verified SHA-256 checksum"));
+
+        // Blank/whitespace-only values are treated as absent.
+        assert!(require_verified_checksum(Some("   ")).is_err());
+
+        // A present checksum is accepted and returned trimmed.
+        assert_eq!(
+            require_verified_checksum(Some("  abc123  ")).unwrap(),
+            "abc123"
+        );
     }
 
     #[test]

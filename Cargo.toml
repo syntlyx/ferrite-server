@@ -25,28 +25,28 @@ postcard = { version = "1", default-features = false, features = ["use-std"] }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
 lru = "0.18"
 regex = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
-tokio-rusqlite = "0.6"
+rusqlite = { version = "0.37", features = ["bundled"] }
+tokio-rusqlite = "0.7"
 chrono = { version = "0.4", features = ["serde"] }
 bytes = "1"
 parking_lot = "0.12"
 arc-swap = "1"
-dirs = "5"
-reqwest = { version = "0.12", features = ["rustls-tls", "json"], default-features = false }
+dirs = "6"
+reqwest = { version = "0.13.4", features = ["rustls", "json"], default-features = false }
 ring = "0.17"
 argon2 = "0.5"
 subtle = "2"
-socket2 = "0.5"
+socket2 = "0.6"
 flate2 = "1"
 tar = "0.4"
-sysinfo = "0.32"
+sysinfo = "0.39"
 
 [dev-dependencies]
 tower = "0.5"

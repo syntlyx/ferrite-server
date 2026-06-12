@@ -10,7 +10,7 @@ use crate::dns::types::{QueryEntry, QueryStatus};
 use crate::error::{FeriteError, Result};
 use crate::stats::timeseries::TimeseriesBucket;
 use crate::storage::schema::SCHEMA;
-use crate::storage::{ClientStats, QueryFilter, Storage};
+use crate::storage::{ClientStats, QueryFilter, Storage, SummaryStats};
 
 const ROLLUP_BUCKET_SECS: i64 = 600;
 
@@ -48,11 +48,7 @@ impl SqliteStorage {
         let conn = Connection::open(path).await?;
 
         // Apply schema.
-        conn.call(|c| {
-            c.execute_batch(SCHEMA)
-                .map_err(tokio_rusqlite::Error::Rusqlite)
-        })
-        .await?;
+        conn.call(|c| c.execute_batch(SCHEMA)).await?;
 
         // Migration: upgrade client_aliases to keyed-by-key+key_type schema.
         conn.call(|c| {
@@ -80,15 +76,13 @@ impl SqliteStorage {
                      INSERT INTO client_aliases (key, key_type, name, created_at)
                          SELECT ip, 'ip', name, created_at FROM client_aliases_old;
                      DROP TABLE client_aliases_old;",
-                )
-                .map_err(tokio_rusqlite::Error::Rusqlite)?;
+                )?;
             }
             Ok(())
         })
         .await?;
 
-        conn.call(|c| backfill_rollups_if_needed(c).map_err(tokio_rusqlite::Error::Rusqlite))
-            .await?;
+        conn.call(backfill_rollups_if_needed).await?;
 
         tracing::info!("SQLite storage opened at {}", path.display());
         Ok(Arc::new(Self { conn }))
@@ -519,15 +513,34 @@ impl Storage for SqliteStorage {
 
     async fn summary(&self, secs: u64) -> Result<(u64, u64)> {
         let from_bucket = align_bucket(chrono::Utc::now().timestamp() - secs as i64);
+        let counts = self
+            .summary_counts(from_bucket, chrono::Utc::now().timestamp())
+            .await?;
+        Ok((counts.total, counts.blocked))
+    }
+
+    async fn summary_counts(&self, from_ts: i64, to_ts: i64) -> Result<SummaryStats> {
+        let from_bucket = align_bucket(from_ts);
+        let to_bucket = align_bucket(to_ts);
         let result = self
             .conn
             .call(move |c| {
                 let row = c.query_row(
                     "SELECT COALESCE(SUM(total), 0),
-                            COALESCE(SUM(blocked), 0)
-                     FROM query_buckets_10m WHERE bucket >= ?1",
-                    rusqlite::params![from_bucket],
-                    |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+                            COALESCE(SUM(blocked), 0),
+                            COALESCE(SUM(cached), 0),
+                            COALESCE(SUM(upstream), 0)
+                     FROM query_buckets_10m
+                     WHERE bucket >= ?1 AND bucket <= ?2",
+                    rusqlite::params![from_bucket, to_bucket],
+                    |row| {
+                        Ok(SummaryStats {
+                            total: row.get::<_, i64>(0)? as u64,
+                            blocked: row.get::<_, i64>(1)? as u64,
+                            cached: row.get::<_, i64>(2)? as u64,
+                            upstream: row.get::<_, i64>(3)? as u64,
+                        })
+                    },
                 )?;
                 Ok(row)
             })
@@ -874,6 +887,11 @@ mod tests {
         assert_eq!(clients[0].blocked, 2);
 
         assert_eq!(storage.summary(3600).await.unwrap(), (4, 2));
+        let counts = storage.summary_counts(bucket, bucket + 599).await.unwrap();
+        assert_eq!(counts.total, 4);
+        assert_eq!(counts.blocked, 2);
+        assert_eq!(counts.cached, 1);
+        assert_eq!(counts.upstream, 1);
     }
 
     #[tokio::test]

@@ -49,15 +49,17 @@ pub struct SummaryResponse {
 }
 
 #[derive(Deserialize, Default)]
-pub struct TopBlockedParams {
+pub struct TopStatsParams {
     pub limit: Option<usize>,
     /// How many hours back to look (default 24, max 168).
     pub hours: Option<u64>,
+    /// Use all retained history instead of a rolling hour window.
+    pub all_time: Option<bool>,
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
-/// GET /api/stats/summary — served entirely from in-memory counters, no SQLite.
+/// GET /api/stats/summary — served entirely from in-memory counters, no storage reads.
 pub async fn get_summary(State(state): State<AppState>) -> Result<Json<SummaryResponse>, ApiError> {
     let live = &state.inner.live_stats;
 
@@ -151,7 +153,7 @@ pub async fn get_timeseries(State(state): State<AppState>) -> Result<Json<Value>
 /// GET /api/stats/top-domains
 pub async fn get_top_domains(
     State(state): State<AppState>,
-    Query(params): Query<TopBlockedParams>,
+    Query(params): Query<TopStatsParams>,
 ) -> Result<Json<Value>, ApiError> {
     let (now, from, limit) = time_window(&params);
     let rows = state.inner.storage.top_domains(from, now, limit).await?;
@@ -161,7 +163,7 @@ pub async fn get_top_domains(
 /// GET /api/stats/top-blocked
 pub async fn get_top_blocked(
     State(state): State<AppState>,
-    Query(params): Query<TopBlockedParams>,
+    Query(params): Query<TopStatsParams>,
 ) -> Result<Json<Value>, ApiError> {
     let (now, from, limit) = time_window(&params);
     let rows = state
@@ -175,7 +177,7 @@ pub async fn get_top_blocked(
 /// GET /api/stats/top-clients
 pub async fn get_top_clients(
     State(state): State<AppState>,
-    Query(params): Query<TopBlockedParams>,
+    Query(params): Query<TopStatsParams>,
 ) -> Result<Json<Value>, ApiError> {
     let (now, from, limit) = time_window(&params);
 
@@ -229,13 +231,18 @@ pub async fn get_top_clients(
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
-fn time_window(params: &TopBlockedParams) -> (i64, i64, usize) {
+fn time_window(params: &TopStatsParams) -> (i64, i64, usize) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    let hours = params.hours.unwrap_or(24).min(168) as i64;
     let limit = params.limit.unwrap_or(20).min(200);
+    let all_time = params.all_time.unwrap_or(false) || params.hours == Some(0);
+    if all_time {
+        return (now, 0, limit);
+    }
+
+    let hours = params.hours.unwrap_or(24).clamp(1, 168) as i64;
     (now, now - hours * 3600, limit)
 }
 
@@ -250,5 +257,36 @@ fn domains_json(rows: Vec<(String, u64)>, from: i64, to: i64) -> Value {
 fn push_unique(values: &mut Vec<String>, value: String) {
     if !values.iter().any(|v| v == &value) {
         values.push(value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn time_window_supports_explicit_all_time() {
+        let params = TopStatsParams {
+            all_time: Some(true),
+            limit: Some(25),
+            ..Default::default()
+        };
+
+        let (_now, from, limit) = time_window(&params);
+
+        assert_eq!(from, 0);
+        assert_eq!(limit, 25);
+    }
+
+    #[test]
+    fn time_window_treats_zero_hours_as_all_time() {
+        let params = TopStatsParams {
+            hours: Some(0),
+            ..Default::default()
+        };
+
+        let (_now, from, _limit) = time_window(&params);
+
+        assert_eq!(from, 0);
     }
 }

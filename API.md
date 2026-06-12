@@ -86,11 +86,11 @@ Invalidates the current session token. Token read from `X-Session-Token` or `Aut
 
 ## Stats
 
-### `GET /api/stats/summary` — live summary since last server start
+### `GET /api/stats/summary` — live summary from retained history
 
-Served entirely from memory — **zero SQLite reads**. Safe to poll every 1–2 seconds. Includes timeseries, so a separate `GET /api/stats/timeseries` call is only needed for standalone chart use.
+Served entirely from memory — **zero storage reads**. Safe to poll every 1–2 seconds. Includes timeseries, so a separate `GET /api/stats/timeseries` call is only needed for standalone chart use.
 
-All counters accumulate from server start and are seeded from storage on startup (last 24 h). Atomic counters are also restored from a warm-restart snapshot when the server restarts on the same day.
+Counters and top-N lists are seeded from retained storage on startup, then updated in memory as new DNS queries arrive. The 24h timeseries and recent-query lists remain rolling/live windows. A same-day warm-restart snapshot can only increase seeded counters, so an old snapshot cannot shrink all-time totals after startup.
 
 ```json
 {
@@ -147,17 +147,17 @@ All counters accumulate from server start and are seeded from storage on startup
 }
 ```
 
-- `top_domains`, `top_blocked` — top 10, sorted descending. Each item is `[name, count]`.
+- `top_domains`, `top_blocked` — top 10 from retained history plus live updates, sorted descending. Each item is `[name, count]`.
 - `top_clients` — top 10 objects. `ips` lists every raw IP that resolved to this name; pass them as a comma-separated `client_ip` filter to `GET /api/queries`.
 - Multiple IPs resolving to the same PTR hostname or alias are merged into one entry.
 - `recent_domains` — last 10 queries (all statuses), newest first. Same format as `GET /api/queries`. `client_name` omitted if unknown.
 - `recent_blocked` — last 10 blocked queries, newest first. Scans up to 500 recent entries to find them.
 - `timeseries` — same data as `GET /api/stats/timeseries`: 24h rolling window, 10-min buckets, sorted ascending. Empty buckets omitted. Each bucket includes `total`, `blocked`, `cached`, and `upstream` counts.
-- For historical top-N with a specific time window, use `GET /api/stats/top-domains?hours=X` etc. (served from SQLite 10-minute rollups).
+- For rolling top-N with a specific time window, use `GET /api/stats/top-domains?hours=X` etc. (served from storage rollups). Use `all_time=true` or `hours=0` for all retained history.
 
 ### `GET /api/stats/timeseries` — 24-hour history
 
-144 buckets × 10 minutes = 24 hours. Served from in-memory rolling window — no SQLite reads. On startup the window is seeded from SQLite so the chart is never blank after a restart. Buckets with zero traffic are omitted.
+144 buckets × 10 minutes = 24 hours. Served from in-memory rolling window — no storage reads. On startup the window is seeded from storage so the chart is never blank after a restart. Buckets with zero traffic are omitted.
 
 > The same data is included in `GET /api/stats/summary` under the `timeseries` key — prefer that endpoint when polling the dashboard to avoid a second request.
 
@@ -236,7 +236,8 @@ CPU and network are measured over the same ~200 ms sample window, so this endpoi
 | Param   | Type | Description                                |
 | ------- | ---- | ------------------------------------------ |
 | `limit` | int  | Max results (default 20, max 200)          |
-| `hours` | int  | How far back to look (default 24, max 168) |
+| `hours` | int  | How far back to look (default 24, max 168); `0` means all retained history |
+| `all_time` | bool | When true, ignore `hours` and use all retained history |
 
 ```
 GET /api/stats/top-blocked?limit=10&hours=48
@@ -260,7 +261,8 @@ Same parameters as `top-blocked`, but counts all queries regardless of status.
 | Param   | Type | Description                                |
 | ------- | ---- | ------------------------------------------ |
 | `limit` | int  | Max results (default 20, max 200)          |
-| `hours` | int  | How far back to look (default 24, max 168) |
+| `hours` | int  | How far back to look (default 24, max 168); `0` means all retained history |
+| `all_time` | bool | When true, ignore `hours` and use all retained history |
 
 ```
 GET /api/stats/top-domains?limit=10&hours=24
@@ -284,10 +286,12 @@ Groups IPs by resolved PTR hostname or alias, same as `summary.top_clients` but 
 | Param   | Type | Description                                |
 | ------- | ---- | ------------------------------------------ |
 | `limit` | int  | Max results (default 20, max 200)          |
-| `hours` | int  | How far back to look (default 24, max 168) |
+| `hours` | int  | How far back to look (default 24, max 168); `0` means all retained history |
+| `all_time` | bool | When true, ignore `hours` and use all retained history |
 
 ```
 GET /api/stats/top-clients?limit=10&hours=12
+GET /api/stats/top-clients?limit=10&all_time=true
 ```
 
 ```json
@@ -381,14 +385,18 @@ Deletes all entries from SQLite **and** resets all in-memory stats: ring buffer,
 
 ### `GET /api/clients` — client list grouped by hostname
 
-IPv4 and IPv6 addresses resolving to the same PTR hostname are merged into one entry.
+IPv4 and IPv6 addresses resolving to the same PTR hostname are merged into one entry. By default this returns all retained client history. Pass `hours` for a rolling window.
 
-| Param   | Type | Description                       |
-| ------- | ---- | --------------------------------- |
-| `limit` | int  | Max results (default 50, max 500) |
+| Param      | Type | Description                                                |
+| ---------- | ---- | ---------------------------------------------------------- |
+| `limit`    | int  | Max results (default 50, max 500)                          |
+| `hours`    | int  | Rolling window in hours, max 168; `0` means all retained history |
+| `all_time` | bool | When true, ignore `hours` and use all retained history      |
 
 ```json
 {
+  "from_ts": 0,
+  "to_ts": 1745008800,
   "clients": [
     {
       "name": "macbook",
@@ -663,7 +671,7 @@ POST /api/lists/StevenBlack/refresh
 
 Local A / AAAA / CNAME overrides. Take priority over blocklist and upstream. Wildcards (`*.home.lan`) are supported. Persisted to SQLite.
 
-Ferrite also has a hidden built-in panel record: `fe.te` resolves to the detected local IPv4 address of the ferrite server. It is not returned by `GET /api/custom-records`; adding a manual `fe.te` custom record overrides the built-in answer.
+Ferrite also has a hidden built-in panel record: `fe.te` resolves to `panel.ipv4` when configured, or to the detected local IPv4 address of the ferrite server. It is not returned by `GET /api/custom-records`; adding a manual `fe.te` custom record overrides the built-in answer. In Docker bridge mode, set `panel.ipv4` or `FERRITE_PANEL_IP` to the host/LAN IP because container interface auto-detection sees the container IP.
 
 ### `GET /api/custom-records`
 
@@ -745,6 +753,12 @@ Returns the full parsed config. Non-empty `api_key` and `password_hash` values a
     "api_key": "***",
     "password_hash": null
   },
+  "panel": {
+    "enabled": true,
+    "domain": "fe.te",
+    "ipv4": "192.168.1.5",
+    "url": "http://fe.te:8031"
+  },
   "blocklist": {
     "enabled": true,
     "decision_cache_size": 50000,
@@ -785,6 +799,10 @@ All fields are optional. Fields not provided are left unchanged.
 | `api_bind_addr`                 | string | HTTP API / web UI bind address, e.g. `"127.0.0.1:8080"`          |
 | `upstream`                      | array  | Replace the entire upstream resolver list (see format below)     |
 | `zones`                         | array  | Replace the entire zone routing table (see format below)         |
+| `panel_enabled`                 | bool   | Enable or disable the built-in panel DNS shortcut record          |
+| `panel_domain`                  | string | Domain for the built-in panel shortcut, e.g. `"fe.te"`           |
+| `panel_ipv4`                    | string \| null | IPv4 address returned by the panel shortcut; `null` restores auto-detection |
+| `panel_url`                     | string \| null | Display URL shown in startup logs; `null` clears the override |
 
 **Upstream resolver format** (`upstream` array items):
 
@@ -801,6 +819,15 @@ All fields are optional. Fields not provided are left unchanged.
 { "name": "1.168.192.in-addr.arpa", "upstream": "192.168.1.1:53" }
 { "name": "localdomain",            "upstream": "192.168.1.1:53" }
 ```
+
+In Docker bridge mode, automatic zone detection sees the Docker bridge network,
+not the LAN. Configure the LAN reverse-DNS zone manually if router-provided PTR
+hostnames should appear for clients.
+
+**Panel shortcut fields:** `panel_ipv4` controls the A record returned for the
+built-in panel domain. In Docker bridge mode, set it to the host/LAN IP because
+the container usually auto-detects its bridge IP. `panel_url` is only a display
+URL; DNS A records cannot encode a non-80 web UI port.
 
 **Examples:**
 
@@ -830,6 +857,21 @@ All fields are optional. Fields not provided are left unchanged.
       "bootstrap_ip": "1.1.1.1"
     }
   ]
+}
+```
+
+```json
+{
+  "panel_enabled": true,
+  "panel_domain": "fe.te",
+  "panel_ipv4": "192.168.1.5",
+  "panel_url": "http://fe.te:8031"
+}
+```
+
+```json
+{
+  "zones": [{ "name": "1.168.192.in-addr.arpa", "upstream": "192.168.1.1:53" }]
 }
 ```
 
@@ -989,13 +1031,13 @@ All errors follow the same shape:
 
 ## Notes for Frontend Developers
 
-**Polling summary:** `GET /api/stats/summary` is served from memory with no SQLite reads — safe to poll every 1–2 seconds.
+**Polling summary:** `GET /api/stats/summary` is served from memory with no storage reads — safe to poll every 1–2 seconds.
 
 **Live query log:** `GET /api/queries` without filters returns from the in-memory ring buffer (last 2 000 entries, newest-first). This is always live. For search or pagination beyond 2 000 entries, add any filter or use `before_ts` + `before_id` cursor pagination to use SQLite efficiently. `offset` remains supported for compatibility but gets slower on deep pages.
 
 **Timeseries chart:** Buckets missing from `GET /api/stats/timeseries` had zero traffic. Fill gaps with zero when rendering a full 24-hour chart.
 
-**Stats persistence after restart:** Atomic counters (`total_queries`, etc.) are restored from a warm-restart snapshot when the restart happens on the same day. The timeseries window is seeded from SQLite rollups on startup — the chart is never blank. Top-N counters (`top_domains`, `top_blocked`, `top_clients` in `/summary`) and the query ring buffer are also seeded from SQLite on startup (last 24 h). For historical top-N with a specific time window, use `GET /api/stats/top-domains?hours=X` etc. (served from SQLite 10-minute rollups).
+**Stats persistence after restart:** Atomic counters and Top-N counters (`top_domains`, `top_blocked`, `top_clients` in `/summary`) are seeded from retained storage on startup, then updated in memory. A same-day warm-restart snapshot can only increase seeded counters. The timeseries window and query ring buffer are seeded from storage on startup for the rolling 24h/recent views. For rolling Top-N with a specific time window, use `GET /api/stats/top-domains?hours=X` etc. Use `all_time=true` or `hours=0` for all retained history.
 
 **`DELETE /api/queries`** clears both SQLite and all in-memory stats: ring buffer, top-N counters, timeseries, and atomic counters (`total_queries`, etc.). The next `/summary` response will show zeroes until new traffic arrives.
 

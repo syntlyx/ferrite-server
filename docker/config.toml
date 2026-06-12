@@ -10,6 +10,10 @@ bind_addr = "0.0.0.0:53"
 [api]
 bind_addr = "0.0.0.0:80"
 
+[panel]
+enabled = true
+domain = "fe.te"
+
 [storage]
 backend = "sqlite"
 path = "/var/lib/ferrite/ferrite.db"

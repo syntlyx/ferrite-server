@@ -21,6 +21,64 @@ use crate::error::FeriteError;
 /// Session TTL — 24 hours.
 const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Token-bucket rate limiter for the password login endpoint.
+///
+/// `POST /api/auth` runs a deliberately-slow Argon2id verification on every
+/// call. Without a limit, an unauthenticated client can both brute-force the
+/// password and amplify a CPU denial-of-service (each request forces hundreds
+/// of milliseconds of work). This bucket bounds the rate of verifications:
+/// rejected requests return `429` *before* any hashing happens, so a flood
+/// costs the server almost nothing.
+///
+/// It is process-global (not per-IP): the panel has a single admin, so a global
+/// cap is sufficient and avoids threading client addresses through the router.
+struct TokenBucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+/// Bucket capacity (max burst) and refill rate (tokens per second).
+const LOGIN_BURST: f64 = 10.0;
+const LOGIN_REFILL_PER_SEC: f64 = 5.0;
+
+impl TokenBucket {
+    fn full() -> Self {
+        Self {
+            tokens: LOGIN_BURST,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Refill based on elapsed time, then try to consume one token.
+    /// Returns `true` if a token was available.
+    fn try_take(&mut self, now: Instant) -> bool {
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * LOGIN_REFILL_PER_SEC).min(LOGIN_BURST);
+        self.last_refill = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn login_bucket() -> &'static parking_lot::Mutex<TokenBucket> {
+    static BUCKET: std::sync::LazyLock<parking_lot::Mutex<TokenBucket>> =
+        std::sync::LazyLock::new(|| parking_lot::Mutex::new(TokenBucket::full()));
+    &BUCKET
+}
+
+/// Consume one token. Returns `Err(RateLimited)` if the bucket is empty.
+fn check_login_rate() -> Result<(), FeriteError> {
+    if login_bucket().lock().try_take(Instant::now()) {
+        Ok(())
+    } else {
+        Err(FeriteError::RateLimited)
+    }
+}
+
 // ── Public helpers ────────────────────────────────────────────────────────────
 
 /// Hash a plaintext password with Argon2id. Returns a PHC string.
@@ -94,6 +152,9 @@ pub async fn login(
     State(state): State<AppState>,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    // Throttle before touching config or running Argon2 so a flood is cheap to reject.
+    check_login_rate().map_err(ApiError)?;
+
     let hash = {
         let cfg = state.live_config.read();
         match cfg.api.password_hash() {
@@ -186,6 +247,20 @@ mod tests {
     use axum::http::HeaderValue;
 
     use crate::test_support;
+
+    #[test]
+    fn login_rate_limiter_allows_a_burst_then_rejects() {
+        // Use a local bucket (not the process-global one) so this test can't
+        // race other login tests. A full bucket allows exactly LOGIN_BURST
+        // back-to-back takes (no time elapses, so no refill), then rejects.
+        let mut bucket = TokenBucket::full();
+        let now = Instant::now();
+        let allowed = (0..(LOGIN_BURST as usize))
+            .filter(|_| bucket.try_take(now))
+            .count();
+        assert_eq!(allowed, LOGIN_BURST as usize);
+        assert!(!bucket.try_take(now), "drained bucket must reject");
+    }
 
     #[test]
     fn password_hash_verifies_correct_password_and_rejects_wrong_password() {

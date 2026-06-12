@@ -51,11 +51,34 @@ impl DnsCache {
     /// Retrieve a cached entry. Returns `None` if not present or expired.
     /// Uses `peek` (shared lock, no LRU promotion) — expired entries are
     /// cleaned up by the janitor task rather than proactively here.
+    ///
+    /// The query path uses `get_with_remaining` (which also returns the
+    /// remaining TTL); this is retained for snapshot restore tests.
+    #[allow(dead_code)]
     pub fn get(&self, name: &str, qtype: u16) -> Option<DnsResponse> {
         let key = Self::cache_key(name, qtype);
         let guard = self.inner.read();
         match guard.peek(&key) {
             Some(entry) if !entry.is_expired() => Some(entry.response.clone()),
+            _ => None,
+        }
+    }
+
+    /// Like `get`, but also returns the entry's remaining lifetime in seconds.
+    /// Callers rewrite the record TTLs to this value so clients receive the
+    /// real remaining TTL rather than the original (over-long) one (RFC 2181).
+    pub fn get_with_remaining(&self, name: &str, qtype: u16) -> Option<(DnsResponse, u32)> {
+        let key = Self::cache_key(name, qtype);
+        let guard = self.inner.read();
+        match guard.peek(&key) {
+            Some(entry) if !entry.is_expired() => {
+                let remaining = entry
+                    .expires_at
+                    .saturating_duration_since(Instant::now())
+                    .as_secs()
+                    .min(u32::MAX as u64) as u32;
+                Some((entry.response.clone(), remaining))
+            }
             _ => None,
         }
     }

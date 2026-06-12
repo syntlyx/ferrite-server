@@ -16,6 +16,10 @@ use crate::clients::{format_mac, parse_ip, parse_mac, ClientRegistry};
 #[derive(Deserialize, Default)]
 pub struct ListClientsParams {
     pub limit: Option<usize>,
+    /// Rolling window in hours. Omit for all retained history.
+    pub hours: Option<u64>,
+    /// Force all retained history. `hours=0` is also treated as all-time.
+    pub all_time: Option<bool>,
 }
 
 /// Aggregated stats per logical client (one entry per resolved name).
@@ -41,11 +45,7 @@ pub async fn list_clients(
     State(state): State<AppState>,
     Query(params): Query<ListClientsParams>,
 ) -> Result<Json<Value>, ApiError> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let from = now - 86400;
+    let (now, from) = client_time_window(&params);
     let limit = params.limit.unwrap_or(50).min(500);
 
     // Fetch more raw IPs than the final limit because merging may reduce count.
@@ -110,7 +110,24 @@ pub async fn list_clients(
     clients.sort_by_key(|b| std::cmp::Reverse(b.total));
     clients.truncate(limit);
 
-    Ok(Json(json!({ "clients": clients })))
+    Ok(Json(
+        json!({ "clients": clients, "from_ts": from, "to_ts": now }),
+    ))
+}
+
+fn client_time_window(params: &ListClientsParams) -> (i64, i64) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let all_time =
+        params.all_time.unwrap_or_else(|| params.hours.is_none()) || params.hours == Some(0);
+    if all_time {
+        return (now, 0);
+    }
+
+    let hours = params.hours.unwrap_or(24).clamp(1, 168) as i64;
+    (now, now - hours * 3600)
 }
 
 // ── Alias management ─────────────────────────────────────────────────────────
@@ -249,4 +266,30 @@ pub async fn remove_alias(
         "'{}' is neither a valid IP nor a MAC address",
         key_str
     ))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_list_defaults_to_all_retained_history() {
+        let params = ListClientsParams::default();
+
+        let (_now, from) = client_time_window(&params);
+
+        assert_eq!(from, 0);
+    }
+
+    #[test]
+    fn client_list_can_request_a_rolling_window() {
+        let params = ListClientsParams {
+            hours: Some(24),
+            ..Default::default()
+        };
+
+        let (now, from) = client_time_window(&params);
+
+        assert_eq!(now - from, 24 * 3600);
+    }
 }

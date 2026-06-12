@@ -57,6 +57,11 @@ pub async fn add_list(
     State(state): State<AppState>,
     Json(payload): Json<AddListPayload>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    // SSRF / local-file-read guard: validate the user-supplied URL before it is
+    // persisted or fetched. Config-defined lists (incl. file://) bypass this by
+    // loading through the loader directly, so trusted local lists keep working.
+    crate::blocklist::loader::validate_remote_list_url(&payload.url).await?;
+
     let cfg = ListConfig {
         url: payload.url.clone(),
         name: payload.name.clone(),

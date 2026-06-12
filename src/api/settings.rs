@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{net::Ipv4Addr, path::PathBuf};
 
 use axum::{extract::State, Json};
 use serde::Deserialize;
@@ -42,6 +42,16 @@ pub async fn get_settings(State(state): State<AppState>) -> Result<Json<Value>, 
         };
     }
 
+    // The redis/valkey storage URL can embed credentials (redis://user:pass@host);
+    // mask the password in the userinfo so it isn't returned in plaintext.
+    if let Some(storage) = val.get_mut("storage") {
+        if let Some(url) = storage.get("url").and_then(|u| u.as_str()) {
+            if let Some(masked) = mask_url_password(url) {
+                storage["url"] = json!(masked);
+            }
+        }
+    }
+
     Ok(Json(val))
 }
 
@@ -68,7 +78,8 @@ mod nullable {
 ///                             `dns_log_ignore`, `web_dir`, `log_retention_days`,
 ///                             `blocklist_enabled`, `blocklist_client_bypass`.
 /// Restart-required:           `dns_bind_addr`, `dns_cache_size`, `api_bind_addr`,
-///                             `blocklist_decision_cache_size`, `upstream`, `zones`.
+///                             `blocklist_decision_cache_size`, `upstream`, `zones`,
+///                             `panel_enabled`, `panel_domain`, `panel_ipv4`, `panel_url`.
 #[derive(Debug, Deserialize, Default)]
 pub struct SettingsPatch {
     // ── Hot-patchable ────────────────────────────────────────────────────────
@@ -92,6 +103,12 @@ pub struct SettingsPatch {
     pub api_bind_addr: Option<String>,
     pub upstream: Option<Vec<UpstreamConfig>>,
     pub zones: Option<Vec<ZoneConfig>>,
+    pub panel_enabled: Option<bool>,
+    pub panel_domain: Option<String>,
+    #[serde(default, deserialize_with = "nullable::deserialize")]
+    pub panel_ipv4: Option<Option<Ipv4Addr>>,
+    #[serde(default, deserialize_with = "nullable::deserialize")]
+    pub panel_url: Option<Option<String>>,
 }
 
 /// PATCH /api/settings — apply a partial settings update.
@@ -270,6 +287,43 @@ pub async fn update_settings(
             cfg.zones = zones;
             restart_changed.push("zones");
         }
+
+        if let Some(enabled) = patch.panel_enabled {
+            cfg.panel.enabled = enabled;
+            restart_changed.push("panel_enabled");
+        }
+
+        if let Some(ref domain) = patch.panel_domain {
+            let domain = domain.trim().trim_end_matches('.');
+            if domain.is_empty() {
+                return Err(ApiError(FeriteError::Config(
+                    "panel_domain cannot be empty".into(),
+                )));
+            }
+            cfg.panel.domain = domain.to_ascii_lowercase();
+            restart_changed.push("panel_domain");
+        }
+
+        if let Some(ipv4) = patch.panel_ipv4 {
+            cfg.panel.ipv4 = ipv4;
+            restart_changed.push("panel_ipv4");
+        }
+
+        if let Some(url) = patch.panel_url {
+            cfg.panel.url = match url {
+                Some(raw) => {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        return Err(ApiError(FeriteError::Config(
+                            "panel_url cannot be empty; use null to reset".into(),
+                        )));
+                    }
+                    Some(trimmed.to_string())
+                }
+                None => None,
+            };
+            restart_changed.push("panel_url");
+        }
     }
 
     if let Some(patterns) = patch.dns_log_ignore {
@@ -329,6 +383,25 @@ pub async fn update_settings(
     })))
 }
 
+/// Replace the password in a `scheme://user:password@host...` URL with `***`.
+/// Returns `None` when there is no embedded password to mask (so the caller
+/// leaves the value untouched). Best-effort string surgery: it never errors,
+/// and on any unexpected shape it leaves the URL as-is.
+fn mask_url_password(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let (authority, tail) = match rest.split_once('/') {
+        Some((a, t)) => (a, Some(t)),
+        None => (rest, None),
+    };
+    let (userinfo, host) = authority.split_once('@')?;
+    let (user, _pass) = userinfo.split_once(':')?;
+    let masked_authority = format!("{}:***@{}", user, host);
+    Some(match tail {
+        Some(t) => format!("{}://{}/{}", scheme, masked_authority, t),
+        None => format!("{}://{}", scheme, masked_authority),
+    })
+}
+
 fn normalize_client_bypass(entries: &[String]) -> Result<Vec<String>, ApiError> {
     let mut normalized = BTreeSet::new();
     for entry in entries {
@@ -374,6 +447,22 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::test_support;
+
+    #[test]
+    fn mask_url_password_redacts_only_the_password() {
+        assert_eq!(
+            mask_url_password("redis://user:s3cret@host:6379"),
+            Some("redis://user:***@host:6379".to_string())
+        );
+        assert_eq!(
+            mask_url_password("redis://user:s3cret@host:6379/0"),
+            Some("redis://user:***@host:6379/0".to_string())
+        );
+        // No credentials → nothing to mask.
+        assert_eq!(mask_url_password("redis://127.0.0.1:6379"), None);
+        // Username only (no password) → leave untouched.
+        assert_eq!(mask_url_password("redis://user@host:6379"), None);
+    }
 
     #[tokio::test]
     async fn get_settings_masks_secret_fields_but_keeps_shape_stable() {

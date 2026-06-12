@@ -8,7 +8,7 @@ use crate::config::CustomRecordConfig;
 use crate::dns::types::{QueryEntry, QueryStatus};
 use crate::error::{FeriteError, Result};
 use crate::stats::timeseries::TimeseriesBucket;
-use crate::storage::{ClientStats, QueryFilter, Storage};
+use crate::storage::{ClientStats, QueryFilter, Storage, SummaryStats};
 
 // ── Error helper ─────────────────────────────────────────────────────────────
 
@@ -70,6 +70,10 @@ impl RedisStorage {
     }
 
     fn day_range(from_ts: i64, to_ts: i64) -> Vec<i64> {
+        if from_ts > to_ts {
+            return Vec::new();
+        }
+        let from_ts = from_ts.max(to_ts.saturating_sub(DAY_TTL));
         let mut days = vec![];
         let mut day = (from_ts / 86_400) * 86_400;
         let end = (to_ts / 86_400) * 86_400;
@@ -389,25 +393,35 @@ impl Storage for RedisStorage {
 
     async fn summary(&self, secs: u64) -> Result<(u64, u64)> {
         let from = (chrono::Utc::now().timestamp() as u64).saturating_sub(secs) as i64;
+        let counts = self
+            .summary_counts(from, chrono::Utc::now().timestamp())
+            .await?;
+        Ok((counts.total, counts.blocked))
+    }
+
+    async fn summary_counts(&self, from_ts: i64, to_ts: i64) -> Result<SummaryStats> {
         let raw: Vec<String> = self
             .pool
             .lrange(self.k("log"), 0, LOG_MAXLEN - 1)
             .await
             .map_err(re)?;
 
-        let mut total = 0u64;
-        let mut blocked = 0u64;
+        let mut counts = SummaryStats::default();
         for json in raw {
             if let Ok(entry) = serde_json::from_str::<QueryEntry>(&json) {
-                if entry.timestamp.timestamp() >= from {
-                    total += 1;
-                    if entry.status == QueryStatus::Blocked {
-                        blocked += 1;
+                let ts = entry.timestamp.timestamp();
+                if ts >= from_ts && ts <= to_ts {
+                    counts.total += 1;
+                    match entry.status {
+                        QueryStatus::Blocked => counts.blocked += 1,
+                        QueryStatus::Cached => counts.cached += 1,
+                        QueryStatus::Upstream => counts.upstream += 1,
+                        QueryStatus::Allowed => {}
                     }
                 }
             }
         }
-        Ok((total, blocked))
+        Ok(counts)
     }
 
     async fn delete_all_queries(&self) -> Result<()> {

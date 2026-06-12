@@ -47,7 +47,8 @@ pub fn load_snapshot(path: &Path) -> Result<Option<StateSnapshot>> {
 /// Apply a snapshot to the running application state.
 ///
 /// - DNS cache entries are restored (expired ones are skipped by `DnsCache::restore`).
-/// - Live stats counters are set to snapshot values.
+/// - Live stats counters are increased from a same-day snapshot when it has
+///   values newer than the storage seed.
 pub fn apply_snapshot(state: &AppState, snapshot: &StateSnapshot) {
     // Restore DNS cache.
     let entries: Vec<(String, Vec<u8>, u32, i64)> = snapshot
@@ -64,20 +65,20 @@ pub fn apply_snapshot(state: &AppState, snapshot: &StateSnapshot) {
 
     if snapshot_day == Some(today) {
         let live = &state.inner.live_stats;
-        live.total_queries
-            .store(snapshot.total_queries, Ordering::Relaxed);
-        live.total_blocked
-            .store(snapshot.total_blocked, Ordering::Relaxed);
-        live.total_cached
-            .store(snapshot.total_cached, Ordering::Relaxed);
-        live.total_upstream
-            .store(snapshot.total_upstream, Ordering::Relaxed);
-        live.total_allowed
-            .store(snapshot.total_allowed, Ordering::Relaxed);
-        tracing::info!("live stats restored from snapshot (same day)");
+        store_max(&live.total_queries, snapshot.total_queries);
+        store_max(&live.total_blocked, snapshot.total_blocked);
+        store_max(&live.total_cached, snapshot.total_cached);
+        store_max(&live.total_upstream, snapshot.total_upstream);
+        store_max(&live.total_allowed, snapshot.total_allowed);
+        tracing::info!("live stats merged from snapshot (same day)");
     } else {
-        tracing::info!("snapshot from a previous day — live stats reset to zero");
+        tracing::info!("snapshot from a previous day — live stats counters ignored");
     }
+}
+
+fn store_max(counter: &std::sync::atomic::AtomicU64, snapshot_value: u64) {
+    let current = counter.load(Ordering::Relaxed);
+    counter.store(current.max(snapshot_value), Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -220,6 +221,36 @@ mod tests {
         assert_eq!(live.total_cached.load(Ordering::Relaxed), 8);
         assert_eq!(live.total_upstream.load(Ordering::Relaxed), 9);
         assert_eq!(live.total_allowed.load(Ordering::Relaxed), 18);
+
+        drop(state);
+        cleanup_sqlite(&db_path);
+    }
+
+    #[tokio::test]
+    async fn same_day_snapshot_does_not_lower_seeded_counters() {
+        let (state, db_path) = temp_state("same-day-stats-max").await;
+        state
+            .inner
+            .live_stats
+            .total_queries
+            .store(100, Ordering::Relaxed);
+        let snapshot = StateSnapshot {
+            version: SNAPSHOT_VERSION,
+            created_at: chrono::Utc::now().timestamp(),
+            dns_cache: vec![],
+            total_queries: 42,
+            total_blocked: 0,
+            total_cached: 0,
+            total_upstream: 0,
+            total_allowed: 0,
+        };
+
+        apply_snapshot(&state, &snapshot);
+
+        assert_eq!(
+            state.inner.live_stats.total_queries.load(Ordering::Relaxed),
+            100
+        );
 
         drop(state);
         cleanup_sqlite(&db_path);

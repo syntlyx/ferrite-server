@@ -78,8 +78,11 @@ async fn udp_loop(socket: UdpSocket, state: AppState) -> anyhow::Result<()> {
                         0x00, 0x00, // NSCOUNT=0
                         0x00, 0x00, // ARCOUNT=0
                     ];
-                    // Echo RD bit from the query.
-                    if raw[2] & 0x01 != 0 {
+                    // Echo RD bit from the query. Byte 2 only exists on a
+                    // header of at least 3 bytes — a 2-byte datagram passes the
+                    // guard above but has no flags byte, so bounds-check before
+                    // reading it (otherwise a 2-byte packet panics this loop).
+                    if raw.len() >= 3 && raw[2] & 0x01 != 0 {
                         servfail[2] |= 0x01;
                     }
                     let _ = socket.send_to(&servfail, src).await;
@@ -90,6 +93,9 @@ async fn udp_loop(socket: UdpSocket, state: AppState) -> anyhow::Result<()> {
 
         tokio::spawn(async move {
             let _permit = permit;
+            // Capture the client's advertised UDP buffer size before `raw` is
+            // moved into the handler (512 without EDNS0, larger if advertised).
+            let max_udp = client_udp_payload(&raw);
             match crate::dns::handler::handle_query(
                 raw,
                 src,
@@ -99,10 +105,16 @@ async fn udp_loop(socket: UdpSocket, state: AppState) -> anyhow::Result<()> {
             .await
             {
                 Ok(resp) if !resp.is_empty() => {
-                    // DNS over UDP is limited to 512 bytes without EDNS0.
-                    // If our response exceeds MAX_UDP_PAYLOAD just send it anyway —
-                    // the client should retry over TCP if it gets a TC response.
-                    if let Err(e) = socket.send_to(&resp, src).await {
+                    // If the answer is larger than the client can accept over
+                    // UDP, send a truncated (TC=1) reply so it retries over TCP
+                    // rather than receiving an oversized datagram the network may
+                    // silently drop (RFC 1035 §4.2.1).
+                    let datagram = if resp.len() > max_udp {
+                        truncate_response(&resp)
+                    } else {
+                        resp
+                    };
+                    if let Err(e) = socket.send_to(&datagram, src).await {
                         tracing::warn!("UDP send to {}: {}", src, e);
                     }
                 }
@@ -111,6 +123,46 @@ async fn udp_loop(socket: UdpSocket, state: AppState) -> anyhow::Result<()> {
             }
         });
     }
+}
+
+/// The client's maximum UDP payload size: 512 bytes by default (RFC 1035), or
+/// the EDNS0 advertised size (clamped to our receive buffer) when the query
+/// carries an OPT record. Falls back to 512 for unparseable queries.
+fn client_udp_payload(query: &[u8]) -> usize {
+    use hickory_proto::op::Message;
+    use hickory_proto::serialize::binary::BinDecodable;
+    // `Message::max_payload()` already returns the EDNS0 advertised size with a
+    // 512-byte floor; we just cap it to our own receive buffer.
+    Message::from_bytes(query)
+        .map(|m| (m.max_payload() as usize).min(MAX_UDP_PAYLOAD))
+        .unwrap_or(512)
+}
+
+/// Build a minimal truncated response from `resp`: the 12-byte header with the
+/// TC bit set and the answer/authority/additional counts cleared, followed by
+/// the question section echoed verbatim. This is a valid, empty, truncated
+/// answer that tells the client to retry the query over TCP.
+fn truncate_response(resp: &[u8]) -> Vec<u8> {
+    if resp.len() < 12 {
+        return resp.to_vec();
+    }
+    let mut out = resp[..12].to_vec();
+    out[2] |= 0b0000_0010; // set TC (truncated) bit
+    out[6] = 0;
+    out[7] = 0; // ANCOUNT = 0
+    out[8] = 0;
+    out[9] = 0; // NSCOUNT = 0
+    out[10] = 0;
+    out[11] = 0; // ARCOUNT = 0
+    match crate::dns::types::question_end(resp) {
+        Some(end) => out.extend_from_slice(&resp[12..end]),
+        // No parseable question — keep the header consistent by zeroing QDCOUNT.
+        None => {
+            out[4] = 0;
+            out[5] = 0;
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -162,9 +214,18 @@ async fn handle_tcp_connection(
         }
 
         let mut raw = vec![0u8; msg_len];
-        if let Err(e) = timeout(IDLE_TIMEOUT, stream.read_exact(&mut raw)).await {
-            tracing::warn!("TCP {}: read message: {}", src, e);
-            break;
+        match timeout(IDLE_TIMEOUT, stream.read_exact(&mut raw)).await {
+            Ok(Ok(_)) => {}
+            // Inner I/O error (e.g. connection reset mid-body): the buffer is
+            // only partially filled, so don't process it as a complete query.
+            Ok(Err(e)) => {
+                tracing::warn!("TCP {}: read message: {}", src, e);
+                break;
+            }
+            Err(e) => {
+                tracing::warn!("TCP {}: read message timed out: {}", src, e);
+                break;
+            }
         }
 
         let _permit = match state.inner.query_semaphore.try_acquire() {
@@ -210,4 +271,47 @@ async fn handle_tcp_connection(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod udp_tests {
+    use super::*;
+
+    /// Wire-format query (no EDNS) for `example.com` A IN, id 0x1234.
+    fn query_no_edns() -> Vec<u8> {
+        let mut m = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        for label in ["example", "com"] {
+            m.push(label.len() as u8);
+            m.extend_from_slice(label.as_bytes());
+        }
+        m.push(0);
+        m.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // QTYPE A, QCLASS IN
+        m
+    }
+
+    #[test]
+    fn no_edns_query_caps_at_512() {
+        assert_eq!(client_udp_payload(&query_no_edns()), 512);
+    }
+
+    #[test]
+    fn unparseable_query_caps_at_512() {
+        assert_eq!(client_udp_payload(b"\x00\x01"), 512);
+    }
+
+    #[test]
+    fn truncate_sets_tc_and_keeps_question() {
+        // A "response": query bytes with QR set and a fake oversized answer tail.
+        let mut resp = query_no_edns();
+        resp[2] |= 0x80; // QR
+        let q_end = crate::dns::types::question_end(&resp).unwrap();
+        resp.truncate(q_end);
+        resp.extend_from_slice(&[0xFF; 200]); // pretend answer payload
+
+        let out = truncate_response(&resp);
+        assert_eq!(out[2] & 0b0000_0010, 0b0000_0010, "TC bit set");
+        assert_eq!(&out[6..12], &[0, 0, 0, 0, 0, 0], "AN/NS/AR counts cleared");
+        // Question section preserved.
+        assert_eq!(&out[12..], &resp[12..q_end]);
+    }
 }

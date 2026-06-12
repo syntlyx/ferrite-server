@@ -14,7 +14,7 @@ A Pi-hole alternative written in Rust. Blocks ads and trackers at the DNS level,
 - **REST API** — complete control without restarting; see [API.md](API.md)
 - **Authentication** — session tokens (Argon2id, 24h TTL) or static API key
 - **Hot reload** — blocklist lists, selected runtime settings, and web UI path update without restart
-- **Panel shortcut** — built-in `fe.te` DNS record resolves to the ferrite server IP
+- **Panel shortcut** — built-in `fe.te` DNS record resolves to the configured or detected ferrite server IP
 - **Warm restart** — DNS cache and same-day stats counters snapshotted on shutdown, restored on startup
 
 ## Installation
@@ -92,6 +92,18 @@ Pin startup installs with `FERRITE_SERVER_VERSION=0.1.1`; `FERRITE_WEB_VERSION`
 defaults to the same value unless set separately. Leave both unset to track the
 latest releases. For private repos or higher API limits, pass
 `FERRITE_RELEASE_TOKEN` or `GITHUB_TOKEN`.
+
+In Docker bridge mode, the built-in `fe.te` panel shortcut cannot infer the LAN
+IP of the host from inside the container. Set `FERRITE_PANEL_IP` to the host IP
+for the `fe.te` A record, for example `FERRITE_PANEL_IP=192.168.1.5`. If the web
+UI is published on a non-80 host port, open `http://fe.te:<port>` and optionally
+set `FERRITE_PANEL_URL` to that URL so startup logs show the reachable address.
+Bridge mode also prevents Ferrite from auto-detecting the LAN reverse-DNS zone,
+so configure `zones` manually if you want router-provided client hostnames:
+
+```json
+{ "zones": [{ "name": "1.168.192.in-addr.arpa", "upstream": "192.168.1.1:53" }] }
+```
 
 Build locally:
 
@@ -267,14 +279,27 @@ curl -s -X PATCH http://localhost:8080/api/settings \
 ```
 
 Ferrite also serves a built-in DNS shortcut for the panel: `fe.te` resolves to
-the detected local IPv4 address of the ferrite server. A manual custom DNS
-record for `fe.te` overrides the built-in one.
+the configured panel IPv4 address, or the detected local IPv4 address of the
+ferrite server. A manual custom DNS record for `fe.te` overrides the built-in
+one. In Docker bridge mode, set `FERRITE_PANEL_IP` to the host/LAN IP because
+interface auto-detection only sees the container IP.
+
+For router-provided client hostnames in Docker bridge mode, configure the LAN
+reverse-DNS zone explicitly, for example `1.168.192.in-addr.arpa` to
+`192.168.1.1:53` for a `192.168.1.0/24` network. Auto-detection inside the
+container sees the Docker bridge network, not the LAN.
 
 Or set it permanently in the config file:
 
 ```toml
 # Top-level setting.
 web_dir = "/path/to/ferrite-ui/dist"
+
+[panel]
+enabled = true
+domain = "fe.te"
+ipv4 = "192.168.1.5"
+url = "http://fe.te:8031"
 ```
 
 ## Updates
@@ -354,16 +379,16 @@ GET    /api/auth                          session status
 POST   /api/auth                          log in → session token
 DELETE /api/auth                          log out
 
-GET    /api/stats/summary                 live counters
+GET    /api/stats/summary                 live counters seeded from retained history
 GET    /api/stats/timeseries              24 h timeseries (144 × 10 min buckets)
 GET    /api/stats/top-blocked             top blocked domains from the query log
 GET    /api/stats/top-domains             top queried domains from the query log
-GET    /api/stats/top-clients             top clients from the query log
+GET    /api/stats/top-clients             top clients from the query log (hours window or all-time)
 GET    /api/stats/system                  host/process system metrics
 
 GET    /api/queries                       query log (filterable, paginated)
 
-GET    /api/clients                       top clients grouped by hostname
+GET    /api/clients                       clients grouped by hostname (all retained history by default)
 GET    /api/clients/aliases               manual name aliases
 POST   /api/clients/aliases               add or update alias
 DELETE /api/clients/aliases/{ip}          remove alias

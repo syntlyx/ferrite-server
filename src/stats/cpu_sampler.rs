@@ -56,6 +56,6 @@ fn refresh_process_cpu(sys: &mut System) {
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,
         false,
-        ProcessRefreshKind::new().with_cpu(),
+        ProcessRefreshKind::nothing().with_cpu(),
     );
 }
