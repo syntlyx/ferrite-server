@@ -37,7 +37,11 @@ impl PlainResolver {
         // shared cache. Instead we send a fresh random ID for the upstream
         // exchange, validate the reply against it (in `send_udp`), then restore
         // the client's original ID before returning.
-        let client_id = if raw.len() >= 2 { [raw[0], raw[1]] } else { [0, 0] };
+        let client_id = if raw.len() >= 2 {
+            [raw[0], raw[1]]
+        } else {
+            [0, 0]
+        };
         let mut query = raw;
         let txid = random_txid().to_be_bytes();
         if query.len() >= 2 {

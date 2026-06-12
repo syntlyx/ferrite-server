@@ -162,7 +162,11 @@ pub async fn handle_query(
                 ),
             );
         }
-        return Ok(patch_cached(&cached.bytes, query.metadata.id, remaining_ttl));
+        return Ok(patch_cached(
+            &cached.bytes,
+            query.metadata.id,
+            remaining_ttl,
+        ));
     }
 
     // ── Step 4: Forward to upstream ───────────────────────────────────────
