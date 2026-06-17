@@ -32,20 +32,20 @@ impl QueryRingBuffer {
         buf.iter().rev().take(n).cloned().collect()
     }
 
-    /// Returns up to `n` entries with `id > after_id`, newest first.
+    /// Returns up to `n` entries with `id > after_id`, sorted newest id first.
     ///
-    /// Relies on ids being monotonic within the buffer (guaranteed: seeded
-    /// entries come from storage in id order, and the live counter is seeded
-    /// above the max persisted id at startup). Stops scanning at the first
-    /// already-seen entry, so a poll with a fresh cursor is O(delta).
+    /// Does NOT assume the buffer is id-monotonic: ids are assigned by an atomic
+    /// counter in the DNS task but pushed to the buffer from the stats-writer
+    /// task, so two concurrent queries can land out of order (e.g. `…,101,100`).
+    /// A `take_while` would stop at the first such inversion and silently drop
+    /// newer entries (freezing the live query log), so we filter the whole
+    /// buffer and sort by id. The buffer is small and bounded, so this is cheap.
     pub fn recent_after(&self, after_id: u64, n: usize) -> Vec<QueryEntry> {
         let buf = self.entries.lock();
-        buf.iter()
-            .rev()
-            .take_while(|e| e.id > after_id)
-            .take(n)
-            .cloned()
-            .collect()
+        let mut out: Vec<QueryEntry> = buf.iter().filter(|e| e.id > after_id).cloned().collect();
+        out.sort_unstable_by_key(|e| std::cmp::Reverse(e.id));
+        out.truncate(n);
+        out
     }
 
     /// Returns up to `n` most recent entries matching `predicate`, newest first.
@@ -132,5 +132,24 @@ mod tests {
 
         let delta = buf.recent_after(0, 2);
         assert_eq!(delta.iter().map(|e| e.id).collect::<Vec<_>>(), vec![5, 4]);
+    }
+
+    #[test]
+    fn recent_after_tolerates_out_of_order_ids() {
+        // Concurrent queries can push ids out of order (id assigned in the DNS
+        // task, pushed from the writer task). A take_while would stop at the
+        // inversion and drop newer entries; filter+sort must not.
+        let buf = QueryRingBuffer::new(10);
+        for id in [1, 2, 3, 5, 4] {
+            buf.push(entry(id));
+        }
+
+        // Everything newer than 3 is returned despite 5 sitting before 4.
+        let delta = buf.recent_after(3, 100);
+        assert_eq!(delta.iter().map(|e| e.id).collect::<Vec<_>>(), vec![5, 4]);
+
+        // Cursor at 4 still surfaces 5 (a take_while would have returned empty).
+        let delta = buf.recent_after(4, 100);
+        assert_eq!(delta.iter().map(|e| e.id).collect::<Vec<_>>(), vec![5]);
     }
 }

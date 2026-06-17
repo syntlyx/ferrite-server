@@ -40,6 +40,8 @@ pub struct SummaryResponse {
     pub upstream_queries: u64,
     pub block_percentage: f64,
     pub total_domains_blocked: u64,
+    /// Query stats dropped due to writer back-pressure (0 in healthy operation).
+    pub dropped_stats: u64,
     pub top_domains: Vec<(String, u64)>,
     pub top_blocked: Vec<(String, u64)>,
     pub top_clients: Vec<TopClientEntry>,
@@ -135,6 +137,7 @@ pub async fn get_summary(State(state): State<AppState>) -> Result<Json<SummaryRe
             .load(std::sync::atomic::Ordering::Relaxed),
         block_percentage: live.block_percentage(),
         total_domains_blocked: state.inner.blocklist.blocked_count(),
+        dropped_stats: live.dropped(),
         top_domains,
         top_blocked,
         top_clients,

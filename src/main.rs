@@ -136,7 +136,7 @@ async fn run() -> anyhow::Result<()> {
         if !blocklist.load_from_disk() {
             // No cached FST on disk — fetch and build in the background.
             tokio::spawn(async move {
-                match blocklist.refresh().await {
+                match blocklist.refresh(false).await {
                     Ok(n) => tracing::info!("initial blocklist loaded: {} domains", n),
                     Err(e) => tracing::error!("initial blocklist load failed: {}", e),
                 }

@@ -224,23 +224,22 @@ pub async fn handle_query(
 
     // ── Step 6: Cache NOERROR responses ───────────────────────────────────
     // A TTL of 0 means "do not cache" (RFC 1035/2181) — caching it would break
-    // failover/GeoDNS that relies on near-zero TTLs. Skip those. Responses with
-    // no answer records (NODATA) fall back to the configured minimum.
+    // failover/GeoDNS that relies on near-zero TTLs. NODATA (empty answer)
+    // responses are cached under the RFC 2308 negative TTL from the authority
+    // SOA, or skipped when no SOA is present.
     if rcode == 0 && !response_bytes.is_empty() {
-        match extract_min_ttl(&response_bytes) {
-            Some(0) => {
-                tracing::debug!("not caching {} (answer TTL is 0)", name);
-            }
-            ttl => {
+        match cache_ttl(&response_bytes) {
+            Some(ttl) => {
                 state.dns_cache.insert(
                     &name,
                     qtype,
                     DnsResponse {
                         bytes: bytes::Bytes::copy_from_slice(&response_bytes),
-                        ttl: ttl.unwrap_or(state.dns_cache.min_ttl_secs() as u32),
+                        ttl,
                     },
                 );
             }
+            None => tracing::debug!("not caching {} (TTL 0 or no cacheable TTL)", name),
         }
     }
 
@@ -270,8 +269,22 @@ pub async fn handle_query(
 
 fn emit(state: &AppStateInner, tx: &mpsc::Sender<QueryEntry>, entry: QueryEntry) {
     state.live_stats.record_query(&entry);
-    // try_send: if channel is full we drop the stat rather than block DNS.
-    let _ = tx.try_send(entry);
+    // try_send: if the channel is full we drop the stat rather than block DNS,
+    // but count the drop and warn (rate-limited) so a stalled writer surfaces
+    // instead of silently diverging the persisted log from the live counters.
+    if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(entry) {
+        let dropped = state
+            .live_stats
+            .total_dropped
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        if dropped.is_power_of_two() {
+            tracing::warn!(
+                "stats writer back-pressure: {} query stats dropped (channel full)",
+                dropped
+            );
+        }
+    }
 }
 
 fn make_entry(
@@ -376,7 +389,16 @@ fn patch_cached(bytes: &[u8], id: u16, remaining_ttl: u32) -> Vec<u8> {
     match Message::from_bytes(bytes) {
         Ok(mut msg) => {
             msg.metadata.id = id;
-            for rr in &mut msg.answers {
+            // Rewrite TTLs in every record section (answers, authority SOA,
+            // additionals) so downstream resolvers don't over-cache past the
+            // entry's expiry — in particular the SOA negative-cache TTL for
+            // NODATA responses, which lives in the authority section.
+            for rr in msg
+                .answers
+                .iter_mut()
+                .chain(msg.authorities.iter_mut())
+                .chain(msg.additionals.iter_mut())
+            {
                 rr.ttl = remaining_ttl;
             }
             msg.to_bytes().unwrap_or_else(|_| patch_id(bytes, id))
@@ -404,14 +426,24 @@ fn is_log_ignored(name: &str, patterns: &[String]) -> bool {
     false
 }
 
-/// Extract the minimum TTL from answer records in a raw DNS response.
-fn extract_min_ttl(bytes: &[u8]) -> Option<u32> {
-    Message::from_bytes(bytes)
-        .ok()?
-        .answers
-        .iter()
-        .map(|rr| rr.ttl)
-        .min()
+/// TTL (seconds) to cache a NOERROR response under, or `None` to skip caching.
+///
+/// Positive answers use the minimum answer-record TTL. Empty (NODATA) answers
+/// use the RFC 2308 negative-cache TTL derived from the authority-section SOA
+/// (the lesser of the SOA record TTL and its MINIMUM field). A TTL of 0 — or a
+/// NODATA response with no SOA to bound it — is not cached.
+fn cache_ttl(bytes: &[u8]) -> Option<u32> {
+    let msg = Message::from_bytes(bytes).ok()?;
+    if !msg.answers.is_empty() {
+        let min = msg.answers.iter().map(|rr| rr.ttl).min()?;
+        return (min > 0).then_some(min);
+    }
+    // NODATA: the negative-cache lifetime lives in the authority-section SOA.
+    let neg = msg.authorities.iter().find_map(|rr| match &rr.data {
+        RData::SOA(soa) => Some(rr.ttl.min(soa.minimum)),
+        _ => None,
+    })?;
+    (neg > 0).then_some(neg)
 }
 
 #[cfg(test)]
@@ -549,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_min_ttl_uses_lowest_answer_ttl() {
+    fn cache_ttl_uses_lowest_answer_ttl() {
         let query = query("ttl.test", RecordType::A);
         let mut resp = Message::response(query.metadata.id, OpCode::Query);
         resp.add_queries(query.queries.iter().cloned());
@@ -564,7 +596,94 @@ mod tests {
             RData::A(A(Ipv4Addr::new(192, 0, 2, 2))),
         ));
 
-        assert_eq!(extract_min_ttl(&resp.to_bytes().unwrap()), Some(45));
+        assert_eq!(cache_ttl(&resp.to_bytes().unwrap()), Some(45));
+    }
+
+    #[test]
+    fn cache_ttl_skips_zero_answer_ttl() {
+        let query = query("nocache.test", RecordType::A);
+        let mut resp = Message::response(query.metadata.id, OpCode::Query);
+        resp.add_queries(query.queries.iter().cloned());
+        resp.add_answer(Record::from_rdata(
+            name("nocache.test"),
+            0,
+            RData::A(A(Ipv4Addr::new(192, 0, 2, 1))),
+        ));
+
+        assert_eq!(cache_ttl(&resp.to_bytes().unwrap()), None);
+    }
+
+    #[test]
+    fn cache_ttl_nodata_uses_soa_negative_ttl() {
+        use hickory_proto::rr::rdata::SOA;
+
+        let query = query("host.test", RecordType::AAAA);
+        let mut resp = Message::response(query.metadata.id, OpCode::Query);
+        resp.add_queries(query.queries.iter().cloned());
+        // NODATA: no answers, SOA in the authority section bounds caching.
+        let soa = SOA::new(
+            name("ns.test"),
+            name("hostmaster.test"),
+            1,
+            3600,
+            600,
+            86400,
+            30, // MINIMUM — the negative-cache TTL
+        );
+        let soa_rr = Record::from_rdata(name("test"), 120, RData::SOA(soa));
+        resp.authorities.push(soa_rr);
+
+        // min(record TTL 120, SOA MINIMUM 30) = 30.
+        assert_eq!(cache_ttl(&resp.to_bytes().unwrap()), Some(30));
+    }
+
+    #[test]
+    fn cache_ttl_nodata_without_soa_is_not_cached() {
+        let query = query("host.test", RecordType::AAAA);
+        let mut resp = Message::response(query.metadata.id, OpCode::Query);
+        resp.add_queries(query.queries.iter().cloned());
+
+        assert_eq!(cache_ttl(&resp.to_bytes().unwrap()), None);
+    }
+
+    #[test]
+    fn patch_cached_rewrites_authority_section_ttl() {
+        use hickory_proto::rr::rdata::SOA;
+
+        // NODATA response: the negative-cache lifetime is the authority SOA TTL.
+        let query = query("host.test", RecordType::AAAA);
+        let mut resp = Message::response(query.metadata.id, OpCode::Query);
+        resp.add_queries(query.queries.iter().cloned());
+        let soa = SOA::new(name("ns.test"), name("hm.test"), 1, 3600, 600, 86400, 300);
+        resp.authorities
+            .push(Record::from_rdata(name("test"), 3600, RData::SOA(soa)));
+        let bytes = resp.to_bytes().unwrap();
+
+        let patched = patch_cached(&bytes, 0x4242, 42);
+        let msg = Message::from_bytes(&patched).unwrap();
+
+        assert_eq!(msg.metadata.id, 0x4242);
+        // The authority SOA TTL is clamped to the entry's remaining lifetime,
+        // not left at its original 3600 (which would over-cache downstream).
+        assert_eq!(msg.authorities[0].ttl, 42);
+    }
+
+    #[tokio::test]
+    async fn emit_counts_dropped_stats_when_channel_full() {
+        let (state, db_path) = test_support::app_state("dns-emit-drop").await;
+        // Keep the receiver alive (so try_send sees Full, not Closed) but never drain.
+        let (tx, _rx) = mpsc::channel::<QueryEntry>(1);
+        let entry = || make_entry("x.test", 1, "192.0.2.1", QueryStatus::Upstream, 0, None, 0);
+
+        // Fill the single slot, then two further emits can't enqueue.
+        tx.try_send(entry()).unwrap();
+        emit(&state.inner, &tx, entry());
+        emit(&state.inner, &tx, entry());
+
+        assert_eq!(state.inner.live_stats.dropped(), 2);
+
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
     }
 
     #[test]

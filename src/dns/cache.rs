@@ -101,6 +101,7 @@ impl DnsCache {
         *self.ttl_bounds.write() = normalize_ttl_bounds(min_ttl, max_ttl);
     }
 
+    #[allow(dead_code)]
     pub fn min_ttl_secs(&self) -> u64 {
         self.ttl_bounds.read().min_secs
     }
@@ -110,6 +111,22 @@ impl DnsCache {
     pub fn evict(&self, name: &str, qtype: u16) {
         let key = Self::cache_key(name, qtype);
         self.inner.write().pop(&key);
+    }
+
+    /// Evict every cached entry for `name`, across all qtypes. Cache keys are
+    /// `name/qtype`, so this pops all keys with the `name/` prefix — covering
+    /// qtypes (ANY, MX, …) that a hardcoded qtype list would miss.
+    pub fn evict_domain(&self, name: &str) {
+        let prefix = format!("{}/", name.to_ascii_lowercase());
+        let mut guard = self.inner.write();
+        let keys: Vec<String> = guard
+            .iter()
+            .map(|(k, _)| k.clone())
+            .filter(|k| k.starts_with(&prefix))
+            .collect();
+        for k in keys {
+            guard.pop(&k);
+        }
     }
 
     /// Remove all expired entries. Called by the janitor task.
@@ -226,5 +243,25 @@ mod tests {
     fn ttl_bounds_are_normalized() {
         let cache = DnsCache::new(8, 7200, 30);
         assert_eq!(cache.min_ttl_secs(), MAX_TTL);
+    }
+
+    #[test]
+    fn evict_domain_removes_all_qtypes_for_that_name_only() {
+        let cache = DnsCache::new(16, 60, 300);
+        cache.insert("router.lan", 1, response(120)); // A
+        cache.insert("router.lan", 28, response(120)); // AAAA
+        cache.insert("router.lan", 255, response(120)); // ANY
+        cache.insert("other.lan", 1, response(120));
+
+        cache.evict_domain("router.lan");
+
+        assert!(cache.get("router.lan", 1).is_none());
+        assert!(cache.get("router.lan", 28).is_none());
+        assert!(
+            cache.get("router.lan", 255).is_none(),
+            "ANY must be evicted too"
+        );
+        // A different domain is untouched.
+        assert!(cache.get("other.lan", 1).is_some());
     }
 }

@@ -10,11 +10,12 @@ use serde_json::{json, Value};
 
 use crate::api::ApiError;
 use crate::app::AppState;
-use crate::blocklist::Blocklist;
+use crate::blocklist::{AdblockStats, Blocklist};
 use crate::config::ListConfig;
 use crate::error::FeriteError;
 
-/// `ListConfig` enriched with the live domain count from the last refresh.
+/// `ListConfig` enriched with the live domain count from the last refresh, plus
+/// the Adblock parse breakdown for Adblock-format lists (absent otherwise).
 #[derive(Serialize)]
 struct ListInfo {
     name: String,
@@ -22,6 +23,8 @@ struct ListInfo {
     enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     domains_loaded: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parse_stats: Option<AdblockStats>,
 }
 
 fn to_list_info(cfg: &ListConfig, bl: &Blocklist) -> ListInfo {
@@ -30,6 +33,7 @@ fn to_list_info(cfg: &ListConfig, bl: &Blocklist) -> ListInfo {
         url: cfg.url.clone(),
         enabled: cfg.enabled,
         domains_loaded: bl.domain_count(&cfg.name),
+        parse_stats: bl.parse_stats(&cfg.name),
     }
 }
 
@@ -78,7 +82,7 @@ pub async fn add_list(
     {
         let blocklist = Arc::clone(&state.inner.blocklist);
         tokio::spawn(async move {
-            if let Err(e) = blocklist.refresh().await {
+            if let Err(e) = blocklist.refresh(false).await {
                 tracing::error!("refresh after add_list failed: {}", e);
             }
         });
@@ -110,7 +114,7 @@ pub async fn del_list(
     {
         let blocklist = Arc::clone(&state.inner.blocklist);
         tokio::spawn(async move {
-            if let Err(e) = blocklist.refresh().await {
+            if let Err(e) = blocklist.refresh(false).await {
                 tracing::error!("refresh after del_list failed: {}", e);
             }
         });
@@ -177,7 +181,7 @@ pub async fn patch_list(
     {
         let blocklist = Arc::clone(&state.inner.blocklist);
         tokio::spawn(async move {
-            if let Err(e) = blocklist.refresh().await {
+            if let Err(e) = blocklist.refresh(false).await {
                 tracing::error!("refresh after patch_list failed: {}", e);
             }
         });
@@ -195,7 +199,7 @@ pub async fn patch_list(
 
 /// POST /api/lists/refresh — re-fetch all lists and rebuild FST
 pub async fn refresh_all_lists(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    state.inner.blocklist.refresh().await?;
+    state.inner.blocklist.refresh(true).await?;
     let lists: Vec<ListInfo> = state
         .inner
         .blocklist
@@ -225,7 +229,12 @@ pub async fn refresh_list(
         ))));
     }
 
-    state.inner.blocklist.refresh().await?;
+    state.inner.blocklist.refresh(true).await?;
     let count = state.inner.blocklist.domain_count(&name);
-    Ok(Json(json!({ "name": name, "domains_loaded": count })))
+    let parse_stats = state.inner.blocklist.parse_stats(&name);
+    Ok(Json(json!({
+        "name": name,
+        "domains_loaded": count,
+        "parse_stats": parse_stats,
+    })))
 }

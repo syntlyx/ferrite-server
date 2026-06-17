@@ -175,18 +175,31 @@ fn find_record<'a>(
     name_norm: &str,
     want_type: RecordType,
 ) -> Option<&'a CustomRecord> {
-    records.iter().find(|r| {
-        let type_match = r.record_type == want_type
-            || want_type == RecordType::ANY
-            // CNAME is returned for any qtype when only a CNAME exists
-            || r.record_type == RecordType::CNAME;
-        let name_match = if r.is_wildcard {
+    let name_match = |r: &CustomRecord| {
+        if r.is_wildcard {
             name_norm.ends_with(&r.wildcard_suffix) && name_norm != r.domain
         } else {
             name_norm == r.domain
-        };
-        name_match && type_match
-    })
+        }
+    };
+
+    // Prefer an exact qtype match (or any record for ANY queries).
+    if let Some(exact) = records
+        .iter()
+        .find(|r| name_match(r) && (r.record_type == want_type || want_type == RecordType::ANY))
+    {
+        return Some(exact);
+    }
+
+    // Fall back to a CNAME only when no direct record of the queried type
+    // exists, so an A/AAAA query isn't answered with a bare CNAME (cached under
+    // the A/AAAA key) when a real address record was configured.
+    if want_type != RecordType::CNAME {
+        return records
+            .iter()
+            .find(|r| name_match(r) && r.record_type == RecordType::CNAME);
+    }
+    None
 }
 
 // ── Response building ─────────────────────────────────────────────────────────
@@ -276,6 +289,42 @@ mod tests {
             resp.map(|r| answer_a(&r)),
             Some("192.168.1.10".parse().unwrap())
         );
+    }
+
+    fn answer_type(resp: &DnsResponse) -> RecordType {
+        let msg = Message::from_bytes(&resp.bytes).unwrap();
+        msg.answers[0].record_type()
+    }
+
+    #[test]
+    fn a_query_prefers_direct_a_record_over_cname() {
+        let records = CustomRecords::new();
+        records
+            .add(&cfg("host.test", "CNAME", "target.test"))
+            .unwrap();
+        records.add(&cfg("host.test", "A", "192.168.1.5")).unwrap();
+
+        // With both a CNAME and a direct A, an A query must get the A record,
+        // not the bare CNAME (which would be cached under the A key).
+        let resp = records
+            .lookup(&query("host.test", RecordType::A), "host.test", 1)
+            .unwrap();
+        assert_eq!(answer_type(&resp), RecordType::A);
+        assert_eq!(answer_a(&resp), "192.168.1.5".parse::<Ipv4Addr>().unwrap());
+    }
+
+    #[test]
+    fn a_query_falls_back_to_cname_when_no_direct_record() {
+        let records = CustomRecords::new();
+        records
+            .add(&cfg("cn.test", "CNAME", "target.test"))
+            .unwrap();
+
+        // No direct A — the CNAME is a legitimate fallback for the chain.
+        let resp = records
+            .lookup(&query("cn.test", RecordType::A), "cn.test", 1)
+            .unwrap();
+        assert_eq!(answer_type(&resp), RecordType::CNAME);
     }
 
     #[test]

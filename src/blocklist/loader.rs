@@ -4,7 +4,7 @@ use fst::map::OpBuilder;
 use fst::{Map, MapBuilder, Streamer};
 use reqwest::{Client, Url};
 
-use crate::blocklist::parser;
+use crate::blocklist::parser::{self, AdblockStats};
 use crate::error::{FeriteError, Result};
 
 /// Standard error message returned when a user-submitted blocklist URL fails
@@ -147,7 +147,7 @@ static HTTP_CLIENT: std::sync::LazyLock<Client> = std::sync::LazyLock::new(|| {
 /// - `http://` / `https://` — HTTP GET
 ///
 /// Format is auto-detected from content (hosts vs. Adblock).
-pub async fn load_list(url: &str) -> Result<Vec<String>> {
+pub async fn load_list(url: &str) -> Result<(Vec<String>, Option<AdblockStats>)> {
     let content = if let Some(path) = url.strip_prefix("file://") {
         tracing::info!("reading blocklist from file {}", path);
         tokio::fs::read_to_string(path).await?
@@ -157,44 +157,59 @@ pub async fn load_list(url: &str) -> Result<Vec<String>> {
         resp.text().await?
     };
 
-    let domains = parse_content(&content);
+    let (domains, stats) = parse_content(&content);
     tracing::info!("parsed {} domains from {}", domains.len(), url);
-    Ok(domains)
+    Ok((domains, stats))
 }
 
 /// Detect list format and parse into domain names.
 ///
-/// Detection is based on the **first non-comment, non-empty data line**
-/// (comments are lines starting with `!`, `#`, or `[Adblock`):
+/// Detection rules, in order:
 ///
-/// - Starts with `||`           → adblock (`||domain^`)
-/// - Starts with `0.0.0.0` /
-///   `127.0.0.1` / `::1`        → hosts format
-/// - Anything else              → plain domain list (one per line)
-pub fn parse_content(content: &str) -> Vec<String> {
+/// - A `[Adblock …]` header anywhere → adblock. This is the definitive marker
+///   emitted by EasyList/uBO lists and is checked first; previously it was
+///   skipped as a "comment", which let EasyList fall through to the plain
+///   parser and wrongly block domains lifted from cosmetic rules.
+/// - Otherwise the **first non-comment, non-empty data line** decides:
+///   - Adblock filter syntax (`||`, `@@`, `##`, `$…`, …) → adblock
+///   - `0.0.0.0` / `127.0.0.1` / `::1`                    → hosts format
+///   - Anything else                                      → plain domain list
+pub fn parse_content(content: &str) -> (Vec<String>, Option<AdblockStats>) {
     for line in content.lines() {
         let line = line.trim();
 
-        // Skip comment / header lines — they don't reveal the data format.
-        if line.is_empty()
-            || line.starts_with('!')
-            || line.starts_with('#')
-            || line.starts_with("[Adblock")
-        {
+        if line.is_empty() {
             continue;
         }
 
-        // First real data line determines the format.
-        if line.starts_with("||") {
-            return parser::parse_adblock(content);
+        // The Adblock/uBO header is itself a definitive format marker — an
+        // EasyList file opens with e.g. `[Adblock Plus 2.0]`. Detect it before
+        // the comment skip so the format is never mistaken for plain text.
+        if line.starts_with("[Adblock") {
+            let (domains, stats) = parser::parse_adblock(content);
+            return (domains, Some(stats));
         }
+
+        // Skip comment lines — they don't reveal the data format.
+        if line.starts_with('!') || line.starts_with('#') {
+            continue;
+        }
+
+        // First real data line determines the format. Check the hosts marker
+        // (a leading IP) first: it is the most specific signal and keeps a
+        // hosts line with a `$` in its trailing comment from being mistaken
+        // for an Adblock rule.
         if line.starts_with("0.0.0.0") || line.starts_with("127.0.0.1") || line.starts_with("::1") {
-            return parser::parse_hosts(content);
+            return (parser::parse_hosts(content), None);
         }
-        return parser::parse_plain(content);
+        if parser::is_adblock_syntax(line) {
+            let (domains, stats) = parser::parse_adblock(content);
+            return (domains, Some(stats));
+        }
+        return (parser::parse_plain(content), None);
     }
 
-    vec![]
+    (vec![], None)
 }
 
 /// Merge multiple per-list FSTs into one via k-way union.
@@ -239,6 +254,14 @@ pub fn merge_fsts(fst_slices: &[Vec<u8>]) -> Result<Vec<u8>> {
 /// All values are set to 1 (the FST is used as a set).
 /// Returns raw FST bytes ready to pass to `fst::Map::new()`.
 pub fn build_fst(mut domains: Vec<String>) -> Result<Vec<u8>> {
+    // Strip the trailing root dot so FQDN-form list entries (`ads.example.com.`)
+    // match queries, which are normalised dot-less before the FST is probed.
+    // Done before sort/dedup so equivalent dotted/undotted entries collapse.
+    for domain in domains.iter_mut() {
+        if domain.ends_with('.') {
+            domain.truncate(domain.trim_end_matches('.').len());
+        }
+    }
     // FST requires keys in strict lexicographic order with no duplicates.
     domains.sort_unstable();
     domains.dedup();
@@ -330,6 +353,71 @@ mod tests {
         // IP literal so no DNS lookup is needed — keeps the test offline.
         assert_accepted("http://1.1.1.1/list.txt").await;
         assert_accepted("https://8.8.8.8/hosts").await;
+    }
+
+    #[test]
+    fn build_fst_strips_trailing_root_dot() {
+        // FQDN-form entries must be stored dot-less so they match dot-stripped
+        // lookups; the dotted and undotted forms also collapse to one key.
+        let bytes = build_fst(vec![
+            "ads.example.com.".to_string(),
+            "ads.example.com".to_string(),
+            "tracker.test.".to_string(),
+        ])
+        .unwrap();
+        let map = Map::new(bytes).unwrap();
+
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key(b"ads.example.com"));
+        assert!(map.contains_key(b"tracker.test"));
+        assert!(!map.contains_key(b"ads.example.com."));
+    }
+
+    #[test]
+    fn easylist_detected_as_adblock_not_plain() {
+        // Real EasyList shape: an `[Adblock …]` header, `!` comments, a network
+        // filter whose first data line does NOT start with `||`, then cosmetic
+        // rules. Regression: this used to fall through to the plain parser and
+        // block google.com lifted from the `google.com##.cls` cosmetic rule.
+        let content = "\
+[Adblock Plus 2.0]\n\
+! Title: EasyList\n\
+&rb=&uuid=$third-party\n\
+||doubleclick.net^\n\
+google.com##.GGQPGYLCD5\n\
+www.google.com##.GISRH3UDHB\n";
+        let (domains, stats) = parse_content(content);
+        assert!(stats.is_some(), "adblock list must report parse stats");
+        assert!(
+            domains.contains(&"doubleclick.net".to_string()),
+            "real ||domain^ rules must be parsed"
+        );
+        assert!(
+            !domains.contains(&"google.com".to_string()),
+            "google.com must not be blocked"
+        );
+        assert!(!domains.contains(&"www.google.com".to_string()));
+    }
+
+    #[test]
+    fn easylist_without_header_still_detected_via_first_rule() {
+        // Same defense without the `[Adblock]` header: the first data line uses
+        // option syntax (`$third-party`), which is enough to route to adblock.
+        let content = "&rb=&uuid=$third-party\n||tracker.example^\ngoogle.com##.cls\n";
+        let (domains, _) = parse_content(content);
+        assert!(domains.contains(&"tracker.example".to_string()));
+        assert!(!domains.contains(&"google.com".to_string()));
+    }
+
+    #[test]
+    fn hosts_with_dollar_in_comment_not_misdetected_as_adblock() {
+        // Regression: a `$` in a hosts comment must not route the file to the
+        // adblock parser (which would find no `||` rules and load nothing).
+        let content = "0.0.0.0 casino.example # costs $$$\n0.0.0.0 ads.example\n";
+        let (domains, stats) = parse_content(content);
+        assert!(stats.is_none(), "hosts list has no adblock parse stats");
+        assert!(domains.contains(&"casino.example".to_string()));
+        assert!(domains.contains(&"ads.example".to_string()));
     }
 
     #[test]

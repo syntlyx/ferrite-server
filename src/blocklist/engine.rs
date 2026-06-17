@@ -9,7 +9,7 @@ use parking_lot::RwLock;
 use regex::Regex;
 
 use crate::blocklist::cache::BlocklistCache;
-use crate::blocklist::refresh;
+use crate::blocklist::{refresh, AdblockStats};
 use crate::clients::normalize_client_key;
 use crate::config::{BlocklistConfig, ListConfig};
 use crate::error::{FeriteError, Result};
@@ -43,6 +43,12 @@ pub struct Blocklist {
     lists: RwLock<Vec<ListConfig>>,
     /// Domain count per list name, updated after each refresh.
     domain_counts: RwLock<HashMap<String, usize>>,
+    /// Adblock parse breakdown per list name (only for Adblock-format lists),
+    /// updated after each refresh. Explains the rules-vs-domains gap in the UI.
+    adblock_stats: RwLock<HashMap<String, AdblockStats>>,
+    /// Serialises [`Self::refresh`] so concurrent API-triggered refreshes don't
+    /// race on `data`/`domain_counts` or pile up duplicate network fetches.
+    refresh_lock: tokio::sync::Mutex<()>,
     fst_path: PathBuf,
     list_cache_dir: PathBuf,
 }
@@ -94,6 +100,8 @@ impl Blocklist {
             cache: BlocklistCache::new(config.decision_cache_size),
             lists: RwLock::new(config.lists),
             domain_counts: RwLock::new(HashMap::new()),
+            adblock_stats: RwLock::new(HashMap::new()),
+            refresh_lock: tokio::sync::Mutex::new(()),
             fst_path,
             list_cache_dir,
         }
@@ -189,8 +197,21 @@ impl Blocklist {
     }
 
     fn check_blocked(&self, domain: &str) -> bool {
-        if self.blacklist.read().contains(domain) {
-            return true;
+        {
+            // Manual blacklist: exact match, then walk up the hierarchy so a
+            // blacklist entry for `evil.com` also blocks `www.evil.com` —
+            // symmetric with the FST walk below and the whitelist walk.
+            let blacklist = self.blacklist.read();
+            if blacklist.contains(domain) {
+                return true;
+            }
+            let mut rest = domain;
+            while let Some(dot) = rest.find('.') {
+                rest = &rest[dot + 1..];
+                if is_registrable_or_deeper(rest) && blacklist.contains(rest) {
+                    return true;
+                }
+            }
         }
         if self
             .blacklist_wildcards
@@ -213,10 +234,13 @@ impl Blocklist {
         }
 
         // Walk up the domain hierarchy: `www.evil.com` → check `evil.com`.
+        // The public-suffix guard stops the walk at the registrable-domain
+        // boundary so an entry for a multi-label suffix (e.g. `co.uk`) cannot
+        // over-match every domain under that ccTLD.
         let mut rest = domain;
         while let Some(dot) = rest.find('.') {
             rest = &rest[dot + 1..];
-            if rest.contains('.') && data.fst.contains_key(rest.as_bytes()) {
+            if is_registrable_or_deeper(rest) && data.fst.contains_key(rest.as_bytes()) {
                 return true;
             }
         }
@@ -231,9 +255,30 @@ impl Blocklist {
 
     /// Like [`Self::is_whitelisted`], but assumes `domain` is already lowercase
     /// and has no trailing root dot. Used by the DNS hot path.
+    ///
+    /// Matching walks up the domain hierarchy so that whitelisting `example.com`
+    /// also exempts `www.example.com`, mirroring how [`Self::check_blocked`]
+    /// matches a blocked parent against its subdomains. Without this the two
+    /// checks are asymmetric: a blocklist entry for `example.com` blocks every
+    /// subdomain, but a whitelist entry for `example.com` would only exempt the
+    /// exact name — so a whitelisted domain's subdomains would stay blocked.
     pub fn is_whitelisted_normalized(&self, domain: &str) -> bool {
-        if self.whitelist.read().contains(domain) {
-            return true;
+        {
+            let whitelist = self.whitelist.read();
+            if whitelist.contains(domain) {
+                return true;
+            }
+            // Walk up the hierarchy: `www.example.com` → check `example.com`.
+            // The public-suffix guard stops the walk at the registrable-domain
+            // boundary, matching the guard in `check_blocked` (so whitelisting a
+            // multi-label suffix like `co.uk` doesn't exempt an entire ccTLD).
+            let mut rest = domain;
+            while let Some(dot) = rest.find('.') {
+                rest = &rest[dot + 1..];
+                if is_registrable_or_deeper(rest) && whitelist.contains(rest) {
+                    return true;
+                }
+            }
         }
         self.whitelist_wildcards
             .read()
@@ -248,11 +293,13 @@ impl Blocklist {
         if d.contains('*') {
             let re = wildcard_to_regex(&d)?;
             self.whitelist_wildcards.write().push((d, re));
-            self.cache.clear();
         } else {
-            self.cache.invalidate(&d);
             self.whitelist.write().insert(d);
         }
+        // A whitelist/blacklist entry now matches subdomains via the hierarchy
+        // walk, so an exact-key invalidation can't cover the cached block/allow
+        // decisions it affects — clear the whole decision cache.
+        self.cache.clear();
         Ok(())
     }
 
@@ -262,11 +309,10 @@ impl Blocklist {
             self.whitelist_wildcards
                 .write()
                 .retain(|(pat, _)| pat != &d);
-            self.cache.clear();
         } else {
-            self.cache.invalidate(&d);
             self.whitelist.write().remove(&d);
         }
+        self.cache.clear();
     }
 
     pub fn add_blacklist(&self, domain: &str) -> Result<()> {
@@ -274,11 +320,10 @@ impl Blocklist {
         if d.contains('*') {
             let re = wildcard_to_regex(&d)?;
             self.blacklist_wildcards.write().push((d, re));
-            self.cache.clear();
         } else {
-            self.cache.invalidate(&d);
             self.blacklist.write().insert(d);
         }
+        self.cache.clear();
         Ok(())
     }
 
@@ -288,11 +333,10 @@ impl Blocklist {
             self.blacklist_wildcards
                 .write()
                 .retain(|(pat, _)| pat != &d);
-            self.cache.clear();
         } else {
-            self.cache.invalidate(&d);
             self.blacklist.write().remove(&d);
         }
+        self.cache.clear();
     }
 
     pub fn list_whitelist(&self) -> Vec<String> {
@@ -327,6 +371,12 @@ impl Blocklist {
         self.domain_counts.read().get(name).copied()
     }
 
+    /// Adblock parse breakdown for `name`, if it is an Adblock-format list and
+    /// has been refreshed at least once. `None` for hosts/plain lists.
+    pub fn parse_stats(&self, name: &str) -> Option<AdblockStats> {
+        self.adblock_stats.read().get(name).copied()
+    }
+
     pub fn add_list(&self, cfg: ListConfig) -> Result<()> {
         let mut lists = self.lists.write();
         if lists.iter().any(|l| l.name == cfg.name) {
@@ -359,7 +409,18 @@ impl Blocklist {
     // ── FST refresh ──────────────────────────────────────────────────────────
 
     /// Fetch all enabled lists and atomically replace the global FST.
-    pub async fn refresh(&self) -> Result<usize> {
+    ///
+    /// `force` bypasses the per-list disk caches (both the built `.fst` and the
+    /// parsed `.domains` text), forcing a network re-fetch and a fresh parse.
+    /// Use it for operator-triggered refreshes so a parser/format change takes
+    /// effect immediately; the periodic/startup refresh passes `false` and reuses
+    /// the caches within their TTL.
+    pub async fn refresh(&self, force: bool) -> Result<usize> {
+        // Serialise refreshes: concurrent API actions (add/del/patch list) each
+        // spawn a refresh, and overlapping runs would re-fetch every list and
+        // interleave their `data`/`domain_counts` stores. One at a time.
+        let _refresh_guard = self.refresh_lock.lock().await;
+
         let lists: Vec<ListConfig> = self
             .lists
             .read()
@@ -383,24 +444,39 @@ impl Blocklist {
                 let domains_cache = self
                     .list_cache_dir
                     .join(format!("{}.domains", refresh::sanitize_name(&list.name)));
+                let stats_cache = self
+                    .list_cache_dir
+                    .join(format!("{}.stats.json", refresh::sanitize_name(&list.name)));
                 tokio::spawn(async move {
                     let Ok(_permit) = permits.acquire_owned().await else {
-                        return (String::new(), vec![], 0);
+                        return (String::new(), vec![], 0, None);
                     };
-                    refresh::load_or_build_list_fst(name, url, fst_cache, domains_cache).await
+                    refresh::load_or_build_list_fst(
+                        name,
+                        url,
+                        fst_cache,
+                        domains_cache,
+                        stats_cache,
+                        force,
+                    )
+                    .await
                 })
             })
             .collect();
 
         let mut per_list_fsts: Vec<Vec<u8>> = Vec::with_capacity(lists.len());
         let mut counts: HashMap<String, usize> = HashMap::new();
+        let mut stats: HashMap<String, AdblockStats> = HashMap::new();
 
         for task in tasks {
-            let (name, fst_bytes, count) = task.await.unwrap_or_else(|e| {
+            let (name, fst_bytes, count, list_stats) = task.await.unwrap_or_else(|e| {
                 tracing::error!("list task panicked: {}", e);
-                (String::new(), vec![], 0)
+                (String::new(), vec![], 0, None)
             });
             if !name.is_empty() {
+                if let Some(s) = list_stats {
+                    stats.insert(name.clone(), s);
+                }
                 counts.insert(name, count);
                 per_list_fsts.push(fst_bytes);
             }
@@ -411,8 +487,6 @@ impl Blocklist {
                 "all enabled blocklists failed and no cached domains are available".to_string(),
             ));
         }
-
-        *self.domain_counts.write() = counts;
 
         let fst_path = self.fst_path.clone();
         let wildcards = self.data.load().wildcards.clone();
@@ -440,7 +514,11 @@ impl Blocklist {
             .await
             .map_err(|e| FeriteError::Internal(e.to_string()))??;
 
+        // Install the new FST and its domain counts together so a reader never
+        // sees counts from one refresh paired with the FST of another.
         self.data.store(Arc::new(BlocklistData { fst, wildcards }));
+        *self.domain_counts.write() = counts;
+        *self.adblock_stats.write() = stats;
         self.cache.clear();
 
         tracing::info!("blocklist refreshed: {} unique domains", unique_count);
@@ -472,6 +550,28 @@ fn normalise(domain: &str) -> String {
         .to_ascii_lowercase()
         .trim_end_matches('.')
         .to_string()
+}
+
+/// Canonical domain key used by the blocklist engine and the DNS hot path:
+/// lowercase, trailing root dot stripped. Exposed so the API layer can store
+/// and look up entries under the exact same key the engine uses (otherwise a
+/// UI-listed value can't delete its persisted row).
+pub fn normalise_domain(domain: &str) -> String {
+    normalise(domain)
+}
+
+/// Returns `true` if `name` is a registrable domain or a subdomain of one —
+/// i.e. it extends beyond its own public suffix. Used to stop the hierarchy
+/// walk at the registrable boundary so an entry for a public suffix
+/// (`com`, `co.uk`, `com.au`, …) never matches every domain beneath it.
+///
+/// Unknown suffixes are treated as registrable (fail open to the previous
+/// single-dot behaviour) rather than silently dropping the check.
+fn is_registrable_or_deeper(name: &str) -> bool {
+    match psl::suffix(name.as_bytes()) {
+        Some(suffix) => name.len() > suffix.as_bytes().len(),
+        None => true,
+    }
 }
 
 fn empty_fst() -> Map<Vec<u8>> {
@@ -534,7 +634,7 @@ mod tests {
         );
 
         assert!(blocklist.is_blocked("tracker.ads.test"));
-        blocklist.refresh().await.unwrap();
+        blocklist.refresh(false).await.unwrap();
         assert!(blocklist.is_blocked("tracker.ads.test"));
     }
 
@@ -565,7 +665,7 @@ mod tests {
         assert!(blocklist.load_from_disk());
         assert!(blocklist.is_blocked("blocked.test"));
 
-        let err = blocklist.refresh().await.unwrap_err();
+        let err = blocklist.refresh(false).await.unwrap_err();
         assert!(err
             .to_string()
             .contains("all enabled blocklists failed and no cached domains are available"));
@@ -595,5 +695,135 @@ mod tests {
         assert!(blocklist.is_whitelisted_normalized("app.trusted.test"));
         assert!(blocklist.is_blocked("Tracker.Ads.Test."));
         assert!(blocklist.is_blocked_normalized("tracker.ads.test"));
+    }
+
+    #[test]
+    fn whitelisting_parent_domain_exempts_subdomains() {
+        let blocklist = Blocklist::new(
+            BlocklistConfig {
+                enabled: true,
+                decision_cache_size: 128,
+                lists: vec![],
+                wildcard_block: vec![],
+                whitelist: vec!["google.com".to_string()],
+                client_bypass: vec![],
+            },
+            temp_fst_path("ferrite-blocklist-wl-hierarchy"),
+        );
+
+        // Exact and subdomains are all whitelisted, symmetric with is_blocked.
+        assert!(blocklist.is_whitelisted_normalized("google.com"));
+        assert!(blocklist.is_whitelisted_normalized("www.google.com"));
+        assert!(blocklist.is_whitelisted_normalized("adservice.google.com"));
+        // Sibling / bare-TLD parents must not be matched.
+        assert!(!blocklist.is_whitelisted_normalized("notgoogle.com"));
+        assert!(!blocklist.is_whitelisted_normalized("google.com.evil.com"));
+    }
+
+    #[test]
+    fn blacklisting_parent_domain_blocks_subdomains() {
+        let blocklist = Blocklist::new(
+            BlocklistConfig {
+                enabled: true,
+                decision_cache_size: 128,
+                lists: vec![],
+                wildcard_block: vec![],
+                whitelist: vec![],
+                client_bypass: vec![],
+            },
+            temp_fst_path("ferrite-blocklist-bl-hierarchy"),
+        );
+
+        blocklist.add_blacklist("evil.com").unwrap();
+        assert!(blocklist.is_blocked_normalized("evil.com"));
+        // Subdomains are blocked via the hierarchy walk, symmetric with the FST.
+        assert!(blocklist.is_blocked_normalized("www.evil.com"));
+        assert!(blocklist.is_blocked_normalized("ads.tracking.evil.com"));
+        // Sibling / unrelated domains are not.
+        assert!(!blocklist.is_blocked_normalized("notevil.com"));
+        assert!(!blocklist.is_blocked_normalized("evil.com.good.org"));
+    }
+
+    #[test]
+    fn blacklisting_parent_clears_stale_allow_for_subdomain() {
+        // A cached ALLOW decision for a subdomain must not survive blacklisting
+        // its parent — add_blacklist clears the whole decision cache because the
+        // hierarchy walk now makes the parent affect every subdomain.
+        let blocklist = Blocklist::new(
+            BlocklistConfig {
+                enabled: true,
+                decision_cache_size: 128,
+                lists: vec![],
+                wildcard_block: vec![],
+                whitelist: vec![],
+                client_bypass: vec![],
+            },
+            temp_fst_path("ferrite-blocklist-stale-allow"),
+        );
+
+        // First lookup caches an ALLOW (300s TTL) for the subdomain.
+        assert!(!blocklist.is_blocked_normalized("www.ads.test"));
+        blocklist.add_blacklist("ads.test").unwrap();
+        // The stale cached ALLOW must be gone.
+        assert!(blocklist.is_blocked_normalized("www.ads.test"));
+    }
+
+    #[test]
+    fn public_suffix_entry_does_not_overmatch_ccsld() {
+        // An entry for a multi-label public suffix (co.uk) must not match every
+        // domain under it — only the exact name.
+        let blocklist = Blocklist::new(
+            BlocklistConfig {
+                enabled: true,
+                decision_cache_size: 128,
+                lists: vec![],
+                wildcard_block: vec![],
+                whitelist: vec![],
+                client_bypass: vec![],
+            },
+            temp_fst_path("ferrite-blocklist-psl"),
+        );
+
+        blocklist.add_blacklist("co.uk").unwrap();
+        assert!(!blocklist.is_blocked_normalized("victim.co.uk"));
+        assert!(!blocklist.is_blocked_normalized("www.bbc.co.uk"));
+        // But a normal registrable domain still covers its subdomains.
+        blocklist.add_blacklist("bad.co.uk").unwrap();
+        assert!(blocklist.is_blocked_normalized("bad.co.uk"));
+        assert!(blocklist.is_blocked_normalized("tracker.bad.co.uk"));
+    }
+
+    #[test]
+    fn whitelisted_parent_overrides_blocked_subdomain() {
+        // Reproduces the reported "domain is whitelisted but its subdomain is
+        // still blocked" bug: a blocklist (FST) entry for `google.com` blocks
+        // every subdomain via the hierarchy walk, so whitelisting the parent
+        // must exempt them too.
+        let fst_path = temp_fst_path("ferrite-blocklist-wl-over-block");
+        std::fs::create_dir_all(fst_path.parent().unwrap()).unwrap();
+        let fst_bytes =
+            crate::blocklist::loader::build_fst(vec!["google.com".to_string()]).unwrap();
+        std::fs::write(&fst_path, fst_bytes).unwrap();
+
+        let blocklist = Blocklist::new(
+            BlocklistConfig {
+                enabled: true,
+                decision_cache_size: 128,
+                lists: vec![],
+                wildcard_block: vec![],
+                whitelist: vec![],
+                client_bypass: vec![],
+            },
+            fst_path,
+        );
+        assert!(blocklist.load_from_disk());
+
+        assert!(blocklist.is_blocked_normalized("www.google.com"));
+        assert!(!blocklist.is_whitelisted_normalized("www.google.com"));
+
+        blocklist.add_whitelist("google.com").unwrap();
+        // The handler gates blocking on `!is_whitelisted`, so this is what makes
+        // www.google.com resolve again.
+        assert!(blocklist.is_whitelisted_normalized("www.google.com"));
     }
 }

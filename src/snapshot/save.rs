@@ -16,10 +16,13 @@ pub fn build_snapshot(state: &AppState) -> StateSnapshot {
         .snapshot()
         .into_iter()
         .map(|(key, response, expires_at)| {
-            // Convert Instant to a unix timestamp by computing the offset from now.
+            // Convert Instant to a unix timestamp by computing the offset from
+            // now. Round the remaining lifetime UP: flooring would drop an entry
+            // with sub-second life left (restore skips `remaining <= 0`), and
+            // systematically shave up to ~1s off every restored TTL.
             let remaining = expires_at
                 .checked_duration_since(std::time::Instant::now())
-                .map(|d| d.as_secs() as i64)
+                .map(|d| d.as_secs() as i64 + i64::from(d.subsec_nanos() > 0))
                 .unwrap_or(0);
             DnsCacheEntry {
                 key,

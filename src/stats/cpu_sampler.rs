@@ -10,10 +10,12 @@ struct Inner {
 
 /// Tracks global and ferrite-process CPU usage by periodically calling sysinfo.
 ///
-/// Both values are sampled in the same `tick()` from the same `System`, so
-/// they cover the same time window and are directly comparable. The process
-/// value is normalized to the whole machine (sysinfo reports it as a
-/// percentage of a single core), so `process <= global` always holds.
+/// Both values are sampled in the same `tick()`. The process value is
+/// normalized to the whole machine (sysinfo reports it as a percentage of a
+/// single core) and then clamped to the global figure: the two come from
+/// separate refreshes whose delta windows don't align exactly, so without the
+/// clamp the normalized process value can momentarily exceed global. With it,
+/// `process <= global` always holds.
 ///
 /// sysinfo 0.32 computes process CPU deltas only on `ProcessesToUpdate::All`;
 /// refreshing only the current PID updates process fields but leaves
@@ -58,8 +60,14 @@ impl CpuSampler {
         if let Some(pid) = g.pid {
             let cores = g.sys.cpus().len().max(1) as f32;
             let per_core = g.sys.process(pid).map(|p| p.cpu_usage()).unwrap_or(0.0);
+            // The process is part of the global figure, so it can never legitimately
+            // exceed it. The global and per-process values come from two separate
+            // refreshes whose delta windows don't line up exactly, so the normalized
+            // process value can momentarily read higher than global; clamp to [0,
+            // global] to absorb that skew and keep `process <= global` from inverting.
+            let process = (per_core / cores).clamp(0.0, global.max(0.0));
             self.cached_process_cpu
-                .store((per_core / cores).to_bits(), Ordering::Relaxed);
+                .store(process.to_bits(), Ordering::Relaxed);
         }
     }
 

@@ -15,6 +15,9 @@ pub struct LiveStats {
     pub total_allowed: AtomicU64,
     pub total_cached: AtomicU64,
     pub total_upstream: AtomicU64,
+    /// Query stats dropped because the writer channel was full (back-pressure).
+    /// A sustained nonzero value flags a stalled stats writer.
+    pub total_dropped: AtomicU64,
 
     /// Top queried domains (all statuses).
     pub top_domains: TopNCounter,
@@ -37,6 +40,7 @@ impl LiveStats {
             total_allowed: AtomicU64::new(0),
             total_cached: AtomicU64::new(0),
             total_upstream: AtomicU64::new(0),
+            total_dropped: AtomicU64::new(0),
             top_domains: TopNCounter::new(10_000),
             top_blocked: TopNCounter::new(10_000),
             top_clients: TopNCounter::new(1_000),
@@ -77,6 +81,7 @@ impl LiveStats {
         self.total_allowed.store(0, Ordering::Relaxed);
         self.total_cached.store(0, Ordering::Relaxed);
         self.total_upstream.store(0, Ordering::Relaxed);
+        self.total_dropped.store(0, Ordering::Relaxed);
         self.top_domains.clear();
         self.top_blocked.clear();
         self.top_clients.clear();
@@ -90,6 +95,10 @@ impl LiveStats {
 
     pub fn blocked(&self) -> u64 {
         self.total_blocked.load(Ordering::Relaxed)
+    }
+
+    pub fn dropped(&self) -> u64 {
+        self.total_dropped.load(Ordering::Relaxed)
     }
 
     pub fn block_percentage(&self) -> f64 {
