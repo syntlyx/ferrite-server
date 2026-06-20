@@ -28,6 +28,10 @@ mac-x86_64: $(DIST)
 # ── Linux (musl, static) ──────────────────────────────────────────────────────
 # Requires cargo-zigbuild + zig (no Docker needed, works natively on Apple Silicon).
 # Install once: cargo install cargo-zigbuild && brew install zig
+#
+# `ulimit -n` is raised per recipe: the static musl link opens ~200 .rlib files at
+# once and the macOS default soft limit (256) makes the linker fail with
+# `ProcessFdQuotaExceeded`. 65536 is well under kern.maxfilesperproc.
 
 define check-zigbuild
 	@command -v cargo-zigbuild >/dev/null 2>&1 || { \
@@ -41,13 +45,13 @@ linux: linux-arm64 linux-x86_64
 
 linux-arm64: $(DIST)
 	$(check-zigbuild)
-	cargo zigbuild --release --target $(TARGET_LINUX_ARM64)
+	ulimit -n 65536; cargo zigbuild --release --target $(TARGET_LINUX_ARM64)
 	cp target/$(TARGET_LINUX_ARM64)/release/$(BINARY) \
 	   $(DIST)/$(BINARY)-$(VERSION)-linux-arm64
 
 linux-x86_64: $(DIST)
 	$(check-zigbuild)
-	cargo zigbuild --release --target $(TARGET_LINUX_X86_64)
+	ulimit -n 65536; cargo zigbuild --release --target $(TARGET_LINUX_X86_64)
 	cp target/$(TARGET_LINUX_X86_64)/release/$(BINARY) \
 	   $(DIST)/$(BINARY)-$(VERSION)-linux-x86_64
 

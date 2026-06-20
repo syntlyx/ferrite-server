@@ -11,10 +11,12 @@
 //! `tokio::io::copy_bidirectional`.
 
 mod direct;
+mod evasion;
 mod socks5;
 mod wireguard;
 
 pub use direct::{DirectEgress, direct_connect};
+pub use evasion::{EvasionParams, write_split};
 
 use std::io;
 use std::pin::Pin;
@@ -80,6 +82,8 @@ pub enum Egress {
     Direct(DirectEgress),
     Socks5(socks5::Socks5Egress),
     Wireguard(wireguard::WgEgress),
+    /// Direct connection that fragments the TLS ClientHello to evade SNI DPI.
+    DirectEvasion(evasion::EvasionEgress),
 }
 
 impl Egress {
@@ -90,6 +94,11 @@ impl Egress {
             "wireguard" => Ok(Self::Wireguard(wireguard::WgEgress::from_config(
                 cfg, upstream,
             )?)),
+            "evasion" => Ok(Self::DirectEvasion(evasion::EvasionEgress::new(
+                cfg.id.clone(),
+                upstream,
+                cfg.seg_position,
+            ))),
             other => Err(FeriteError::Config(format!(
                 "egress '{}': unsupported kind '{}'",
                 cfg.id, other
@@ -102,6 +111,16 @@ impl Egress {
             Self::Direct(d) => d.id(),
             Self::Socks5(s) => s.id(),
             Self::Wireguard(w) => w.id(),
+            Self::DirectEvasion(e) => e.id(),
+        }
+    }
+
+    /// The ClientHello-fragmentation parameters, if this is a DirectEvasion
+    /// egress. The intercept loop uses them to split the first TLS write.
+    pub fn evasion_params(&self) -> Option<EvasionParams> {
+        match self {
+            Self::DirectEvasion(e) => Some(e.params()),
+            _ => None,
         }
     }
 
@@ -111,7 +130,7 @@ impl Egress {
     /// rules don't redirect to a tunnel that isn't up yet.
     pub fn is_healthy(&self) -> bool {
         match self {
-            Self::Direct(_) | Self::Socks5(_) => true,
+            Self::Direct(_) | Self::Socks5(_) | Self::DirectEvasion(_) => true,
             Self::Wireguard(w) => w.is_healthy(),
         }
     }
@@ -121,6 +140,7 @@ impl Egress {
             Self::Direct(d) => Ok(EgressConn::Tcp(d.connect(host, port).await?)),
             Self::Socks5(s) => Ok(EgressConn::Tcp(s.connect(host, port).await?)),
             Self::Wireguard(w) => Ok(EgressConn::Wg(w.connect(host, port).await?)),
+            Self::DirectEvasion(e) => Ok(EgressConn::Tcp(e.connect(host, port).await?)),
         }
     }
 }

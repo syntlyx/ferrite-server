@@ -17,6 +17,59 @@ use crate::error::{FeriteError, Result};
 type FstBuildResult = (Map<Vec<u8>>, Vec<Regex>, usize);
 const MAX_CONCURRENT_LIST_REFRESHES: usize = 2;
 
+/// A diagnostic explanation of why a domain is (or isn't) blocked — produced by
+/// [`Blocklist::explain`] for the Tools UI. Built off the DNS hot path: it scans
+/// each list's on-disk FST to attribute a match to its source list, which the
+/// merged hot-path FST can't do.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BlockExplanation {
+    pub domain: String,
+    pub blocked: bool,
+    pub whitelisted: bool,
+    /// When whitelisted, the whitelist entry that exempted it (and where it matched).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub whitelist_match: Option<MatchInfo>,
+    /// Every source that would block this domain (manual blacklist, wildcard
+    /// rule, subscription list). Empty when nothing matches.
+    pub sources: Vec<BlockSource>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MatchInfo {
+    /// The configured entry that matched (exact key or wildcard pattern).
+    pub entry: String,
+    /// The label at which it matched: the domain itself or a parent of it.
+    pub matched: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BlockSource {
+    /// `"blacklist"` (manual exact), `"wildcard"` (manual or config wildcard), or
+    /// `"list"` (a subscription).
+    pub kind: String,
+    /// Human label: the list name, `"manual blacklist"`, or the wildcard pattern.
+    pub name: String,
+    /// The key or pattern that produced the match (the domain or a matched parent).
+    pub matched: String,
+}
+
+/// Exact match on `domain`, else the first parent in the hierarchy that matches
+/// (stopping at the registrable-domain boundary) — the same walk as
+/// [`Blocklist::check_blocked`]. Returns the key that matched.
+fn matched_key(domain: &str, contains: impl Fn(&str) -> bool) -> Option<String> {
+    if contains(domain) {
+        return Some(domain.to_string());
+    }
+    let mut rest = domain;
+    while let Some(dot) = rest.find('.') {
+        rest = &rest[dot + 1..];
+        if is_registrable_or_deeper(rest) && contains(rest) {
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
+
 /// The hot-swappable core data (FST + wildcards).
 struct BlocklistData {
     fst: Map<Vec<u8>>,
@@ -180,6 +233,10 @@ impl Blocklist {
         entries.contains(client_ip) || mac.is_some_and(|key| entries.contains(key))
     }
 
+    /// Convenience wrapper that normalises first. The DNS hot path uses
+    /// [`Self::is_blocked_normalized`]; the diagnostic API uses [`Self::explain`].
+    /// Kept as a test helper.
+    #[cfg(test)]
     pub fn is_blocked(&self, domain: &str) -> bool {
         let domain = normalise(domain);
         self.is_blocked_normalized(&domain)
@@ -247,7 +304,10 @@ impl Blocklist {
         false
     }
 
-    /// Returns `true` if `domain` is explicitly whitelisted (exact or wildcard match).
+    /// Returns `true` if `domain` is explicitly whitelisted (exact or wildcard
+    /// match). Convenience wrapper that normalises first; the hot path uses
+    /// [`Self::is_whitelisted_normalized`]. Kept as a test helper.
+    #[cfg(test)]
     pub fn is_whitelisted(&self, domain: &str) -> bool {
         let domain = normalise(domain);
         self.is_whitelisted_normalized(&domain)
@@ -284,6 +344,119 @@ impl Blocklist {
             .read()
             .iter()
             .any(|(_, re)| re.is_match(domain))
+    }
+
+    /// Off-hot-path explanation of why `domain` is or isn't blocked, attributing
+    /// each match to its source. Scans every enabled list's on-disk FST, so it is
+    /// slower than [`Self::is_blocked`] — call it only from the diagnostic API,
+    /// never the DNS path.
+    pub fn explain(&self, domain: &str) -> BlockExplanation {
+        let domain = normalise(domain);
+
+        let whitelist_match = self.whitelist_match(&domain);
+        let whitelisted = whitelist_match.is_some();
+
+        let mut sources = Vec::new();
+
+        // Manual blacklist (exact + hierarchy walk).
+        {
+            let blacklist = self.blacklist.read();
+            if let Some(key) = matched_key(&domain, |k| blacklist.contains(k)) {
+                sources.push(BlockSource {
+                    kind: "blacklist".into(),
+                    name: "manual blacklist".into(),
+                    matched: key,
+                });
+            }
+        }
+        // Manual blacklist wildcards.
+        for (pat, re) in self.blacklist_wildcards.read().iter() {
+            if re.is_match(&domain) {
+                sources.push(BlockSource {
+                    kind: "wildcard".into(),
+                    name: pat.clone(),
+                    matched: domain.clone(),
+                });
+            }
+        }
+        // Config `wildcard_block` (compiled into the hot-path data; only the
+        // anchored regex survives there, so report that as the pattern).
+        for re in &self.data.load().wildcards {
+            if re.is_match(&domain) {
+                sources.push(BlockSource {
+                    kind: "wildcard".into(),
+                    name: re.as_str().to_string(),
+                    matched: domain.clone(),
+                });
+            }
+        }
+        // Subscription lists: scan each enabled list's own on-disk FST so the
+        // match attributes to a specific list (the merged hot-path FST can't).
+        let lists = self.lists.read().clone();
+        let mut list_matched = false;
+        for list in lists.iter().filter(|l| l.enabled) {
+            let path = self
+                .list_cache_dir
+                .join(format!("{}.fst", refresh::sanitize_name(&list.name)));
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(map) = Map::new(bytes) else {
+                continue;
+            };
+            if let Some(key) = matched_key(&domain, |k| map.contains_key(k.as_bytes())) {
+                list_matched = true;
+                sources.push(BlockSource {
+                    kind: "list".into(),
+                    name: list.name.clone(),
+                    matched: key,
+                });
+            }
+        }
+        // Fallback: the merged FST matches but no per-list file attributed it
+        // (e.g. a source file is missing) — still report the block.
+        if !list_matched
+            && let Some(key) =
+                matched_key(&domain, |k| self.data.load().fst.contains_key(k.as_bytes()))
+        {
+            sources.push(BlockSource {
+                kind: "list".into(),
+                name: "subscription (source file unavailable)".into(),
+                matched: key,
+            });
+        }
+
+        let blocked = !whitelisted && !sources.is_empty();
+        BlockExplanation {
+            domain,
+            blocked,
+            whitelisted,
+            whitelist_match,
+            sources,
+        }
+    }
+
+    /// The whitelist entry that exempts `domain`, if any (exact/hierarchy, then
+    /// wildcard) — mirrors [`Self::is_whitelisted_normalized`].
+    fn whitelist_match(&self, domain: &str) -> Option<MatchInfo> {
+        {
+            let whitelist = self.whitelist.read();
+            if let Some(key) = matched_key(domain, |k| whitelist.contains(k)) {
+                return Some(MatchInfo {
+                    entry: key.clone(),
+                    matched: key,
+                });
+            }
+        }
+        for (pat, re) in self.whitelist_wildcards.read().iter() {
+            if re.is_match(domain) {
+                return Some(MatchInfo {
+                    entry: pat.clone(),
+                    matched: domain.to_string(),
+                });
+            }
+        }
+        None
     }
 
     // ── Whitelist / blacklist CRUD ───────────────────────────────────────────
@@ -699,6 +872,50 @@ mod tests {
         assert!(blocklist.is_whitelisted_normalized("app.trusted.test"));
         assert!(blocklist.is_blocked("Tracker.Ads.Test."));
         assert!(blocklist.is_blocked_normalized("tracker.ads.test"));
+    }
+
+    #[test]
+    fn explain_attributes_sources_and_whitelist() {
+        let blocklist = Blocklist::new(
+            BlocklistConfig {
+                enabled: true,
+                decision_cache_size: 128,
+                lists: vec![],
+                wildcard_block: vec!["*.ads.test".to_string()],
+                whitelist: vec!["safe.test".to_string()],
+                client_bypass: vec![],
+            },
+            temp_fst_path("ferrite-blocklist-explain"),
+        );
+        blocklist.add_blacklist("evil.test").unwrap();
+
+        // Manual blacklist match attributes to the parent (hierarchy walk).
+        let e = blocklist.explain("www.evil.test");
+        assert!(e.blocked);
+        assert!(!e.whitelisted);
+        assert!(
+            e.sources
+                .iter()
+                .any(|s| s.kind == "blacklist" && s.matched == "evil.test")
+        );
+
+        // Config wildcard_block match is reported as a wildcard source.
+        let w = blocklist.explain("x.ads.test");
+        assert!(w.blocked);
+        assert!(w.sources.iter().any(|s| s.kind == "wildcard"));
+
+        // A whitelisted domain reports the exempting entry and is not blocked.
+        let s = blocklist.explain("safe.test");
+        assert!(!s.blocked);
+        assert!(s.whitelisted);
+        assert_eq!(s.whitelist_match.as_ref().unwrap().entry, "safe.test");
+
+        // Whitelist beats a block: still report the source, but blocked = false.
+        blocklist.add_whitelist("evil.test").unwrap();
+        let ww = blocklist.explain("evil.test");
+        assert!(ww.whitelisted);
+        assert!(!ww.blocked);
+        assert!(!ww.sources.is_empty());
     }
 
     #[test]

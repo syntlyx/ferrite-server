@@ -54,12 +54,22 @@ use device::WgDevice;
 /// Default inner MTU (WireGuard's standard for a 1500 path MTU).
 const DEFAULT_MTU: usize = 1420;
 /// Per-connection smoltcp ring sizes (RAM: 2×16 KiB per active connection).
-const SOCK_RX: usize = 16 * 1024;
-const SOCK_TX: usize = 16 * 1024;
+/// Default per-connection socket buffer (KiB) when the egress sets none. The TCP
+/// window scales with this (smoltcp supports RFC 1323), so it bounds single-
+/// connection throughput — roughly buffer / RTT.
+const DEFAULT_BUFFER_KB: u32 = 256;
+/// Clamp for a configured buffer (KiB): below ~16 TCP barely flows; the upper
+/// bound caps worst-case RAM (buffer × 2 × active connections).
+const MIN_BUFFER_KB: u32 = 16;
+const MAX_BUFFER_KB: u32 = 16 * 1024;
 /// In-memory pipe capacity between the caller stream and its bridge task.
 const DUPLEX_CAP: usize = 64 * 1024;
 /// boringtun timer cadence (rekey, keepalive, retransmit).
 const TIMER_TICK: Duration = Duration::from_millis(250);
+/// Max inbound datagrams drained per wake before yielding to the other select
+/// branches — high enough to swallow a large-window burst, capped so a sustained
+/// stream can't starve ctrl/timer handling.
+const UDP_DRAIN_BURST: usize = 1024;
 /// WireGuard's REJECT_AFTER_TIME: a session older than this is dead. We treat the
 /// tunnel as healthy only while the last handshake is still inside this window;
 /// boringtun keeps it fresh via rekey/keepalive as long as the peer is alive.
@@ -158,6 +168,9 @@ impl WgEgress {
             })?;
         let conf = parse(text)?;
         let dns = conf.dns.clone();
+        // Per-connection socket buffer (bytes), clamped; drives the TCP window.
+        let buffer = cfg.buffer_kb.unwrap_or(DEFAULT_BUFFER_KB).clamp(MIN_BUFFER_KB, MAX_BUFFER_KB) as usize
+            * 1024;
 
         let (ctrl_tx, ctrl_rx) = mpsc::channel(64);
         let healthy = Arc::new(AtomicBool::new(false));
@@ -169,7 +182,7 @@ impl WgEgress {
         // (config reload / shutdown) `ctrl_tx` goes away, `ctrl_rx.recv()`
         // returns None, and the loop tears itself down — no orphaned tunnels.
         tokio::spawn(async move {
-            if let Err(e) = run_tunnel(loop_id.clone(), conf, ctrl_rx, loop_healthy).await {
+            if let Err(e) = run_tunnel(loop_id.clone(), conf, buffer, ctrl_rx, loop_healthy).await {
                 tracing::warn!("proxy: wireguard egress '{}' loop exited: {}", loop_id, e);
             }
         });
@@ -229,19 +242,34 @@ impl WgEgress {
         if let Some(ip) = self.cache.get(&key) {
             return Ok(ip);
         }
-        let Some(&dns) = self.dns.first() else {
-            return super::direct::resolve_host(&self.upstream, host).await;
-        };
-        // Prefer A; fall back to AAAA for v6-only names.
-        for rtype in [RecordType::A, RecordType::AAAA] {
-            if let Some((ip, ttl)) = self.lookup(dns, host, rtype).await? {
-                self.cache.put(&key, ip, ttl);
-                return Ok(ip);
+        // Prefer the tunnel's DNS (no leak, geo-correct). Prefer A, then AAAA.
+        if let Some(&dns) = self.dns.first() {
+            for rtype in [RecordType::A, RecordType::AAAA] {
+                match self.lookup(dns, host, rtype).await {
+                    Ok(Some((ip, ttl))) => {
+                        self.cache.put(&key, ip, ttl);
+                        return Ok(ip);
+                    }
+                    Ok(None) => {} // no record of this type — try the next
+                    Err(e) => {
+                        // A tunnel-DNS hiccup must NOT fail the connection (that
+                        // shows up as a page loading "every other time"). Fall back
+                        // to ferrite's upstream; the traffic still goes through the
+                        // tunnel, only the lookup didn't.
+                        tracing::debug!(
+                            "wg '{}': tunnel DNS for {host} failed ({e}); using upstream",
+                            self.id
+                        );
+                        break;
+                    }
+                }
             }
         }
-        Err(FeriteError::Dns(format!(
-            "'{host}' did not resolve through the tunnel"
-        )))
+        // Fallback: resolve via ferrite's upstream (no tunnel DNS configured, or it
+        // hiccuped). Cache briefly so we don't re-hammer it.
+        let ip = super::direct::resolve_host(&self.upstream, host).await?;
+        self.cache.put(&key, ip, DNS_MIN_TTL);
+        Ok(ip)
     }
 
     /// One DNS-over-TCP query to `dns:53` routed through the tunnel. Returns the
@@ -323,6 +351,7 @@ struct Conn {
 async fn run_tunnel(
     id: String,
     conf: WgConf,
+    buffer: usize,
     mut ctrl_rx: mpsc::Receiver<Ctrl>,
     healthy: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -331,6 +360,37 @@ async fn run_tunnel(
     let endpoint = resolve_endpoint(&conf.endpoint).await?;
     let udp = UdpSocket::bind(("0.0.0.0", 0)).await?;
     udp.connect(endpoint).await?;
+    // A large TCP window lets the peer send big bursts; grow the kernel UDP
+    // buffers so the single loop doesn't drop packets between drains (which would
+    // stall individual connections). Best-effort — the kernel may clamp to
+    // net.core.rmem_max/wmem_max.
+    {
+        let sock = socket2::SockRef::from(&udp);
+        // ONE UDP socket serves every connection on this egress, so its kernel
+        // buffer must hold the AGGREGATE burst = per-conn window × concurrent
+        // downloads. Size it for several concurrent windows (≈8×), floored at
+        // 8 MiB and capped at 32 MiB. The kernel clamps to net.core.rmem_max — so
+        // large per-conn buffers still need rmem_max raised to be reliable.
+        let want = buffer
+            .saturating_mul(8)
+            .clamp(8 * 1024 * 1024, 32 * 1024 * 1024);
+        let _ = sock.set_recv_buffer_size(want);
+        let _ = sock.set_send_buffer_size((want / 2).max(2 * 1024 * 1024));
+        // Warn only when the EFFECTIVE recv buffer is actually smaller than one
+        // window (raising net.core.rmem_max would then help); otherwise just note it.
+        if let Ok(rcv) = sock.recv_buffer_size() {
+            if rcv < buffer {
+                tracing::warn!(
+                    "wg '{}': kernel UDP recv buffer {} KiB < per-conn buffer {} KiB — large bursts may drop; raise net.core.rmem_max",
+                    id,
+                    rcv / 1024,
+                    buffer / 1024,
+                );
+            } else {
+                tracing::info!("wg '{}': UDP recv buffer {} KiB", id, rcv / 1024);
+            }
+        }
+    }
 
     // ── boringtun tunnel ──
     let static_private = StaticSecret::from(conf.private_key);
@@ -400,7 +460,7 @@ async fn run_tunnel(
                 Some(Ctrl::Open { remote, io, reply }) => {
                     let res = open_conn(
                         &mut sockets, &mut iface, &mut conns, &mut next_port,
-                        remote, io, &data_tx, &close_tx, &wake,
+                        remote, io, buffer, &data_tx, &close_tx, &wake,
                     );
                     let _ = reply.send(res);
                 }
@@ -420,10 +480,23 @@ async fn run_tunnel(
                 }
             }
 
-            // Inbound ciphertext from the peer.
+            // Inbound ciphertext from the peer. Drain the whole burst before the
+            // service cycle below: a big TCP window means thousands of datagrams
+            // arrive back-to-back, and reading one-per-iteration (with O(conns)
+            // work each) lets the kernel UDP buffer overflow and drop packets,
+            // stalling individual connections. Capped so we still yield to the
+            // other branches under a sustained stream.
             r = udp.recv(&mut udp_buf) => {
                 if let Ok(n) = r {
                     decapsulate_all(&mut tunn, &udp_buf[..n], &mut device, &mut crypt, &udp).await;
+                    for _ in 0..UDP_DRAIN_BURST {
+                        match udp.try_recv(&mut udp_buf) {
+                            Ok(n) => {
+                                decapsulate_all(&mut tunn, &udp_buf[..n], &mut device, &mut crypt, &udp).await;
+                            }
+                            Err(_) => break, // WouldBlock — burst drained
+                        }
+                    }
                 }
             }
 
@@ -469,13 +542,14 @@ fn open_conn(
     next_port: &mut u16,
     remote: SocketAddr,
     io: DuplexStream,
+    buffer: usize,
     data_tx: &mpsc::Sender<(SocketHandle, Vec<u8>)>,
     close_tx: &mpsc::Sender<SocketHandle>,
     wake: &Arc<Notify>,
 ) -> Result<()> {
     let mut sock = tcp::Socket::new(
-        tcp::SocketBuffer::new(vec![0u8; SOCK_RX]),
-        tcp::SocketBuffer::new(vec![0u8; SOCK_TX]),
+        tcp::SocketBuffer::new(vec![0u8; buffer]),
+        tcp::SocketBuffer::new(vec![0u8; buffer]),
     );
     let local_port = *next_port;
     *next_port = if *next_port == u16::MAX {
@@ -732,7 +806,7 @@ mod smoke {
     //! real peer, and a TCP byte exchange routed all the way through the tunnel.
     use super::*;
     use crate::config::{EgressConfig, UpstreamConfig};
-    use crate::upstream::{UpstreamPool, ZoneRouter};
+    use crate::upstream::{UpstreamPool, ZoneRouter, no_proxy};
 
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::{Name, RData, RecordType};
@@ -743,10 +817,14 @@ mod smoke {
     fn upstream() -> Arc<ZoneRouter> {
         // Plain 1.1.1.1 — used only to resolve hostnames the test connects to
         // (the IP-literal connects below skip it entirely).
-        let pool = UpstreamPool::from_config(&[UpstreamConfig::Plain {
-            address: "1.1.1.1".into(),
-            port: 53,
-        }])
+        let pool = UpstreamPool::from_config(
+            &[UpstreamConfig::Plain {
+                address: "1.1.1.1".into(),
+                port: 53,
+                egress: None,
+            }],
+            no_proxy(),
+        )
         .expect("upstream pool");
         ZoneRouter::new(&[], pool).expect("zone router")
     }
@@ -762,6 +840,8 @@ mod smoke {
             username: None,
             password: None,
             config: Some(conf_text),
+            seg_position: None,
+            buffer_kb: None,
         }
     }
 

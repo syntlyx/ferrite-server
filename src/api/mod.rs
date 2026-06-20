@@ -3,6 +3,7 @@ pub mod blocklist;
 pub mod clients;
 pub mod custom_records;
 pub mod error;
+mod ingress;
 pub mod lists;
 pub mod logs;
 pub mod middleware;
@@ -11,6 +12,7 @@ pub mod queries;
 pub mod settings;
 pub mod stats;
 pub mod system;
+pub mod tools;
 pub mod update;
 
 pub use error::ApiError;
@@ -85,6 +87,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/proxy", put(proxy::put_proxy))
         // Live server logs (in-memory ring)
         .route("/logs", get(logs::get_logs))
+        // Diagnostic tools (DNS lookup + WHOIS)
+        .route("/tools/resolve", get(tools::resolve))
+        .route("/tools/whois", get(tools::whois))
         // Updates
         .route("/update/check", get(update::check_update))
         .route("/update/server", post(update::update_server))
@@ -125,13 +130,23 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
         }
     }
 
-    let router = build_router(state);
+    let router = build_router(state.clone());
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    tracing::info!("API server listening on http://{}", bind_addr);
+    tracing::info!("panel/API listener on http://{}", bind_addr);
 
-    axum::serve(listener, router).await?;
-    Ok(())
+    // Per-connection demux: peek the Host and serve the panel or route via the
+    // proxy (see `ingress`), so one port serves both.
+    loop {
+        let (stream, _peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("panel accept error: {e}");
+                continue;
+            }
+        };
+        tokio::spawn(ingress::dispatch(stream, state.clone(), router.clone()));
+    }
 }
 
 #[cfg(test)]

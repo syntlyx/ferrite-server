@@ -11,11 +11,12 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 use crate::app::AppState;
 
-use super::egress::{EgressConn, direct_connect, enable_keepalive};
+use super::egress::{EgressConn, EvasionParams, direct_connect, enable_keepalive, write_split};
 use super::http_host::{HostResult, parse_http_host};
 use super::sni::{SniResult, parse_sni};
 
@@ -39,49 +40,80 @@ impl Protocol {
     }
 }
 
-/// Bind the proxy listeners and serve until the process exits. Detached: a bind
-/// failure is logged and skipped rather than taking down the server (DNS/API run
-/// in other tasks). No-op when proxy is disabled.
+/// The listener supervisor. Binds the proxy listeners and **rebinds them live**
+/// whenever the listener settings change (`enabled` / ports / connection cap), so
+/// those take effect without a process restart. Runs for the life of the process;
+/// a bind failure is logged and retried on the next change (DNS/API run in other
+/// tasks, so the proxy never takes the server down).
 pub async fn run(state: AppState) {
-    let (enabled, http_port, https_port) = {
-        let proxy = &state.inner.proxy;
-        (
-            proxy.registry.load().enabled,
-            proxy.http_port,
-            proxy.https_port,
-        )
-    };
-    if !enabled {
-        return;
-    }
+    let reload = state.inner.proxy.listener_reload();
+    loop {
+        // Arm the wake-up BEFORE reading config so a change that lands while we're
+        // binding isn't lost (a `Notified` holds one permit once enabled).
+        let wait = reload.notified();
+        tokio::pin!(wait);
+        wait.as_mut().enable();
 
-    let https = bind(https_port).await;
-    let http = bind(http_port).await;
+        let session = start_session(&state).await;
+
+        wait.await; // a listener-affecting field changed → rebind
+        for h in &session {
+            h.abort();
+        }
+        // Await the aborted accept loops so their TcpListeners are fully dropped
+        // (port freed) before we rebind — possibly on the same port. In-flight
+        // proxied connections run in their own tasks and are left to finish.
+        for h in session {
+            let _ = h.await;
+        }
+    }
+}
+
+/// Bind the listeners for the current settings and spawn their accept loops,
+/// returning the loop handles (empty when disabled or nothing bound). The
+/// connection-cap semaphore is session-local, so a changed cap applies on rebind.
+async fn start_session(state: &AppState) -> Vec<tokio::task::JoinHandle<()>> {
+    let cfg = state.inner.proxy.listener_cfg();
+    if !cfg.enabled {
+        tracing::info!("proxy: selective routing disabled");
+        return Vec::new();
+    }
+    let semaphore = Arc::new(Semaphore::new(cfg.max_connections));
+    let https = bind(cfg.https_port).await;
+    // When the panel already owns the HTTP port, don't bind a second :80 — the
+    // panel's listener demuxes by Host and forwards non-panel hosts here via
+    // `forward_http`. Otherwise the proxy binds its own HTTP listener.
+    let http = if cfg.http_port == state.inner.config.api.bind_addr.port() {
+        tracing::info!("proxy: HTTP routing shared with the panel listener on :{}", cfg.http_port);
+        None
+    } else {
+        bind(cfg.http_port).await
+    };
     if https.is_none() && http.is_none() {
-        tracing::warn!("proxy: no listeners bound; selective routing inactive");
-        return;
+        tracing::warn!("proxy: no proxy-owned listeners bound this session");
+        return Vec::new();
     }
 
     let mut handles = Vec::new();
     if let Some(listener) = https {
-        tracing::info!("proxy: TLS/SNI listener on 0.0.0.0:{https_port}");
+        tracing::info!("proxy: TLS/SNI listener on 0.0.0.0:{}", cfg.https_port);
         handles.push(tokio::spawn(accept_loop(
             listener,
             state.clone(),
             Protocol::Tls,
+            Arc::clone(&semaphore),
         )));
     }
     if let Some(listener) = http {
-        tracing::info!("proxy: HTTP listener on 0.0.0.0:{http_port}");
+        tracing::info!("proxy: HTTP listener on 0.0.0.0:{}", cfg.http_port);
         handles.push(tokio::spawn(accept_loop(
             listener,
             state.clone(),
             Protocol::Http,
+            Arc::clone(&semaphore),
         )));
     }
-    for h in handles {
-        let _ = h.await;
-    }
+    handles
 }
 
 async fn bind(port: u16) -> Option<TcpListener> {
@@ -94,7 +126,12 @@ async fn bind(port: u16) -> Option<TcpListener> {
     }
 }
 
-async fn accept_loop(listener: TcpListener, state: AppState, proto: Protocol) {
+async fn accept_loop(
+    listener: TcpListener,
+    state: AppState,
+    proto: Protocol,
+    semaphore: Arc<Semaphore>,
+) {
     loop {
         let (stream, src) = match listener.accept().await {
             Ok(v) => v,
@@ -105,10 +142,13 @@ async fn accept_loop(listener: TcpListener, state: AppState, proto: Protocol) {
         };
         // Each proxied connection holds a permit for its whole lifetime; shed
         // load by dropping new connections once the cap is reached.
-        let permit = match state.inner.proxy.conn_semaphore.clone().try_acquire_owned() {
+        let permit = match semaphore.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
-                tracing::debug!("proxy: max_connections reached, dropping {src}");
+                // WARN (not debug) so this is visible: a dropped connection here is
+                // exactly the "loads, then doesn't" symptom — either raise
+                // max_connections or connections are piling up (stalled/keep-alive).
+                tracing::warn!("proxy: connection cap reached, dropping {src} (max_connections)");
                 continue;
             }
         };
@@ -153,17 +193,53 @@ async fn handle(mut client: TcpStream, state: AppState, proto: Protocol) -> std:
         }
     };
 
+    splice_through(client, state, proto, host, buf).await
+}
+
+/// Forward an already-peeked HTTP connection through the proxy. Used by the shared
+/// :80 listener (the panel) for non-panel hosts, so plain-HTTP routing works even
+/// though the proxy itself doesn't bind :80 when the panel owns it.
+pub(crate) async fn forward_http(state: AppState, client: TcpStream, buf: Vec<u8>, host: String) {
+    enable_keepalive(&client);
+    if let Err(e) = splice_through(client, state, Protocol::Http, host, buf).await {
+        tracing::debug!("proxy: http forward ended: {e}");
+    }
+}
+
+/// Route `host` to its egress (or forward-direct), replay the peeked `buf`, and
+/// splice both directions. Shared by the proxy's own listeners and the panel's
+/// :80 demux.
+async fn splice_through(
+    mut client: TcpStream,
+    state: AppState,
+    proto: Protocol,
+    host: String,
+    buf: Vec<u8>,
+) -> std::io::Result<()> {
     let port = proto.upstream_port();
+
+    // Identify the connecting client for client-scoped rules (canonicalize so an
+    // IPv4-mapped IPv6 peer matches the registry's plain IPv4).
+    let client_addr = client.peer_addr().ok().map(|a| a.ip().to_canonical());
+    let client_ip = client_addr.map(|ip| ip.to_string()).unwrap_or_default();
+    let client_mac = if state.inner.proxy.has_client_rules() {
+        client_addr.and_then(|ip| state.inner.client_registry.get_mac(ip))
+    } else {
+        None
+    };
 
     // Decide the egress from the actual SNI/Host (authoritative). Clone the
     // egress Arc out of the snapshot so the ArcSwap guard isn't held across the
     // connect await.
     let decision = {
         let snap = state.inner.proxy.registry.load();
-        snap.route(&host)
+        snap.route(&host, &client_ip, client_mac.as_deref())
             .map(|r| (Arc::clone(&snap.egresses[r.egress_idx]), r.fail_closed))
     };
 
+    // ClientHello-fragmentation params, set only when the chosen egress is a
+    // DirectEvasion egress and the connect succeeds (not on the direct fallback).
+    let mut frag: Option<EvasionParams> = None;
     let mut conn: EgressConn = match decision {
         Some((egress, fail_closed)) => {
             let id = egress.id().to_string();
@@ -174,6 +250,7 @@ async fn handle(mut client: TcpStream, state: AppState, proto: Protocol) -> std:
             match egress.connect(&host, port).await {
                 Ok(c) => {
                     state.inner.proxy.note_success(&id);
+                    frag = egress.evasion_params();
                     c
                 }
                 Err(e) => {
@@ -207,8 +284,14 @@ async fn handle(mut client: TcpStream, state: AppState, proto: Protocol) -> std:
         }
     };
 
-    // Replay the bytes we already consumed, then splice both directions.
-    conn.write_all(&buf).await?;
+    // Replay the bytes we already consumed, then splice both directions. For an
+    // evasion egress on a TLS connection the ClientHello replay is fragmented so
+    // the SNI is split across TCP segments (DPI bypass); everything else is a
+    // single write.
+    match frag {
+        Some(p) if matches!(proto, Protocol::Tls) => write_split(&mut conn, &buf, &p).await?,
+        _ => conn.write_all(&buf).await?,
+    }
     tokio::io::copy_bidirectional(&mut client, &mut conn).await?;
     Ok(())
 }

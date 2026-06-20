@@ -1,8 +1,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use tokio_rustls::rustls::ClientConfig;
+
 use crate::config::UpstreamConfig;
 use crate::error::{FeriteError, Result};
+use crate::upstream::tunneled::{ProxyHandle, TunneledResolver, client_config};
 use crate::upstream::{doh::DohResolver, doq::DoqResolver, dot::DotResolver, plain::PlainResolver};
 
 /// A single upstream entry, wrapping one of the protocol variants.
@@ -11,6 +14,8 @@ pub enum UpstreamEntry {
     Tls(Box<DotResolver>),
     Https(DohResolver),
     Quic(Box<DoqResolver>),
+    /// Plain DNS-over-TCP or DoT routed through an egress (tunnel).
+    Tunneled(TunneledResolver),
 }
 
 impl UpstreamEntry {
@@ -20,6 +25,7 @@ impl UpstreamEntry {
             UpstreamEntry::Tls(r) => r.resolve_raw(raw).await,
             UpstreamEntry::Https(r) => r.resolve_raw(raw).await,
             UpstreamEntry::Quic(r) => r.resolve_raw(raw).await,
+            UpstreamEntry::Tunneled(r) => r.resolve_raw(raw).await,
         }
     }
 
@@ -29,6 +35,7 @@ impl UpstreamEntry {
             UpstreamEntry::Tls(r) => r.label(),
             UpstreamEntry::Https(r) => r.label(),
             UpstreamEntry::Quic(r) => r.label(),
+            UpstreamEntry::Tunneled(r) => r.label(),
         }
     }
 }
@@ -41,21 +48,61 @@ pub struct UpstreamPool {
 
 impl UpstreamPool {
     /// Build a pool from a list of `UpstreamConfig` entries.
-    pub fn from_config(configs: &[UpstreamConfig]) -> Result<Arc<Self>> {
+    pub fn from_config(configs: &[UpstreamConfig], proxy: ProxyHandle) -> Result<Arc<Self>> {
         if configs.is_empty() {
             return Err(FeriteError::Config("no upstreams configured".to_string()));
         }
 
+        // Shared TLS client config, built lazily only if a tunneled DoT upstream
+        // is configured (most setups have none).
+        let mut tls_config: Option<Arc<ClientConfig>> = None;
+
         let mut upstreams = Vec::with_capacity(configs.len());
         for cfg in configs {
             let entry = match cfg {
-                UpstreamConfig::Plain { address, port } => {
+                // Tunneled (egress set) variants first — most-specific match wins.
+                UpstreamConfig::Plain {
+                    address,
+                    port,
+                    egress: Some(id),
+                } => UpstreamEntry::Tunneled(TunneledResolver::plain(
+                    proxy.clone(),
+                    id,
+                    address,
+                    *port,
+                )?),
+                UpstreamConfig::Tls {
+                    address,
+                    port,
+                    tls_name,
+                    egress: Some(id),
+                } => {
+                    let tls = match &tls_config {
+                        Some(c) => c.clone(),
+                        None => {
+                            let c = client_config()?;
+                            tls_config = Some(c.clone());
+                            c
+                        }
+                    };
+                    UpstreamEntry::Tunneled(TunneledResolver::dot(
+                        proxy.clone(),
+                        id,
+                        address,
+                        *port,
+                        tls_name,
+                        tls,
+                    )?)
+                }
+                // Direct (no egress) variants.
+                UpstreamConfig::Plain { address, port, .. } => {
                     UpstreamEntry::Plain(PlainResolver::new(address, *port)?)
                 }
                 UpstreamConfig::Tls {
                     address,
                     port,
                     tls_name,
+                    ..
                 } => UpstreamEntry::Tls(Box::new(DotResolver::new(address, *port, tls_name)?)),
                 UpstreamConfig::Https { url, bootstrap_ip } => {
                     UpstreamEntry::Https(DohResolver::new(url, bootstrap_ip.as_deref())?)

@@ -38,6 +38,9 @@ pub struct AppStateInner {
     pub client_registry: Arc<ClientRegistry>,
     /// Selective per-domain routing (egresses + rules + listeners).
     pub proxy: Arc<crate::proxy::ProxyState>,
+    /// Host names that resolve to the local admin panel. The shared HTTP listener
+    /// serves the panel for these and hands everything else to the proxy.
+    pub panel_hosts: std::collections::HashSet<String>,
     /// Path to the warm-restart snapshot file.
     pub snapshot_path: std::path::PathBuf,
     /// Hot-patchable list of domain patterns to suppress from the query log.
@@ -211,8 +214,13 @@ impl AppState {
             Err(e) => tracing::warn!("failed to seed recent_queries: {}", e),
         }
 
-        // Upstream pool + zone router
-        let default_pool = UpstreamPool::from_config(&config.upstream)?;
+        // Upstream pool + zone router. The pool is built before the proxy (the
+        // proxy resolves through it), but an upstream may itself tunnel through an
+        // egress — so the pool gets a late-bound handle to the proxy, filled in
+        // once the proxy exists below. Empty until then → such upstreams resolve
+        // direct, which is also the steady-state fallback when the tunnel is down.
+        let proxy_handle: crate::upstream::ProxyHandle = crate::upstream::no_proxy();
+        let default_pool = UpstreamPool::from_config(&config.upstream, Arc::clone(&proxy_handle))?;
         let upstream_pool = ZoneRouter::new(&config.zones, default_pool)?;
 
         // Custom DNS records — load from config, then append from DB.
@@ -265,6 +273,8 @@ impl AppState {
         // ferrite's own DNS for routed names).
         let proxy =
             crate::proxy::ProxyState::from_config(&config.proxy, Arc::clone(&upstream_pool));
+        // Now that the proxy exists, let tunneled upstreams reach its egresses.
+        proxy_handle.store(Some(Arc::clone(&proxy)));
 
         // Query channel
         let (query_tx, query_rx) = mpsc::channel(QUERY_CHANNEL_CAPACITY);
@@ -281,6 +291,7 @@ impl AppState {
             custom_records,
             client_registry,
             proxy,
+            panel_hosts: panel_hosts(config),
             snapshot_path,
             log_ignore: Arc::new(RwLock::new(config.dns.log_ignore.clone())),
             query_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
@@ -354,6 +365,24 @@ fn env_panel_ipv4() -> Option<Ipv4Addr> {
 
 fn panel_domain(config: &Config) -> String {
     trim_env("FERRITE_PANEL_DOMAIN").unwrap_or_else(|| config.panel.domain.clone())
+}
+
+/// Host names (lowercased, no port) that the shared HTTP listener serves locally
+/// as the admin panel: the panel domain, the panel IP, and loopback. Anything
+/// else arriving on the listener is handed to the proxy.
+fn panel_hosts(config: &Config) -> std::collections::HashSet<String> {
+    let mut hosts = std::collections::HashSet::new();
+    hosts.insert("localhost".to_string());
+    hosts.insert(Ipv4Addr::LOCALHOST.to_string());
+    hosts.insert("::1".to_string());
+    let domain = panel_domain(config).trim_end_matches('.').to_ascii_lowercase();
+    if !domain.is_empty() {
+        hosts.insert(domain);
+    }
+    if let Some(ip) = panel_ipv4(config) {
+        hosts.insert(ip.to_string());
+    }
+    hosts
 }
 
 fn non_loopback_ipv4(addr: SocketAddr) -> Option<Ipv4Addr> {
@@ -452,6 +481,7 @@ mod tests {
         cfg.upstream = vec![UpstreamConfig::Plain {
             address: "127.0.0.1".to_string(),
             port: 53,
+            egress: None,
         }];
 
         let state = AppState::init(&cfg, cfg.clone()).await.unwrap();

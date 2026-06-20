@@ -16,10 +16,38 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
-use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
+use tracing_subscriber::{EnvFilter, Layer, Registry, reload};
 
 const CAPACITY: usize = 2000;
+
+/// Reload handle for the process-wide level filter, installed once by `main`.
+/// Lets the Settings API flip debug logging at runtime without a restart.
+static FILTER_HANDLE: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
+
+/// The env-filter directive for a debug state. Debug raises the `ferrite` target
+/// to debug level only — dependencies stay at info so the log doesn't flood.
+pub fn filter_directive(debug: bool) -> &'static str {
+    if debug { "ferrite=debug" } else { "ferrite=info" }
+}
+
+/// Store the reload handle (called by `main` right after building the subscriber).
+pub fn install_filter_handle(handle: reload::Handle<EnvFilter, Registry>) {
+    let _ = FILTER_HANDLE.set(handle);
+}
+
+/// Flip debug logging live. No-op if the handle isn't installed (e.g. in tests
+/// that don't initialize tracing) or if `RUST_LOG` took over the filter.
+pub fn set_debug(debug: bool) {
+    let Some(handle) = FILTER_HANDLE.get() else {
+        return;
+    };
+    let state = if debug { "enabled" } else { "disabled" };
+    match handle.reload(EnvFilter::new(filter_directive(debug))) {
+        Ok(()) => tracing::info!("debug logging {state}"),
+        Err(e) => tracing::warn!("failed to reload log filter: {e}"),
+    }
+}
 
 #[derive(Clone, Serialize)]
 pub struct LogEntry {

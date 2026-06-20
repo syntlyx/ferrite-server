@@ -106,6 +106,11 @@ impl DnsCache {
         self.ttl_bounds.read().min_secs
     }
 
+    /// The configured max TTL — the ceiling for what any client should cache.
+    pub fn max_ttl_secs(&self) -> u64 {
+        self.ttl_bounds.read().max_secs
+    }
+
     /// Explicitly evict an entry.
     #[allow(dead_code)]
     pub fn evict(&self, name: &str, qtype: u16) {

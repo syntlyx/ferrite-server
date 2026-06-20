@@ -23,6 +23,8 @@ pub struct CompiledRule {
     pub matcher: Matcher,
     pub egress_idx: usize,
     pub fail_closed: bool,
+    /// Restrict to these clients (lowercased MAC or IP strings). Empty = all.
+    pub clients: Vec<String>,
     /// Higher = more specific. Used to order rules so the most specific wins.
     pub specificity: u32,
 }
@@ -38,6 +40,19 @@ impl CompiledRule {
             }
             Matcher::Wildcard(re) => re.is_match(name),
         }
+    }
+
+    /// Does this rule apply to the querying client? Empty client list = all
+    /// clients; otherwise the client's IP or resolved MAC must be listed.
+    pub fn matches_client(&self, ip: &str, mac: Option<&str>) -> bool {
+        if self.clients.is_empty() {
+            return true;
+        }
+        let ip = ip.to_ascii_lowercase();
+        let mac = mac.map(|m| m.to_ascii_lowercase());
+        self.clients
+            .iter()
+            .any(|c| *c == ip || mac.as_deref() == Some(c.as_str()))
     }
 }
 
@@ -72,6 +87,12 @@ pub fn compile(rules: &[RuleConfig], egress_idx: &HashMap<String, usize>) -> Vec
             matcher,
             egress_idx: idx,
             fail_closed: r.fail_closed,
+            clients: r
+                .clients
+                .iter()
+                .map(|c| c.trim().to_ascii_lowercase())
+                .filter(|c| !c.is_empty())
+                .collect(),
             specificity,
         });
     }
@@ -97,6 +118,7 @@ mod tests {
             pattern: pattern.to_string(),
             egress: egress.to_string(),
             fail_closed: true,
+            clients: Vec::new(),
         }
     }
 
@@ -114,6 +136,7 @@ mod tests {
             matcher: m,
             egress_idx: 0,
             fail_closed: true,
+            clients: Vec::new(),
             specificity: 0,
         };
         assert!(r.matches("google.com"));
@@ -121,6 +144,29 @@ mod tests {
         assert!(r.matches("a.b.google.com"));
         assert!(!r.matches("notgoogle.com"));
         assert!(!r.matches("google.com.evil.com"));
+    }
+
+    #[test]
+    fn client_scoping_restricts_to_listed_devices() {
+        let scoped = CompiledRule {
+            matcher: Matcher::Exact("x.test".to_string()),
+            egress_idx: 0,
+            fail_closed: true,
+            clients: vec!["aa:bb:cc:dd:ee:ff".to_string(), "10.0.0.5".to_string()],
+            specificity: 0,
+        };
+        assert!(scoped.matches_client("10.0.0.5", None)); // by IP
+        assert!(scoped.matches_client("10.0.0.9", Some("AA:BB:CC:DD:EE:FF"))); // by MAC, case-insensitive
+        assert!(!scoped.matches_client("10.0.0.9", None)); // neither IP nor MAC listed
+
+        let all = CompiledRule {
+            matcher: Matcher::Exact("x.test".to_string()),
+            egress_idx: 0,
+            fail_closed: true,
+            clients: Vec::new(),
+            specificity: 0,
+        };
+        assert!(all.matches_client("1.2.3.4", None)); // empty list = all clients
     }
 
     #[test]

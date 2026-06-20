@@ -66,7 +66,8 @@ mod nullable {
 ///
 /// Hot-patchable (no restart): `api_key`, `password`, `dns_min_ttl`, `dns_max_ttl`,
 ///                             `dns_log_ignore`, `web_dir`, `log_retention_days`,
-///                             `blocklist_enabled`, `blocklist_client_bypass`.
+///                             `blocklist_enabled`, `blocklist_client_bypass`,
+///                             `debug_logging`.
 /// Restart-required:           `dns_bind_addr`, `dns_cache_size`, `api_bind_addr`,
 ///                             `blocklist_decision_cache_size`, `upstream`, `zones`,
 ///                             `panel_enabled`, `panel_domain`, `panel_ipv4`, `panel_url`.
@@ -85,6 +86,7 @@ pub struct SettingsPatch {
     pub log_retention_days: Option<u32>,
     pub blocklist_enabled: Option<bool>,
     pub blocklist_client_bypass: Option<Vec<String>>,
+    pub debug_logging: Option<bool>,
 
     // ── Restart-required ─────────────────────────────────────────────────────
     pub dns_bind_addr: Option<String>,
@@ -133,6 +135,7 @@ pub async fn update_settings(
     let mut ttl_bounds_to_apply: Option<(u64, u64)> = None;
     let mut blocklist_enabled_to_apply: Option<bool> = None;
     let mut blocklist_client_bypass_to_apply: Option<Vec<String>> = None;
+    let mut debug_logging_to_apply: Option<bool> = None;
 
     {
         let mut cfg = state.live_config.write();
@@ -224,6 +227,12 @@ pub async fn update_settings(
             cfg.blocklist.client_bypass = normalized.clone();
             blocklist_client_bypass_to_apply = Some(normalized);
             hot_changed.push("blocklist_client_bypass");
+        }
+
+        if let Some(debug) = patch.debug_logging {
+            cfg.debug_logging = debug;
+            debug_logging_to_apply = Some(debug);
+            hot_changed.push("debug_logging");
         }
 
         // ── Restart-required ─────────────────────────────────────────────────
@@ -330,6 +339,13 @@ pub async fn update_settings(
 
     if let Some(entries) = blocklist_client_bypass_to_apply {
         state.inner.blocklist.set_client_bypass(&entries);
+    }
+
+    // RUST_LOG, when set, owns the filter — don't let the toggle fight it.
+    if let Some(debug) = debug_logging_to_apply
+        && std::env::var_os("RUST_LOG").is_none()
+    {
+        crate::logbuf::set_debug(debug);
     }
 
     let all_changed = hot_changed.len() + restart_changed.len();

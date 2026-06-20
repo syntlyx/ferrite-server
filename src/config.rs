@@ -41,6 +41,12 @@ pub struct Config {
     /// Selective per-domain routing through tunnels/proxies (egresses).
     #[serde(default)]
     pub proxy: ProxyConfig,
+    /// Verbose debug-level logging for the `ferrite` target. On by default so a
+    /// problem leaves a useful trail to attach to a bug report; turn it off from
+    /// Settings if the volume is too high. Applied live (no restart); the
+    /// `RUST_LOG` environment variable overrides it.
+    #[serde(default = "default_true")]
+    pub debug_logging: bool,
     /// Override path for static web UI files. If unset, defaults to `data_dir()/web`.
     /// Useful during frontend development to point at a local `dist/` folder.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -52,10 +58,12 @@ fn default_upstreams() -> Vec<UpstreamConfig> {
         UpstreamConfig::Plain {
             address: "8.8.8.8".to_string(),
             port: 53,
+            egress: None,
         },
         UpstreamConfig::Plain {
             address: "8.8.4.4".to_string(),
             port: 53,
+            egress: None,
         },
     ]
 }
@@ -112,11 +120,20 @@ pub enum UpstreamConfig {
     Plain {
         address: String,
         port: u16,
+        /// Route this resolver's DNS-over-TCP through a named egress (tunnel).
+        /// Empty/absent = direct. The address must be a literal IP (no bootstrap
+        /// loop). Falls back to direct when the egress is down.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        egress: Option<String>,
     },
     Tls {
         address: String,
         port: u16,
         tls_name: String,
+        /// Route this DoT resolver's TLS through a named egress (tunnel). Same
+        /// semantics as `Plain::egress` — direct fallback when the egress is down.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        egress: Option<String>,
     },
     Https {
         url: String,
@@ -286,6 +303,17 @@ pub struct EgressConfig {
     /// Raw WireGuard `.conf` text (`[Interface]`/`[Peer]`) pasted in the web UI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<String>,
+    // ── evasion (DPI bypass) field ──
+    /// Byte offset at which to split the TLS ClientHello. `None` = auto-split
+    /// inside the SNI host name. Only used by the `evasion` egress kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seg_position: Option<u16>,
+    // ── wireguard tuning ──
+    /// Per-connection socket buffer in KiB for a WireGuard egress. Larger = higher
+    /// single-connection throughput (the TCP window scales with it) at more RAM.
+    /// `None` uses the default. Only used by the `wireguard` egress kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_kb: Option<u32>,
 }
 
 /// Maps a domain pattern to an egress. `pattern` is an exact domain (matches the
@@ -298,6 +326,10 @@ pub struct RuleConfig {
     /// than leak it directly (false). Enforced at connect time, not DNS time.
     #[serde(default = "default_true")]
     pub fail_closed: bool,
+    /// Restrict the rule to these clients (MAC or IP strings). Empty = all
+    /// clients. Lets a domain be routed only for specific devices.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clients: Vec<String>,
 }
 
 impl ProxyConfig {
@@ -425,10 +457,12 @@ impl Default for Config {
                 UpstreamConfig::Plain {
                     address: "8.8.8.8".to_string(),
                     port: 53,
+                    egress: None,
                 },
                 UpstreamConfig::Plain {
                     address: "8.8.4.4".to_string(),
                     port: 53,
+                    egress: None,
                 },
             ],
             storage: StorageConfig::default(),
@@ -438,6 +472,7 @@ impl Default for Config {
             zones: vec![],
             custom_records: vec![],
             proxy: ProxyConfig::default(),
+            debug_logging: true,
             web_dir: None,
         }
     }

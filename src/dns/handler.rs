@@ -65,7 +65,11 @@ pub async fn handle_query(
     let client_addr = unmap_v4(src.ip());
     let client_ip = client_addr.to_string();
     let blocking_enabled = state.blocklist.blocking_enabled();
-    let client_mac = if blocking_enabled && state.blocklist.has_client_bypass() {
+    // Resolve the client MAC when something keys on it: blocklist client-bypass,
+    // or a proxy rule scoped to specific clients. Both are cheap in-memory lookups.
+    let client_mac = if (blocking_enabled && state.blocklist.has_client_bypass())
+        || state.proxy.has_client_rules()
+    {
         state.client_registry.get_mac(client_addr)
     } else {
         None
@@ -101,7 +105,36 @@ pub async fn handle_query(
         return Ok(patch_id(&custom_resp.bytes, query.metadata.id));
     }
 
-    // ── Step 2: Blocklist (skipped when globally disabled or client bypasses filtering) ──
+    // ── Step 2: Selective routing / proxy interception ────────────────────
+    // For a routed domain, answer with our advertise IP so the client connects
+    // to the proxy listeners. Runs BEFORE the blocklist: an explicitly routed
+    // domain is never blocked (you asked for it on purpose). Synthetic + returned
+    // early (NOT cached): routing rules are runtime-mutable, so a cached redirect
+    // could outlive a deletion.
+    if let Some(intercept) = state
+        .proxy
+        .maybe_intercept(&query, &name, qtype, &client_ip, client_mac.as_deref())
+    {
+        if !log_ignored {
+            let elapsed = start.elapsed().as_millis() as u32;
+            emit(
+                &state,
+                &query_tx,
+                make_entry(
+                    &name,
+                    qtype,
+                    &client_ip,
+                    QueryStatus::Allowed,
+                    elapsed,
+                    Some(format!("proxy:{}", intercept.egress_id)),
+                    0,
+                ),
+            );
+        }
+        return Ok(patch_id(&intercept.response.bytes, query.metadata.id));
+    }
+
+    // ── Step 3: Blocklist (skipped when globally disabled or client bypasses filtering) ──
     if filtering_enabled
         && !state.blocklist.is_whitelisted_normalized(&name)
         && state.blocklist.is_blocked_normalized(&name)
@@ -124,33 +157,6 @@ pub async fn handle_query(
             );
         }
         return Ok(build_nxdomain(&query));
-    }
-
-    // ── Step 2.5: Selective routing / proxy interception ──────────────────
-    // For a routed domain, answer with our advertise IP so the client connects
-    // to the proxy listeners. Synthetic + returned early (NOT cached): routing
-    // rules are runtime-mutable, so a cached redirect could outlive a deletion.
-    if let Some(intercept) = state
-        .proxy
-        .maybe_intercept(&query, &name, qtype, &state.blocklist)
-    {
-        if !log_ignored {
-            let elapsed = start.elapsed().as_millis() as u32;
-            emit(
-                &state,
-                &query_tx,
-                make_entry(
-                    &name,
-                    qtype,
-                    &client_ip,
-                    QueryStatus::Allowed,
-                    elapsed,
-                    Some(format!("proxy:{}", intercept.egress_id)),
-                    0,
-                ),
-            );
-        }
-        return Ok(patch_id(&intercept.response.bytes, query.metadata.id));
     }
 
     // ── Step 3: DNS response cache ────────────────────────────────────────
@@ -286,7 +292,12 @@ pub async fn handle_query(
         );
     }
 
-    Ok(response_bytes)
+    // Cap client-facing TTLs to the configured max. Cache hits are already
+    // bounded (patch_cached rewrites to the remaining lifetime ≤ max_ttl); this
+    // covers the first, uncached lookup so `max_ttl` reliably bounds what every
+    // client caches — e.g. how long a client clings to a pre-rule direct answer
+    // before re-querying and getting routed.
+    Ok(cap_ttls(response_bytes, state.dns_cache.max_ttl_secs() as u32))
 }
 
 // ---------------------------------------------------------------------------
@@ -433,6 +444,33 @@ fn patch_cached(bytes: &[u8], id: u16, remaining_ttl: u32) -> Vec<u8> {
         }
         Err(_) => patch_id(bytes, id),
     }
+}
+
+/// Cap every record TTL in a response to `max_ttl` so no client caches an answer
+/// longer than the operator's ceiling. Returns the bytes unchanged when nothing
+/// exceeds the cap (the common case — only reserializes when needed) or the
+/// message can't be decoded. EDNS OPT lives in `Message::edns`, not the record
+/// sections, so its pseudo-TTL (flags/version) is never touched.
+fn cap_ttls(bytes: Vec<u8>, max_ttl: u32) -> Vec<u8> {
+    let Ok(mut msg) = Message::from_bytes(&bytes) else {
+        return bytes;
+    };
+    let mut changed = false;
+    for rr in msg
+        .answers
+        .iter_mut()
+        .chain(msg.authorities.iter_mut())
+        .chain(msg.additionals.iter_mut())
+    {
+        if rr.ttl > max_ttl {
+            rr.ttl = max_ttl;
+            changed = true;
+        }
+    }
+    if !changed {
+        return bytes;
+    }
+    msg.to_bytes().unwrap_or(bytes)
 }
 
 /// Returns true if the domain should be silently dropped from the query log.
@@ -694,6 +732,26 @@ mod tests {
         // The authority SOA TTL is clamped to the entry's remaining lifetime,
         // not left at its original 3600 (which would over-cache downstream).
         assert_eq!(msg.authorities[0].ttl, 42);
+    }
+
+    #[test]
+    fn cap_ttls_caps_above_ceiling_and_leaves_below_untouched() {
+        let query = query("host.test", RecordType::A);
+        let mut resp = Message::response(query.metadata.id, OpCode::Query);
+        resp.add_queries(query.queries.iter().cloned());
+        resp.add_answer(Record::from_rdata(
+            name("host.test"),
+            3600,
+            RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
+        ));
+        let bytes = resp.to_bytes().unwrap();
+
+        // Above the cap → rewritten down to the ceiling.
+        let capped = cap_ttls(bytes.clone(), 60);
+        assert_eq!(Message::from_bytes(&capped).unwrap().answers[0].ttl, 60);
+
+        // Already below the cap → returned byte-for-byte (no reserialization).
+        assert_eq!(cap_ttls(bytes.clone(), 7200), bytes);
     }
 
     #[tokio::test]

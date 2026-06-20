@@ -1,9 +1,9 @@
 //! `/api/proxy` — view and replace the selective-routing configuration.
 //!
 //! The web UI is the primary editor: it GETs the whole config and PUTs it back.
-//! Rules/egresses/advertise hot-reload immediately (ArcSwap snapshot swap);
-//! `enabled`, the listener ports, and the connection cap bind at startup, so
-//! changing them is flagged `restart_required`.
+//! Everything applies live — rules/egresses/advertise swap the routing snapshot,
+//! and `enabled` / listener ports / connection cap rebind the listeners on the
+//! fly (the supervisor in `proxy::intercept`), so nothing needs a restart.
 
 use std::collections::HashSet;
 
@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::api::ApiError;
 use crate::app::AppState;
-use crate::config::ProxyConfig;
+use crate::config::{EgressConfig, ProxyConfig};
 use crate::error::FeriteError;
 
 /// GET /api/proxy — current config (socks5 passwords redacted) + egress health.
@@ -32,13 +32,26 @@ pub async fn get_proxy(State(state): State<AppState>) -> Json<Value> {
         })
         .collect();
 
-    let restart_pending = restart_required(&state, &proxy);
-
     Json(json!({
         "proxy": redacted(proxy),
         "egress_health": health,
-        "restart_pending": restart_pending,
+        // Effective kernel UDP recv-buffer ceiling (KiB). A WireGuard egress whose
+        // per-connection buffer exceeds this drops bursts under load; the UI warns
+        // and suggests raising net.core.rmem_max.
+        "max_buffer_kb": kernel_udp_recv_kb(),
     }))
+}
+
+/// Probe the effective UDP receive-buffer ceiling the kernel grants (KiB) by
+/// requesting a large `SO_RCVBUF` on a throwaway socket and reading it back. The
+/// kernel clamps to `net.core.rmem_max`, so this reveals the real limit the
+/// WireGuard tunnel is subject to. Re-probed per call so a live sysctl change is
+/// reflected without a restart.
+fn kernel_udp_recv_kb() -> Option<u64> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    let r = socket2::SockRef::from(&sock);
+    let _ = r.set_recv_buffer_size(8 * 1024 * 1024);
+    r.recv_buffer_size().ok().map(|b| (b / 1024) as u64)
 }
 
 /// PUT /api/proxy — replace the whole proxy config.
@@ -53,7 +66,11 @@ pub async fn put_proxy(
         let old = state.live_config.read().proxy.clone();
         for e in &mut new.egresses {
             let id = e.id.trim().to_ascii_lowercase();
-            let prev = old.egresses.iter().find(|p| p.id == id);
+            // Match the previous egress by id; if the id changed (the UI derives it
+            // from the name, so renaming changes it), fall back to a stable identity
+            // in the config so masked secrets still restore instead of failing
+            // validation as "PrivateKey is not valid base64".
+            let prev = match_prev(&old, e, &id);
             if e.kind.eq_ignore_ascii_case("socks5")
                 && e.password.as_deref().unwrap_or("").is_empty()
                 && let Some(p) = prev
@@ -61,26 +78,30 @@ pub async fn put_proxy(
                 e.password = p.password.clone();
             }
             if e.kind.eq_ignore_ascii_case("wireguard")
-                && e.config.as_deref().unwrap_or("").trim().is_empty()
                 && let Some(p) = prev
+                && let Some(stored) = p.config.as_deref()
             {
-                e.config = p.config.clone();
+                let submitted = e.config.as_deref().unwrap_or("");
+                e.config = Some(if submitted.trim().is_empty() {
+                    stored.to_string() // blank → keep the whole stored .conf
+                } else {
+                    restore_wg_key(submitted, stored) // splice the key back if still masked
+                });
             }
         }
     }
 
     validate(&new)?;
     new.normalize();
-    let restart = restart_required(&state, &new);
 
-    // Hot-reload routing immediately, then persist.
+    // Apply live — routing snapshot swaps and the listeners rebind if their
+    // settings changed (no restart) — then persist.
     state.inner.proxy.reload(&new);
     state.live_config.write().proxy = new;
     let saved_to = persist(&state);
 
     Ok(Json(json!({
         "status": "ok",
-        "restart_required": restart,
         "persisted": saved_to.is_some(),
         "saved_to": saved_to,
     })))
@@ -118,6 +139,9 @@ fn validate(cfg: &ProxyConfig) -> Result<(), ApiError> {
                 }
                 crate::proxy::validate_wireguard_conf(text).map_err(ApiError)?;
             }
+            // DirectEvasion needs no required fields; seg_position is optional and
+            // any u16 offset is valid (out-of-range is ignored at runtime).
+            "evasion" => {}
             other => return Err(bad(&format!("egress '{}': unknown kind '{}'", e.id, other))),
         }
     }
@@ -136,15 +160,6 @@ fn validate(cfg: &ProxyConfig) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Restart needed if a listener-affecting field differs from what's running
-/// (enabling a cold-started proxy, or changing the ports / connection cap).
-fn restart_required(state: &AppState, cfg: &ProxyConfig) -> bool {
-    let startup = &state.inner.config.proxy;
-    (cfg.enabled && !state.inner.proxy.is_active())
-        || cfg.http_port != startup.http_port
-        || cfg.https_port != startup.https_port
-        || cfg.max_connections != startup.max_connections
-}
 
 /// Strip secrets before returning config to the UI: the socks5 password and the
 /// whole wireguard `.conf` (it embeds the PrivateKey). The UI re-sends them only
@@ -152,11 +167,100 @@ fn restart_required(state: &AppState, cfg: &ProxyConfig) -> bool {
 fn redacted(mut p: ProxyConfig) -> ProxyConfig {
     for e in &mut p.egresses {
         e.password = None;
-        if e.kind.eq_ignore_ascii_case("wireguard") {
-            e.config = None;
+        if e.kind.eq_ignore_ascii_case("wireguard")
+            && let Some(cfg) = e.config.as_deref()
+        {
+            // Show the .conf (so the UI can display it like Proton does) but mask
+            // the PrivateKey value; the rest is non-secret and helps the operator
+            // confirm what's configured.
+            e.config = Some(mask_wg_key(cfg));
         }
     }
     p
+}
+
+/// Placeholder shown in place of a WireGuard PrivateKey on GET. A real key is
+/// base64, so this is unmistakable; PUT treats it as "keep the stored key".
+const WG_KEY_MASK: &str = "********";
+
+/// Replace the `PrivateKey` value with [`WG_KEY_MASK`], leaving every other line
+/// (Address, DNS, Endpoint, PublicKey, …) intact.
+fn mask_wg_key(text: &str) -> String {
+    map_private_key_line(text, |_| WG_KEY_MASK.to_string())
+}
+
+/// If the submitted `.conf` still carries the masked PrivateKey, splice the real
+/// key back in from `stored`; otherwise return the submitted text unchanged (the
+/// operator pasted a fresh key).
+fn restore_wg_key(submitted: &str, stored: &str) -> String {
+    let stored_key = private_key_value(stored);
+    map_private_key_line(submitted, |value| {
+        if value == WG_KEY_MASK {
+            stored_key.clone().unwrap_or_else(|| value.to_string())
+        } else {
+            value.to_string()
+        }
+    })
+}
+
+/// Rewrite the value of the (case-insensitive) `PrivateKey` line via `f`,
+/// preserving the key name and surrounding whitespace.
+fn map_private_key_line(text: &str, f: impl Fn(&str) -> String) -> String {
+    text.lines()
+        .map(|line| match (is_private_key_line(line), line.find('=')) {
+            (true, Some(eq)) => format!("{}= {}", &line[..eq], f(line[eq + 1..].trim())),
+            _ => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn private_key_value(text: &str) -> Option<String> {
+    text.lines()
+        .find(|l| is_private_key_line(l))
+        .and_then(|l| l.split_once('='))
+        .map(|(_, v)| v.trim().to_string())
+}
+
+fn is_private_key_line(line: &str) -> bool {
+    line.trim_start().to_ascii_lowercase().starts_with("privatekey")
+}
+
+/// The `PublicKey` value from a `.conf` — a stable per-peer identity (it isn't
+/// masked) used to re-match a renamed WireGuard egress to its stored config.
+fn wg_public_key(text: &str) -> Option<String> {
+    text.lines()
+        .find(|l| l.trim_start().to_ascii_lowercase().starts_with("publickey"))
+        .and_then(|l| l.split_once('='))
+        .map(|(_, v)| v.trim().to_string())
+}
+
+/// Find the previous version of egress `e`: by id, or — when the id changed (the
+/// UI derives it from the display name) — by a stable property of the config so a
+/// masked secret still restores. WireGuard matches on PublicKey, SOCKS5 on host+port.
+fn match_prev<'a>(old: &'a ProxyConfig, e: &EgressConfig, id: &str) -> Option<&'a EgressConfig> {
+    if let Some(p) = old.egresses.iter().find(|p| p.id == id) {
+        return Some(p);
+    }
+    match e.kind.trim().to_ascii_lowercase().as_str() {
+        "wireguard" => {
+            let pk = wg_public_key(e.config.as_deref().unwrap_or(""))?;
+            old.egresses.iter().find(|p| {
+                p.kind.eq_ignore_ascii_case("wireguard")
+                    && wg_public_key(p.config.as_deref().unwrap_or("")).as_deref() == Some(pk.as_str())
+            })
+        }
+        "socks5" => {
+            let addr = e.address.as_deref()?;
+            let port = e.port?;
+            old.egresses.iter().find(|p| {
+                p.kind.eq_ignore_ascii_case("socks5")
+                    && p.address.as_deref() == Some(addr)
+                    && p.port == Some(port)
+            })
+        }
+        _ => None,
+    }
 }
 
 fn persist(state: &AppState) -> Option<String> {
@@ -206,6 +310,8 @@ mod tests {
             username: None,
             password: None,
             config: None,
+            seg_position: None,
+            buffer_kb: None,
         }
     }
 
@@ -227,6 +333,7 @@ mod tests {
                 pattern: "x.test".to_string(),
                 egress: "ghost".to_string(),
                 fail_closed: true,
+                clients: Vec::new(),
             }],
             ..ProxyConfig::default()
         };
@@ -239,7 +346,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_updates_live_config_and_flags_restart() {
+    async fn put_updates_live_config() {
         let (state, db) = test_support::app_state("proxy-put-ok").await;
         let cfg = ProxyConfig {
             enabled: true,
@@ -248,13 +355,14 @@ mod tests {
                 pattern: "*.example.com".to_string(),
                 egress: "work".to_string(),
                 fail_closed: true,
+                clients: Vec::new(),
             }],
             ..ProxyConfig::default()
         };
         let Json(resp) = put_proxy(State(state.clone()), Json(cfg)).await.unwrap();
         assert_eq!(resp["status"], serde_json::json!("ok"));
-        // Default test state starts disabled, so enabling needs a restart.
-        assert_eq!(resp["restart_required"], serde_json::json!(true));
+        // Everything applies live now — there is no restart_required field.
+        assert!(resp.get("restart_required").is_none());
         // The live config now reflects the new egress/rule.
         let live = state.live_config.read().proxy.clone();
         assert_eq!(live.egresses.len(), 1);
@@ -275,6 +383,8 @@ mod tests {
             username: None,
             password: None,
             config: config.map(str::to_string),
+            seg_position: None,
+            buffer_kb: None,
         }
     }
 
@@ -286,10 +396,33 @@ mod tests {
         )
     }
 
+    #[test]
+    fn renamed_wireguard_egress_restores_key_by_public_key() {
+        // Stored egress "vpn" with a real key; the UI re-submits it under a NEW id
+        // (rename derives the id from the name) with the masked .conf.
+        let conf = sample_wg_conf();
+        let old = ProxyConfig {
+            egresses: vec![wg_egress("vpn", Some(&conf))],
+            ..ProxyConfig::default()
+        };
+        let submitted = wg_egress("vpn-renamed", Some(&mask_wg_key(&conf)));
+
+        // id no longer matches → must fall back to the PublicKey to find the prev.
+        let prev = match_prev(&old, &submitted, "vpn-renamed").expect("matched by PublicKey");
+        assert_eq!(prev.id, "vpn");
+        // And the masked key splices back to the real one (no validation failure).
+        let restored = restore_wg_key(&mask_wg_key(&conf), prev.config.as_deref().unwrap());
+        assert!(restored.contains("PrivateKey =") && !restored.contains("********"));
+    }
+
     #[tokio::test]
     async fn wireguard_config_is_redacted_on_get_and_kept_when_blank() {
         let (state, db) = test_support::app_state("proxy-wg-redact").await;
         let conf = sample_wg_conf();
+        let k = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode([7u8; 32])
+        };
 
         // Save a wireguard egress with its .conf.
         let cfg = ProxyConfig {
@@ -300,17 +433,36 @@ mod tests {
         let _ = put_proxy(State(state.clone()), Json(cfg)).await.unwrap();
         assert!(state.live_config.read().proxy.egresses[0].config.is_some());
 
-        // GET must NOT echo the .conf (it embeds the PrivateKey).
+        // GET shows the .conf with ONLY the PrivateKey masked (Proton-style).
         let Json(v) = get_proxy(State(state.clone())).await;
-        assert!(v["proxy"]["egresses"][0]["config"].is_null());
+        let shown = v["proxy"]["egresses"][0]["config"].as_str().unwrap().to_string();
+        assert!(shown.contains("PrivateKey = ********"), "key must be masked: {shown}");
+        assert!(!shown.contains(&format!("PrivateKey = {k}")), "raw key leaked: {shown}");
+        assert!(shown.contains("Address = 10.9.0.2/32"), "non-secret lines must stay");
 
-        // Re-saving with a blank config keeps the stored one (and still validates).
+        // Re-saving the masked .conf (what the UI echoes back) restores the real key.
         let cfg2 = ProxyConfig {
+            enabled: true,
+            egresses: vec![wg_egress("vpn", Some(&shown))],
+            ..ProxyConfig::default()
+        };
+        let _ = put_proxy(State(state.clone()), Json(cfg2)).await.unwrap();
+        assert!(
+            state.live_config.read().proxy.egresses[0]
+                .config
+                .as_deref()
+                .unwrap_or("")
+                .contains(&format!("PrivateKey = {k}")),
+            "real key must be restored when the mask is sent back"
+        );
+
+        // A fully blank config also keeps the stored one.
+        let cfg3 = ProxyConfig {
             enabled: true,
             egresses: vec![wg_egress("vpn", None)],
             ..ProxyConfig::default()
         };
-        let _ = put_proxy(State(state.clone()), Json(cfg2)).await.unwrap();
+        let _ = put_proxy(State(state.clone()), Json(cfg3)).await.unwrap();
         assert!(
             state.live_config.read().proxy.egresses[0]
                 .config

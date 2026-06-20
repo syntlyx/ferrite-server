@@ -44,6 +44,72 @@ pub fn parse_sni(buf: &[u8]) -> SniResult {
     }
 }
 
+/// Absolute byte offset (into `buf`) and length of the SNI host name within the
+/// first TLS record, if `buf` begins with a ClientHello carrying a `server_name`.
+/// Used by the DPI-evasion egress to split the ClientHello *inside* the host name
+/// so a SNI-matching middlebox never sees the whole name in one segment. Returns
+/// `None` for anything that wouldn't parse to a host (mirrors `parse_sni`), and
+/// every index is bounds-checked.
+pub fn sni_host_range(buf: &[u8]) -> Option<(usize, usize)> {
+    if buf.len() < 5 || buf[0] != TLS_HANDSHAKE {
+        return None;
+    }
+    let record_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+    let record_end = 5 + record_len;
+    if buf.len() < record_end {
+        return None;
+    }
+    // Single cursor over the first record so positions stay absolute.
+    let rec = &buf[..record_end];
+    let mut r = Reader::new(rec);
+    r.skip(5)?; // record header
+    if r.u8()? != CLIENT_HELLO {
+        return None;
+    }
+    r.u24()?; // handshake length
+    r.skip(2 + 32)?; // client_version + random
+    let session_id_len = r.u8()? as usize;
+    r.skip(session_id_len)?;
+    let cipher_suites_len = r.u16()? as usize;
+    r.skip(cipher_suites_len)?;
+    let compression_len = r.u8()? as usize;
+    r.skip(compression_len)?;
+    let ext_total = r.u16()? as usize;
+    let ext_end = r.pos.checked_add(ext_total)?.min(record_end);
+    while r.pos + 4 <= ext_end {
+        let ext_type = r.u16()?;
+        let ext_len = r.u16()? as usize;
+        let ext_data_start = r.pos;
+        r.skip(ext_len)?;
+        if ext_type == EXT_SERVER_NAME {
+            return host_name_range(rec, ext_data_start, ext_len);
+        }
+    }
+    None
+}
+
+/// Locate the first `host_name` entry inside a `server_name` extension's data,
+/// returning its absolute offset and length within `rec`.
+fn host_name_range(rec: &[u8], data_start: usize, data_len: usize) -> Option<(usize, usize)> {
+    let end = data_start.checked_add(data_len)?.min(rec.len());
+    let mut r = Reader::new(rec);
+    r.pos = data_start;
+    let _list_len = r.u16()?; // server_name_list length
+    while r.pos + 3 <= end {
+        let name_type = r.u8()?;
+        let name_len = r.u16()? as usize;
+        let name_start = r.pos;
+        if name_start.checked_add(name_len)? > end {
+            return None;
+        }
+        r.pos = name_start + name_len;
+        if name_type == SNI_HOST_NAME && name_len > 0 {
+            return Some((name_start, name_len));
+        }
+    }
+    None
+}
+
 /// `Some(Some(host))` = found; `Some(None)` = valid ClientHello but no SNI;
 /// `None` = malformed/truncated within the record.
 fn parse_client_hello(rec: &[u8]) -> Option<Option<String>> {
@@ -219,5 +285,31 @@ mod tests {
     #[test]
     fn client_hello_without_sni_is_not_found() {
         assert_eq!(parse_sni(&client_hello("")), SniResult::NotFound);
+    }
+
+    #[test]
+    fn sni_host_range_points_at_the_raw_host_bytes() {
+        let ch = client_hello("Example.COM");
+        let (start, len) = sni_host_range(&ch).expect("range");
+        // Raw bytes (case preserved — unlike parse_sni, which lowercases).
+        assert_eq!(&ch[start..start + len], b"Example.COM");
+    }
+
+    #[test]
+    fn sni_host_range_none_without_sni_or_for_junk() {
+        assert_eq!(sni_host_range(&client_hello("")), None);
+        assert_eq!(sni_host_range(b"GET / HTTP/1.1\r\n\r\n"), None);
+        // Truncated record → None (no panic).
+        let full = client_hello("example.com");
+        assert_eq!(sni_host_range(&full[..full.len() - 4]), None);
+    }
+
+    #[test]
+    fn sni_host_range_midpoint_splits_the_host() {
+        let ch = client_hello("blocked.example.com");
+        let (start, len) = sni_host_range(&ch).unwrap();
+        let split = start + len / 2;
+        // Neither side contains the whole host name.
+        assert!(split > start && split < start + len);
     }
 }

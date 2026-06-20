@@ -10,10 +10,12 @@ A Pi-hole alternative written in Rust. Blocks ads and trackers at the DNS level,
 - **Client tracking** — groups IPv4 and IPv6 addresses with PTR, MAC, and manual aliases
 - **LRU DNS cache** — TTL clamping, survives restarts via binary snapshot
 - **Custom DNS records** — A, AAAA, CNAME with wildcard domains (`*.home.lan`)
+- **Selective routing** — send chosen domains through a tunnel/proxy (Direct, SOCKS5, built-in userspace WireGuard, or DPI-evasion) while everything else goes direct; configured entirely from the web UI ([details](#selective-routing-tunnels))
 - **Statistics** — live atomic counters, 24h timeseries (144 × 10 min buckets), full query log in SQLite
+- **Live logs** — recent server log records kept in memory and viewable in the web UI (`GET /api/logs`)
 - **REST API** — complete control without restarting; see [API.md](API.md)
 - **Authentication** — session tokens (Argon2id, 24h TTL) or static API key
-- **Hot reload** — blocklist lists, selected runtime settings, and web UI path update without restart
+- **Hot reload** — blocklist lists, selected runtime settings, web UI path, and the whole selective-routing config (egresses, rules, listener ports) apply without restart
 - **Panel shortcut** — built-in `fe.te` DNS record resolves to the configured or detected ferrite server IP
 - **Warm restart** — DNS cache and same-day stats counters snapshotted on shutdown, restored on startup
 
@@ -102,7 +104,9 @@ Bridge mode also prevents Ferrite from auto-detecting the LAN reverse-DNS zone,
 so configure `zones` manually if you want router-provided client hostnames:
 
 ```json
-{ "zones": [{ "name": "1.168.192.in-addr.arpa", "upstream": "192.168.1.1:53" }] }
+{
+  "zones": [{ "name": "1.168.192.in-addr.arpa", "upstream": "192.168.1.1:53" }]
+}
 ```
 
 Build locally:
@@ -259,6 +263,70 @@ value  = "192.168.1.100"
 
 Supported types: `A`, `AAAA`, `CNAME`.
 
+## Selective routing (tunnels)
+
+Route chosen domains through a tunnel or proxy while everything else resolves
+normally. For a domain that matches a rule, the DNS pipeline answers with
+ferrite's own IP, so the client connects to ferrite; the listeners then peek the
+SNI (`:443`) or `Host` (`:80`) — **without terminating TLS, so the client still
+validates the real certificate end-to-end** — re-match the rule on the real host,
+and splice the connection through the chosen egress.
+
+Egress kinds:
+
+- **`direct`** — connect straight to the destination (resolved via ferrite's upstream, so no DNS leak)
+- **`socks5`** — forward through a SOCKS5 proxy (hostname sent as `ATYP=domain`, optional auth)
+- **`wireguard`** — built-in **userspace** WireGuard client (boringtun + smoltcp; no TUN device, no root). Paste a standard `.conf`; DNS for routed names is resolved _through_ the tunnel
+- **`evasion`** — like `direct`, but splits the TLS ClientHello across TCP segments so SNI-based DPI can't read the host name (anti-censorship; pure userspace, no raw sockets)
+
+Routing is independent of the blocklist (a routed domain is never blocked) and of
+the whitelist (the whitelist only governs blocking). Rules and egresses
+**hot-reload**; enabling/ports/connection-cap rebind the listeners live — no
+restart. Everything is managed from the web UI (Tunnels page) or `GET/PUT
+/api/proxy`; the config file is just persistence ferrite writes itself.
+
+The HTTP listener is shared with the panel on `:80` (it demuxes by `Host`: the
+panel domain/IP serve the web UI, everything else is routed); the TLS listener is
+`:443`. Binding 80/443 needs privilege (ferrite already binds `:53`, so deploy
+with `CAP_NET_BIND_SERVICE`).
+
+```toml
+[proxy]
+enabled = true
+# advertise_ipv4 / advertise_ipv6 auto-detect when unset
+max_connections = 256
+
+[[proxy.egresses]]
+id   = "nl-proton"        # machine name rules reference (the UI derives it from the display name)
+name = "NL Proton"
+enabled = true
+kind = "wireguard"        # direct | socks5 | wireguard | evasion
+buffer_kb = 512           # wireguard: per-connection socket buffer (throughput vs RAM)
+config = """
+[Interface]
+PrivateKey = <your key>
+Address = 10.2.0.2/32
+DNS = 10.2.0.1
+[Peer]
+PublicKey = <peer key>
+Endpoint = 146.70.86.114:51820
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+"""
+
+[[proxy.rules]]
+pattern = "example.com"     # exact domain matches it AND all subdomains; "*.example.com" = subdomains only
+egress  = "nl-proton"
+fail_closed = true        # if the egress is down, refuse rather than leak the connection directly
+```
+
+**WireGuard throughput.** Each connection's TCP window is `buffer_kb`; bigger =
+faster single-stream (the window scales) but more RAM, and the egress's single
+UDP socket must hold the _aggregate_ burst of all parallel downloads. `256–1024`
+KiB is the sweet spot. Larger buffers need a bigger kernel UDP buffer — raise
+`net.core.rmem_max` (the web UI shows the effective ceiling and the exact
+`sysctl` command when a buffer exceeds it).
+
 ## Web UI
 
 Static files are served from `~/.local/share/ferrite/web/` by default. Install or update them via:
@@ -408,6 +476,11 @@ POST   /api/lists/refresh                 force re-fetch all enabled lists
 GET    /api/custom-records                list custom DNS records
 POST   /api/custom-records                add or update record
 DELETE /api/custom-records/{domain}       remove record
+
+GET    /api/proxy                         selective-routing config + egress health + kernel UDP-buffer ceiling (secrets redacted)
+PUT    /api/proxy                         replace the whole proxy config (hot-applied)
+
+GET    /api/logs                          recent in-memory server log records (delta cursor + level filter)
 
 GET    /api/settings                      current config (secrets redacted)
 PATCH  /api/settings                      update runtime settings

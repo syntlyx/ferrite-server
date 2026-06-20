@@ -17,9 +17,18 @@ tokio = { version = "1", features = ["full"] }
 # Upstream resolution (plain + DoT/DoH/DoQ) and DNS wire-format encode/decode.
 hickory-resolver = { version = "0.26.1", features = ["tls-ring", "https-ring", "quic-ring"] }
 hickory-proto = "0.26.1"                              # Message/Query/PTR parsing (dns/, clients/resolver)
+# Tunneled upstream: ferrite speaks DNS-over-TLS / DNS-over-TCP itself, directly
+# over a userspace egress stream (WireGuard/SOCKS5), so its own upstream queries
+# can ride the tunnel. hickory/reqwest own their sockets and can't, hence raw TLS.
+tokio-rustls = "0.26"   # TLS client over an arbitrary egress stream (tunneled DoT)
+webpki-roots = "1"      # Mozilla root store for tunneled DoT certificate verification
 
 # ── HTTP: API server + outbound client ────────────────────────────────────────
 axum = { version = "0.8", features = ["macros"] }     # REST API + serves the web UI
+# hyper/hyper-util: serve the panel on a single peeked connection so the :80
+# listener can demux panel-vs-proxy by Host (already in the tree via axum).
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }  # CORS + request tracing middleware
 reqwest = { version = "0.13.4", features = ["rustls", "json"], default-features = false }  # blocklist & update downloads
 

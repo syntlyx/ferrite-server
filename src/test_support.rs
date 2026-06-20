@@ -23,6 +23,7 @@ pub async fn app_state(name: &str) -> (AppState, PathBuf) {
     config.upstream = vec![UpstreamConfig::Plain {
         address: "127.0.0.1".to_string(),
         port: 53,
+        egress: None,
     }];
 
     let state = AppState::init(&config, config.clone()).await.unwrap();

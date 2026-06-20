@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 use crate::api::ApiError;
 use crate::app::AppState;
+use crate::error::FeriteError;
 
 #[derive(Deserialize)]
 pub struct DomainPayload {
@@ -124,20 +125,21 @@ pub async fn del_whitelist(
 }
 
 /// GET /api/blocklist/check/:domain
+///
+/// Returns the block decision **plus attribution**: which source(s) match (manual
+/// blacklist, wildcard, or a named subscription list) and the whitelist entry that
+/// exempts it. The attribution scans each list's on-disk FST, so it runs in
+/// `spawn_blocking` and off the DNS hot path.
 pub async fn check_domain(
     State(state): State<AppState>,
     Path(domain): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let domain = crate::blocklist::normalise_domain(&domain);
-    let whitelisted = state.inner.blocklist.is_whitelisted(&domain);
-    // Mirror the DNS hot path (`!whitelisted && is_blocked`) so a whitelisted
-    // domain (or subdomain) never reports `blocked: true`.
-    let blocked = !whitelisted && state.inner.blocklist.is_blocked(&domain);
-    Ok(Json(json!({
-        "domain": domain,
-        "blocked": blocked,
-        "whitelisted": whitelisted,
-    })))
+    let explanation = tokio::task::spawn_blocking(move || state.inner.blocklist.explain(&domain))
+        .await
+        .map_err(|e| ApiError(FeriteError::Internal(format!("explain task failed: {e}"))))?;
+    let value = serde_json::to_value(explanation)
+        .map_err(|e| ApiError(FeriteError::Internal(format!("serialize explanation: {e}"))))?;
+    Ok(Json(value))
 }
 
 /// GET /api/blocklist/blacklist

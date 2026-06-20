@@ -92,11 +92,17 @@ fn rpassword_read_line() -> anyhow::Result<String> {
 async fn run() -> anyhow::Result<()> {
     {
         use tracing_subscriber::prelude::*;
+        // Honor an explicit RUST_LOG; otherwise start at info and let the
+        // configured `debug_logging` flag adjust it once config is loaded (and the
+        // Settings API toggle it live). The filter sits behind a reload layer so
+        // that toggle needs no restart.
         let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("ferrite=info"));
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(logbuf::filter_directive(false)));
+        let (filter, filter_handle) = tracing_subscriber::reload::Layer::new(env_filter);
+        logbuf::install_filter_handle(filter_handle);
         // stdout (journald/Docker) as before + an in-memory ring for GET /api/logs.
         tracing_subscriber::registry()
-            .with(env_filter)
+            .with(filter)
             .with(tracing_subscriber::fmt::layer())
             .with(logbuf::LogLayer)
             .init();
@@ -105,6 +111,11 @@ async fn run() -> anyhow::Result<()> {
     let persistent_config = config::Config::load()?;
     let mut runtime_config = persistent_config.clone();
     tracing::info!("ferrite v{} starting", env!("CARGO_PKG_VERSION"));
+
+    // Apply the configured debug-logging level (unless RUST_LOG took over).
+    if std::env::var_os("RUST_LOG").is_none() {
+        logbuf::set_debug(runtime_config.debug_logging);
+    }
 
     // Auto-detect local zones when none are configured.
     // Runs only once at startup; nothing is written to disk.
