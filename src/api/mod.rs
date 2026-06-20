@@ -4,6 +4,7 @@ pub mod clients;
 pub mod custom_records;
 pub mod error;
 pub mod lists;
+pub mod logs;
 pub mod middleware;
 pub mod proxy;
 pub mod queries;
@@ -82,6 +83,8 @@ pub fn build_router(state: AppState) -> Router {
         // Selective routing / proxy
         .route("/proxy", get(proxy::get_proxy))
         .route("/proxy", put(proxy::put_proxy))
+        // Live server logs (in-memory ring)
+        .route("/logs", get(logs::get_logs))
         // Updates
         .route("/update/check", get(update::check_update))
         .route("/update/server", post(update::update_server))

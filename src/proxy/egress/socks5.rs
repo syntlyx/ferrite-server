@@ -14,7 +14,7 @@ use tokio::time::timeout;
 use crate::config::EgressConfig;
 use crate::error::{FeriteError, Result};
 
-use super::{EgressConn, enable_keepalive};
+use super::enable_keepalive;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -52,13 +52,13 @@ impl Socks5Egress {
         &self.id
     }
 
-    pub async fn connect(&self, host: &str, port: u16) -> Result<EgressConn> {
+    pub async fn connect(&self, host: &str, port: u16) -> Result<TcpStream> {
         timeout(CONNECT_TIMEOUT, self.handshake(host, port))
             .await
             .map_err(|_| FeriteError::Dns(format!("socks5 {} timeout", self.proxy_addr)))?
     }
 
-    async fn handshake(&self, host: &str, port: u16) -> Result<EgressConn> {
+    async fn handshake(&self, host: &str, port: u16) -> Result<TcpStream> {
         if host.len() > 255 {
             return Err(FeriteError::Dns(
                 "socks5: hostname too long for ATYP=domain".into(),

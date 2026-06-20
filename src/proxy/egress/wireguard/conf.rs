@@ -1,10 +1,6 @@
-//! WireGuard egress — userspace, in-process (boringtun + smoltcp), no TUN / no root.
-//!
-//! This slice implements the `.conf` parser (`[Interface]`/`[Peer]`) that the
-//! web UI pastes in. The data path (boringtun `Tunn` event loop + a smoltcp
-//! netstack over the tunnel, exposing `connect(host, port)`) builds on top of
-//! this parsed config and lands in the next slice.
-#![allow(dead_code)] // consumed by the WireGuard data path (next slice)
+//! WireGuard `.conf` parser (`[Interface]`/`[Peer]`, `wg-quick` format) — the
+//! text the web UI pastes in, turned into the fields ferrite needs to bring up
+//! a userspace client tunnel.
 
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -22,7 +18,8 @@ pub struct WgConf {
     pub private_key: [u8; 32],
     /// Interface addresses to assign on the tunnel (IP + prefix length).
     pub addresses: Vec<(IpAddr, u8)>,
-    /// DNS servers to resolve through the tunnel (no leak).
+    /// DNS servers to resolve through the tunnel (queried over DNS-over-TCP from
+    /// inside the tunnel — see `WgEgress::resolve`).
     pub dns: Vec<IpAddr>,
     /// Inner MTU (default 1420 if unset).
     pub mtu: Option<u32>,
@@ -33,6 +30,7 @@ pub struct WgConf {
     /// Peer endpoint as `host:port` (host may be a name — resolved at startup).
     pub endpoint: String,
     /// Networks routed through the peer (informational; we route per-connection).
+    #[allow(dead_code)]
     pub allowed_ips: Vec<(IpAddr, u8)>,
     /// Keepalive interval in seconds.
     pub persistent_keepalive: Option<u16>,
@@ -76,13 +74,17 @@ pub fn parse(text: &str) -> Result<WgConf> {
         }
 
         let Some((key, value)) = line.split_once('=') else {
-            return Err(cfg(format!("malformed line (expected key = value): '{line}'")));
+            return Err(cfg(format!(
+                "malformed line (expected key = value): '{line}'"
+            )));
         };
         let key = key.trim().to_ascii_lowercase();
         let value = value.trim();
 
         match (&section, key.as_str()) {
-            (Section::Interface, "privatekey") => private_key = Some(decode_key(value, "PrivateKey")?),
+            (Section::Interface, "privatekey") => {
+                private_key = Some(decode_key(value, "PrivateKey")?)
+            }
             (Section::Interface, "address") => {
                 for item in split_list(value) {
                     addresses.push(parse_cidr(item)?);
@@ -90,15 +92,24 @@ pub fn parse(text: &str) -> Result<WgConf> {
             }
             (Section::Interface, "dns") => {
                 for item in split_list(value) {
-                    dns.push(IpAddr::from_str(item).map_err(|_| cfg(format!("invalid DNS address '{item}'")))?);
+                    dns.push(
+                        IpAddr::from_str(item)
+                            .map_err(|_| cfg(format!("invalid DNS address '{item}'")))?,
+                    );
                 }
             }
             (Section::Interface, "mtu") => {
-                mtu = Some(value.parse().map_err(|_| cfg(format!("invalid MTU '{value}'")))?);
+                mtu = Some(
+                    value
+                        .parse()
+                        .map_err(|_| cfg(format!("invalid MTU '{value}'")))?,
+                );
             }
             (Section::Interface, "listenport") => {} // client doesn't need a fixed port
             (Section::Peer, "publickey") => peer_public_key = Some(decode_key(value, "PublicKey")?),
-            (Section::Peer, "presharedkey") => preshared_key = Some(decode_key(value, "PresharedKey")?),
+            (Section::Peer, "presharedkey") => {
+                preshared_key = Some(decode_key(value, "PresharedKey")?)
+            }
             (Section::Peer, "endpoint") => endpoint = Some(value.to_string()),
             (Section::Peer, "allowedips") => {
                 for item in split_list(value) {
@@ -106,8 +117,11 @@ pub fn parse(text: &str) -> Result<WgConf> {
                 }
             }
             (Section::Peer, "persistentkeepalive") => {
-                persistent_keepalive =
-                    Some(value.parse().map_err(|_| cfg(format!("invalid PersistentKeepalive '{value}'")))?);
+                persistent_keepalive = Some(
+                    value
+                        .parse()
+                        .map_err(|_| cfg(format!("invalid PersistentKeepalive '{value}'")))?,
+                );
             }
             // Unknown keys are ignored for forward-compat with wg-quick extras.
             _ => {}
@@ -119,7 +133,8 @@ pub fn parse(text: &str) -> Result<WgConf> {
         addresses: require_nonempty(addresses, "[Interface] Address is required")?,
         dns,
         mtu,
-        peer_public_key: peer_public_key.ok_or_else(|| cfg("[Peer] PublicKey is required".into()))?,
+        peer_public_key: peer_public_key
+            .ok_or_else(|| cfg("[Peer] PublicKey is required".into()))?,
         preshared_key,
         endpoint: endpoint.ok_or_else(|| cfg("[Peer] Endpoint is required".into()))?,
         allowed_ips,
@@ -149,7 +164,8 @@ fn decode_key(value: &str, what: &str) -> Result<[u8; 32]> {
 fn parse_cidr(item: &str) -> Result<(IpAddr, u8)> {
     match item.split_once('/') {
         Some((ip, prefix)) => {
-            let ip = IpAddr::from_str(ip.trim()).map_err(|_| cfg(format!("invalid address '{item}'")))?;
+            let ip = IpAddr::from_str(ip.trim())
+                .map_err(|_| cfg(format!("invalid address '{item}'")))?;
             let prefix = prefix
                 .trim()
                 .parse::<u8>()
@@ -161,7 +177,8 @@ fn parse_cidr(item: &str) -> Result<(IpAddr, u8)> {
             Ok((ip, prefix))
         }
         None => {
-            let ip = IpAddr::from_str(item.trim()).map_err(|_| cfg(format!("invalid address '{item}'")))?;
+            let ip = IpAddr::from_str(item.trim())
+                .map_err(|_| cfg(format!("invalid address '{item}'")))?;
             Ok((ip, if ip.is_ipv4() { 32 } else { 128 }))
         }
     }
@@ -266,6 +283,9 @@ mod tests {
             key(2)
         );
         let c = parse(&conf).unwrap();
-        assert_eq!(c.addresses, vec![(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 32)]);
+        assert_eq!(
+            c.addresses,
+            vec![(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 32)]
+        );
     }
 }

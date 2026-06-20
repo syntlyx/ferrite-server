@@ -138,10 +138,23 @@ impl ProxyState {
     }
 
     pub fn is_egress_healthy(&self, id: &str) -> bool {
-        self.breakers
+        // Both the connect circuit-breaker AND the egress's intrinsic readiness
+        // (e.g. a WireGuard tunnel only counts as healthy once its handshake has
+        // completed) must be green.
+        let breaker_ok = self
+            .breakers
             .get(id)
             .map(|b| b.is_healthy())
-            .unwrap_or(true)
+            .unwrap_or(true);
+        let intrinsic_ok = self
+            .registry
+            .load()
+            .egresses
+            .iter()
+            .find(|e| e.id() == id)
+            .map(|e| e.is_healthy())
+            .unwrap_or(true);
+        breaker_ok && intrinsic_ok
     }
 
     fn note_success(&self, id: &str) {
@@ -157,6 +170,11 @@ impl ProxyState {
             .or_default()
             .record_failure();
     }
+}
+
+/// Validate a pasted WireGuard `.conf` so the API can reject a bad one with 400.
+pub fn validate_wireguard_conf(text: &str) -> crate::error::Result<()> {
+    egress::validate_wireguard_conf(text)
 }
 
 fn build_snapshot(cfg: &ProxyConfig, enabled: bool, upstream: &Arc<ZoneRouter>) -> Snapshot {

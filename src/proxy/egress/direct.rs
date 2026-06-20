@@ -20,7 +20,7 @@ use tokio::time::timeout;
 use crate::error::{FeriteError, Result};
 use crate::upstream::ZoneRouter;
 
-use super::{EgressConn, enable_keepalive};
+use super::enable_keepalive;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -38,7 +38,7 @@ impl DirectEgress {
         &self.id
     }
 
-    pub async fn connect(&self, host: &str, port: u16) -> Result<EgressConn> {
+    pub async fn connect(&self, host: &str, port: u16) -> Result<TcpStream> {
         direct_connect(&self.upstream, host, port).await
     }
 }
@@ -46,7 +46,7 @@ impl DirectEgress {
 /// Resolve `host` via the upstream pool (or parse it as a literal IP) and open a
 /// TCP connection to `host:port`. Shared by [`DirectEgress`] and the
 /// "connected to us but no rule matches" forward-direct fallback.
-pub async fn direct_connect(upstream: &ZoneRouter, host: &str, port: u16) -> Result<EgressConn> {
+pub async fn direct_connect(upstream: &ZoneRouter, host: &str, port: u16) -> Result<TcpStream> {
     let ip = match IpAddr::from_str(host) {
         Ok(ip) => ip,
         Err(_) => resolve_via_upstream(upstream, host).await?,
@@ -58,6 +58,15 @@ pub async fn direct_connect(upstream: &ZoneRouter, host: &str, port: u16) -> Res
         .map_err(|e| FeriteError::Dns(format!("connect {host}:{port}: {e}")))?;
     enable_keepalive(&stream);
     Ok(stream)
+}
+
+/// Resolve `host` (or parse it as a literal IP) via ferrite's upstream pool.
+/// Shared with the WireGuard egress so it resolves the same way Direct does.
+pub(super) async fn resolve_host(upstream: &ZoneRouter, host: &str) -> Result<IpAddr> {
+    if let Ok(ip) = IpAddr::from_str(host) {
+        return Ok(ip);
+    }
+    resolve_via_upstream(upstream, host).await
 }
 
 async fn resolve_via_upstream(upstream: &ZoneRouter, host: &str) -> Result<IpAddr> {

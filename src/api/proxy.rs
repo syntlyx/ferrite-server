@@ -46,23 +46,30 @@ pub async fn put_proxy(
     State(state): State<AppState>,
     Json(mut new): Json<ProxyConfig>,
 ) -> Result<Json<Value>, ApiError> {
-    validate(&new)?;
-
-    // Preserve socks5 passwords the UI left blank (they're redacted on GET).
+    // Restore secrets the UI left blank (they're redacted on GET) BEFORE
+    // validating, so an unchanged socks5 password / wireguard `.conf` still
+    // satisfies the required-fields checks.
     {
         let old = state.live_config.read().proxy.clone();
         for e in &mut new.egresses {
+            let id = e.id.trim().to_ascii_lowercase();
+            let prev = old.egresses.iter().find(|p| p.id == id);
             if e.kind.eq_ignore_ascii_case("socks5")
                 && e.password.as_deref().unwrap_or("").is_empty()
+                && let Some(p) = prev
             {
-                let id = e.id.trim().to_ascii_lowercase();
-                if let Some(prev) = old.egresses.iter().find(|p| p.id == id) {
-                    e.password = prev.password.clone();
-                }
+                e.password = p.password.clone();
+            }
+            if e.kind.eq_ignore_ascii_case("wireguard")
+                && e.config.as_deref().unwrap_or("").trim().is_empty()
+                && let Some(p) = prev
+            {
+                e.config = p.config.clone();
             }
         }
     }
 
+    validate(&new)?;
     new.normalize();
     let restart = restart_required(&state, &new);
 
@@ -101,6 +108,16 @@ fn validate(cfg: &ProxyConfig) -> Result<(), ApiError> {
                     )));
                 }
             }
+            "wireguard" => {
+                let text = e.config.as_deref().unwrap_or("").trim();
+                if text.is_empty() {
+                    return Err(bad(&format!(
+                        "wireguard egress '{}' requires a config (.conf text)",
+                        e.id
+                    )));
+                }
+                crate::proxy::validate_wireguard_conf(text).map_err(ApiError)?;
+            }
             other => return Err(bad(&format!("egress '{}': unknown kind '{}'", e.id, other))),
         }
     }
@@ -129,10 +146,14 @@ fn restart_required(state: &AppState, cfg: &ProxyConfig) -> bool {
         || cfg.max_connections != startup.max_connections
 }
 
+/// Strip secrets before returning config to the UI: the socks5 password and the
+/// whole wireguard `.conf` (it embeds the PrivateKey). The UI re-sends them only
+/// when changing them; a blank value on save means "keep the stored one".
 fn redacted(mut p: ProxyConfig) -> ProxyConfig {
     for e in &mut p.egresses {
-        if e.password.is_some() {
-            e.password = None;
+        e.password = None;
+        if e.kind.eq_ignore_ascii_case("wireguard") {
+            e.config = None;
         }
     }
     p
@@ -239,6 +260,65 @@ mod tests {
         assert_eq!(live.egresses.len(), 1);
         assert_eq!(live.rules.len(), 1);
         assert_eq!(live.egresses[0].id, "work");
+        drop(state);
+        test_support::cleanup_sqlite(&db);
+    }
+
+    fn wg_egress(id: &str, config: Option<&str>) -> EgressConfig {
+        EgressConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            enabled: true,
+            kind: "wireguard".to_string(),
+            address: None,
+            port: None,
+            username: None,
+            password: None,
+            config: config.map(str::to_string),
+        }
+    }
+
+    fn sample_wg_conf() -> String {
+        use base64::Engine;
+        let k = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        format!(
+            "[Interface]\nPrivateKey = {k}\nAddress = 10.9.0.2/32\n[Peer]\nPublicKey = {k}\nEndpoint = 127.0.0.1:51820\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn wireguard_config_is_redacted_on_get_and_kept_when_blank() {
+        let (state, db) = test_support::app_state("proxy-wg-redact").await;
+        let conf = sample_wg_conf();
+
+        // Save a wireguard egress with its .conf.
+        let cfg = ProxyConfig {
+            enabled: true,
+            egresses: vec![wg_egress("vpn", Some(&conf))],
+            ..ProxyConfig::default()
+        };
+        let _ = put_proxy(State(state.clone()), Json(cfg)).await.unwrap();
+        assert!(state.live_config.read().proxy.egresses[0].config.is_some());
+
+        // GET must NOT echo the .conf (it embeds the PrivateKey).
+        let Json(v) = get_proxy(State(state.clone())).await;
+        assert!(v["proxy"]["egresses"][0]["config"].is_null());
+
+        // Re-saving with a blank config keeps the stored one (and still validates).
+        let cfg2 = ProxyConfig {
+            enabled: true,
+            egresses: vec![wg_egress("vpn", None)],
+            ..ProxyConfig::default()
+        };
+        let _ = put_proxy(State(state.clone()), Json(cfg2)).await.unwrap();
+        assert!(
+            state.live_config.read().proxy.egresses[0]
+                .config
+                .as_deref()
+                .unwrap_or("")
+                .contains("PrivateKey")
+        );
+
         drop(state);
         test_support::cleanup_sqlite(&db);
     }

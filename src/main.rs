@@ -5,6 +5,7 @@ mod clients;
 mod config;
 mod dns;
 mod error;
+mod logbuf;
 mod proxy;
 mod setup;
 mod snapshot;
@@ -89,12 +90,17 @@ fn rpassword_read_line() -> anyhow::Result<String> {
 }
 
 async fn run() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("ferrite=info")),
-        )
-        .init();
+    {
+        use tracing_subscriber::prelude::*;
+        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("ferrite=info"));
+        // stdout (journald/Docker) as before + an in-memory ring for GET /api/logs.
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer())
+            .with(logbuf::LogLayer)
+            .init();
+    }
 
     let persistent_config = config::Config::load()?;
     let mut runtime_config = persistent_config.clone();

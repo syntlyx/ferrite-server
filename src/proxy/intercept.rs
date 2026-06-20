@@ -188,7 +188,7 @@ async fn handle(mut client: TcpStream, state: AppState, proto: Protocol) -> std:
                         "proxy: egress '{id}' failed ({e}) → falling back to direct for {host}"
                     );
                     match direct_connect(&state.inner.upstream_pool, &host, port).await {
-                        Ok(c) => c,
+                        Ok(c) => EgressConn::Tcp(c),
                         Err(_) => return Ok(()),
                     }
                 }
@@ -198,7 +198,7 @@ async fn handle(mut client: TcpStream, state: AppState, proto: Protocol) -> std:
             // The client reached us for a host we don't route (it used its own
             // resolver, or a stale cache entry). Act as a plain forwarder.
             match direct_connect(&state.inner.upstream_pool, &host, port).await {
-                Ok(c) => c,
+                Ok(c) => EgressConn::Tcp(c),
                 Err(e) => {
                     tracing::debug!("proxy: forward-direct to {host} failed: {e}");
                     return Ok(());
