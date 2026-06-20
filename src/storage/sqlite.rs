@@ -860,8 +860,9 @@ fn migrate_v2_backfill_rollups(tx: &rusqlite::Transaction) -> rusqlite::Result<(
     if query_count == 0 {
         return Ok(());
     }
-    let rollup_count: i64 =
-        tx.query_row("SELECT COUNT(*) FROM query_buckets_10m", [], |row| row.get(0))?;
+    let rollup_count: i64 = tx.query_row("SELECT COUNT(*) FROM query_buckets_10m", [], |row| {
+        row.get(0)
+    })?;
     if rollup_count > 0 {
         return Ok(());
     }
@@ -959,7 +960,9 @@ fn migrate_v5_backfill_devices(tx: &rusqlite::Transaction) -> rusqlite::Result<(
     )?;
 
     let device_rollup_count: i64 =
-        tx.query_row("SELECT COUNT(*) FROM device_buckets_10m", [], |row| row.get(0))?;
+        tx.query_row("SELECT COUNT(*) FROM device_buckets_10m", [], |row| {
+            row.get(0)
+        })?;
     if device_rollup_count == 0 {
         let sql = format!(
             "INSERT INTO device_buckets_10m (bucket, device, total, blocked, last_seen)
@@ -1255,27 +1258,51 @@ mod tests {
             .unwrap();
 
         // Learn a device name, then refine it — upsert should overwrite.
-        storage.upsert_device("aa:bb:cc:dd:ee:ff", Some("laptop")).await.unwrap();
+        storage
+            .upsert_device("aa:bb:cc:dd:ee:ff", Some("laptop"))
+            .await
+            .unwrap();
         storage
             .upsert_device("aa:bb:cc:dd:ee:ff", Some("alex-laptop"))
             .await
             .unwrap();
         // A nameless re-learn must NOT blank an existing hostname (COALESCE).
-        storage.upsert_device("aa:bb:cc:dd:ee:ff", None).await.unwrap();
+        storage
+            .upsert_device("aa:bb:cc:dd:ee:ff", None)
+            .await
+            .unwrap();
         // A device seen only by MAC, hostname not yet resolved.
-        storage.upsert_device("11:22:33:44:55:66", None).await.unwrap();
+        storage
+            .upsert_device("11:22:33:44:55:66", None)
+            .await
+            .unwrap();
 
         let devices = storage.load_devices().await.unwrap();
         assert_eq!(devices.len(), 2);
-        let laptop = devices.iter().find(|(m, _)| m == "aa:bb:cc:dd:ee:ff").unwrap();
+        let laptop = devices
+            .iter()
+            .find(|(m, _)| m == "aa:bb:cc:dd:ee:ff")
+            .unwrap();
         assert_eq!(laptop.1.as_deref(), Some("alex-laptop"));
-        let nameless = devices.iter().find(|(m, _)| m == "11:22:33:44:55:66").unwrap();
+        let nameless = devices
+            .iter()
+            .find(|(m, _)| m == "11:22:33:44:55:66")
+            .unwrap();
         assert_eq!(nameless.1, None);
 
         // IP .50 first belongs to the laptop, then is reassigned ("last binding wins").
-        storage.upsert_ip_binding("192.168.1.50", "aa:bb:cc:dd:ee:ff").await.unwrap();
-        storage.upsert_ip_binding("192.168.1.77", "aa:bb:cc:dd:ee:ff").await.unwrap();
-        storage.upsert_ip_binding("192.168.1.50", "11:22:33:44:55:66").await.unwrap();
+        storage
+            .upsert_ip_binding("192.168.1.50", "aa:bb:cc:dd:ee:ff")
+            .await
+            .unwrap();
+        storage
+            .upsert_ip_binding("192.168.1.77", "aa:bb:cc:dd:ee:ff")
+            .await
+            .unwrap();
+        storage
+            .upsert_ip_binding("192.168.1.50", "11:22:33:44:55:66")
+            .await
+            .unwrap();
 
         let mut bindings = storage.load_ip_bindings().await.unwrap();
         bindings.sort();
@@ -1348,22 +1375,28 @@ mod tests {
 
         storage.delete_all_queries().await.unwrap();
 
-        assert!(storage
-            .query_range(&QueryFilter::default())
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            storage
+                .query_range(&QueryFilter::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(storage.summary(3600).await.unwrap(), (0, 0));
-        assert!(storage
-            .top_domains(bucket, bucket + 599, 10)
-            .await
-            .unwrap()
-            .is_empty());
-        assert!(storage
-            .top_clients(bucket, bucket + 599, 10)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            storage
+                .top_domains(bucket, bucket + 599, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            storage
+                .top_clients(bucket, bucket + 599, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1406,11 +1439,13 @@ mod tests {
             .unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].domain, "new.test");
-        assert!(storage
-            .top_blocked_domains(old_bucket, old_bucket + 599, 10)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            storage
+                .top_blocked_domains(old_bucket, old_bucket + 599, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             storage
                 .top_domains(now_bucket, now_bucket + 599, 10)
@@ -1431,10 +1466,34 @@ mod tests {
         // plus a second device that has no MAC (IP fallback token).
         storage
             .write_batch(&[
-                query_entry_dev(bucket + 1, "a.test", "192.168.1.50", mac, QueryStatus::Upstream),
-                query_entry_dev(bucket + 2, "b.test", "192.168.1.50", mac, QueryStatus::Blocked),
-                query_entry_dev(bucket + 3, "c.test", "192.168.1.77", mac, QueryStatus::Upstream),
-                query_entry_dev(bucket + 4, "d.test", "10.0.0.9", "10.0.0.9", QueryStatus::Upstream),
+                query_entry_dev(
+                    bucket + 1,
+                    "a.test",
+                    "192.168.1.50",
+                    mac,
+                    QueryStatus::Upstream,
+                ),
+                query_entry_dev(
+                    bucket + 2,
+                    "b.test",
+                    "192.168.1.50",
+                    mac,
+                    QueryStatus::Blocked,
+                ),
+                query_entry_dev(
+                    bucket + 3,
+                    "c.test",
+                    "192.168.1.77",
+                    mac,
+                    QueryStatus::Upstream,
+                ),
+                query_entry_dev(
+                    bucket + 4,
+                    "d.test",
+                    "10.0.0.9",
+                    "10.0.0.9",
+                    QueryStatus::Upstream,
+                ),
             ])
             .await
             .unwrap();
@@ -1494,7 +1553,9 @@ mod tests {
         // user_version stamped to latest; `device` column added.
         let (version, has_device): (i64, bool) = {
             let c = rusqlite::Connection::open(&path).unwrap();
-            let v = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            let v = c
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
             let d: i64 = c
                 .query_row(
                     "SELECT COUNT(*) FROM pragma_table_info('queries') WHERE name='device'",
@@ -1510,7 +1571,11 @@ mod tests {
         // client_aliases upgraded to (key, key_type) without losing data.
         assert_eq!(
             storage.load_client_aliases().await.unwrap(),
-            vec![("192.168.1.10".to_string(), "ip".to_string(), "Laptop".to_string())]
+            vec![(
+                "192.168.1.10".to_string(),
+                "ip".to_string(),
+                "Laptop".to_string()
+            )]
         );
 
         // Legacy query rows backfilled to device = client_ip (no MAC history).
@@ -1533,6 +1598,14 @@ mod tests {
         // Re-opening is a no-op: migrations are idempotent and data is preserved.
         drop(storage);
         let storage2 = SqliteStorage::open(&path).await.unwrap();
-        assert_eq!(storage2.client_stats("192.168.1.50").await.unwrap().unwrap().total, 2);
+        assert_eq!(
+            storage2
+                .client_stats("192.168.1.50")
+                .await
+                .unwrap()
+                .unwrap()
+                .total,
+            2
+        );
     }
 }

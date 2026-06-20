@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use fst::Map;
 
-use crate::blocklist::{loader, AdblockStats};
+use crate::blocklist::{AdblockStats, loader};
 
 /// Per-list domain cache is considered fresh for 12 hours.
 pub(super) const LIST_CACHE_TTL: Duration = Duration::from_secs(12 * 3600);
@@ -32,26 +32,24 @@ pub(super) async fn load_or_build_list_fst(
 ) -> (String, Vec<u8>, usize, Option<AdblockStats>) {
     // Fast path: fresh per-list FST on disk. The parse stats can't be recovered
     // from the binary FST, so they ride along in a sidecar written at parse time.
-    if !force {
-        if let Some(bytes) = load_fresh_bytes(&fst_cache).await {
-            let count = Map::new(bytes.as_slice()).map(|m| m.len()).unwrap_or(0);
-            let stats = load_stats_cache(&stats_cache).await;
-            tracing::info!("list '{}': {} domains from FST cache", name, count);
-            return (name, bytes, count, stats);
-        }
+    if !force && let Some(bytes) = load_fresh_bytes(&fst_cache).await {
+        let count = Map::new(bytes.as_slice()).map(|m| m.len()).unwrap_or(0);
+        let stats = load_stats_cache(&stats_cache).await;
+        tracing::info!("list '{}': {} domains from FST cache", name, count);
+        return (name, bytes, count, stats);
     }
 
     // Slow path: load/fetch domain text, then build FST.
     let (domains, stats) = fetch_domains(&name, &url, &domains_cache, &stats_cache, force).await;
 
     if domains.is_empty() {
-        if let Ok(bytes) = tokio::fs::read(&fst_cache).await {
-            if let Ok(m) = Map::new(bytes.as_slice()) {
-                let count = m.len();
-                let stats = load_stats_cache(&stats_cache).await;
-                tracing::warn!("list '{}': using stale FST ({} domains)", name, count);
-                return (name, bytes, count, stats);
-            }
+        if let Ok(bytes) = tokio::fs::read(&fst_cache).await
+            && let Ok(m) = Map::new(bytes.as_slice())
+        {
+            let count = m.len();
+            let stats = load_stats_cache(&stats_cache).await;
+            tracing::warn!("list '{}': using stale FST ({} domains)", name, count);
+            return (name, bytes, count, stats);
         }
         tracing::error!("list '{}': no domains available, skipping", name);
         return (String::new(), vec![], 0, None);
@@ -89,16 +87,14 @@ async fn fetch_domains(
     stats_cache: &Path,
     force: bool,
 ) -> (Vec<String>, Option<AdblockStats>) {
-    if !force {
-        if let Some(domains) = load_fresh_text_cache(domains_cache).await {
-            let stats = load_stats_cache(stats_cache).await;
-            tracing::debug!(
-                "list '{}': {} domains from domain cache",
-                name,
-                domains.len()
-            );
-            return (domains, stats);
-        }
+    if !force && let Some(domains) = load_fresh_text_cache(domains_cache).await {
+        let stats = load_stats_cache(stats_cache).await;
+        tracing::debug!(
+            "list '{}': {} domains from domain cache",
+            name,
+            domains.len()
+        );
+        return (domains, stats);
     }
 
     match loader::load_list(url).await {

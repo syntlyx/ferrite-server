@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 
 use crate::app::AppState;
 use crate::error::Result;
-use crate::snapshot::{StateSnapshot, SNAPSHOT_MAGIC, SNAPSHOT_VERSION};
+use crate::snapshot::{SNAPSHOT_MAGIC, SNAPSHOT_VERSION, StateSnapshot};
 
 /// Deserialize a `StateSnapshot` from `path`.
 /// Returns `Ok(None)` if the file doesn't exist.

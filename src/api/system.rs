@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
-use axum::extract::State;
 use axum::Json;
+use axum::extract::State;
 use serde_json::Value;
 
 use crate::api::ApiError;
@@ -25,10 +25,10 @@ pub async fn get_system_stats(State(state): State<AppState>) -> Result<Json<Valu
     // Return cached value if still fresh.
     {
         let cache = state.system_stats_cache.lock();
-        if let Some((ts, ref val)) = *cache {
-            if ts.elapsed() < SYSTEM_STATS_TTL {
-                return Ok(Json(val.clone()));
-            }
+        if let Some((ts, ref val)) = *cache
+            && ts.elapsed() < SYSTEM_STATS_TTL
+        {
+            return Ok(Json(val.clone()));
         }
     }
 
@@ -169,14 +169,12 @@ fn collect_network(networks: &sysinfo::Networks) -> (u64, u64, Option<u64>, Vec<
         rx_bytes += data.received();
         tx_bytes += data.transmitted();
         active_ifaces.push(name.clone());
-        if link_speed_mbps.is_none() {
-            if let Ok(s) = std::fs::read_to_string(format!("/sys/class/net/{}/speed", name)) {
-                if let Ok(mbps) = s.trim().parse::<i64>() {
-                    if mbps > 0 {
-                        link_speed_mbps = Some(mbps as u64);
-                    }
-                }
-            }
+        if link_speed_mbps.is_none()
+            && let Ok(s) = std::fs::read_to_string(format!("/sys/class/net/{}/speed", name))
+            && let Ok(mbps) = s.trim().parse::<i64>()
+            && mbps > 0
+        {
+            link_speed_mbps = Some(mbps as u64);
         }
     }
     (rx_bytes, tx_bytes, link_speed_mbps, active_ifaces)

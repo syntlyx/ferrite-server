@@ -14,7 +14,7 @@ use tokio::time::timeout;
 use crate::config::EgressConfig;
 use crate::error::{FeriteError, Result};
 
-use super::{enable_keepalive, EgressConn};
+use super::{EgressConn, enable_keepalive};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -26,9 +26,13 @@ pub struct Socks5Egress {
 
 impl Socks5Egress {
     pub fn from_config(cfg: &EgressConfig) -> Result<Self> {
-        let address = cfg.address.as_deref().filter(|s| !s.trim().is_empty()).ok_or_else(|| {
-            FeriteError::Config(format!("socks5 egress '{}' requires an address", cfg.id))
-        })?;
+        let address = cfg
+            .address
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                FeriteError::Config(format!("socks5 egress '{}' requires an address", cfg.id))
+            })?;
         let port = cfg.port.ok_or_else(|| {
             FeriteError::Config(format!("socks5 egress '{}' requires a port", cfg.id))
         })?;
@@ -56,7 +60,9 @@ impl Socks5Egress {
 
     async fn handshake(&self, host: &str, port: u16) -> Result<EgressConn> {
         if host.len() > 255 {
-            return Err(FeriteError::Dns("socks5: hostname too long for ATYP=domain".into()));
+            return Err(FeriteError::Dns(
+                "socks5: hostname too long for ATYP=domain".into(),
+            ));
         }
 
         let mut s = TcpStream::connect(&self.proxy_addr)
@@ -73,13 +79,23 @@ impl Socks5Egress {
         let mut method = [0u8; 2];
         s.read_exact(&mut method).await?;
         if method[0] != 0x05 {
-            return Err(FeriteError::Dns("socks5: bad version in method reply".into()));
+            return Err(FeriteError::Dns(
+                "socks5: bad version in method reply".into(),
+            ));
         }
         match method[1] {
             0x00 => {} // no auth required
             0x02 => self.user_pass_auth(&mut s).await?,
-            0xFF => return Err(FeriteError::Dns("socks5: no acceptable auth methods".into())),
-            other => return Err(FeriteError::Dns(format!("socks5: unexpected method {other}"))),
+            0xFF => {
+                return Err(FeriteError::Dns(
+                    "socks5: no acceptable auth methods".into(),
+                ));
+            }
+            other => {
+                return Err(FeriteError::Dns(format!(
+                    "socks5: unexpected method {other}"
+                )));
+            }
         }
 
         // ── CONNECT request (ATYP=domain → remote resolution). ──
@@ -115,12 +131,13 @@ impl Socks5Egress {
     }
 
     async fn user_pass_auth(&self, s: &mut TcpStream) -> Result<()> {
-        let (user, pass) = self
-            .auth
-            .as_ref()
-            .ok_or_else(|| FeriteError::Dns("socks5: server requires auth but none configured".into()))?;
+        let (user, pass) = self.auth.as_ref().ok_or_else(|| {
+            FeriteError::Dns("socks5: server requires auth but none configured".into())
+        })?;
         if user.len() > 255 || pass.len() > 255 {
-            return Err(FeriteError::Dns("socks5: username/password too long".into()));
+            return Err(FeriteError::Dns(
+                "socks5: username/password too long".into(),
+            ));
         }
         let mut msg = vec![0x01, user.len() as u8];
         msg.extend_from_slice(user.as_bytes());

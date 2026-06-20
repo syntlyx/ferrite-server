@@ -121,9 +121,11 @@ mod tests {
     async fn refusing_invalid_sidecar_value_does_not_create_file() {
         let path = temp_path("invalid-sidecar");
 
-        assert!(write_sha256_file(&path, "definitely-not-a-sha")
-            .await
-            .is_err());
+        assert!(
+            write_sha256_file(&path, "definitely-not-a-sha")
+                .await
+                .is_err()
+        );
         assert_eq!(read_sha256_file(&path).await.unwrap(), None);
     }
 

@@ -1,14 +1,14 @@
 use axum::{
+    Json,
     extract::{Query, State},
     http::StatusCode,
-    Json,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::api::ApiError;
 use crate::app::AppState;
-use crate::clients::{parse_ip, ClientRegistry};
+use crate::clients::{ClientRegistry, parse_ip};
 use crate::dns::types::QueryEntry;
 use crate::storage::QueryFilter;
 

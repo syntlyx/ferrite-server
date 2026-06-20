@@ -289,7 +289,7 @@ async fn neighbor_mirror_loop(state: app::AppState) {
 async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
         let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
         tokio::select! {

@@ -1,18 +1,18 @@
 use std::time::{Duration, Instant};
 
 use argon2::{
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
 use axum::{
+    Json,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    Json,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::api::ApiError;
 use crate::app::AppState;
@@ -109,10 +109,10 @@ pub fn extract_session_token(headers: &HeaderMap) -> Option<String> {
     if let Some(v) = headers.get("x-session-token").and_then(|v| v.to_str().ok()) {
         return Some(v.to_string());
     }
-    if let Some(v) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        if let Some(token) = v.strip_prefix("Bearer ") {
-            return Some(token.to_string());
-        }
+    if let Some(v) = headers.get("authorization").and_then(|v| v.to_str().ok())
+        && let Some(token) = v.strip_prefix("Bearer ")
+    {
+        return Some(token.to_string());
     }
     None
 }

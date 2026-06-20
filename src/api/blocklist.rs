@@ -1,10 +1,10 @@
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
-    Json,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::api::ApiError;
 use crate::app::AppState;
@@ -184,13 +184,15 @@ mod tests {
         let _ = del_whitelist(State(state.clone()), Path("ads.example.com".to_string()))
             .await
             .unwrap();
-        assert!(state
-            .inner
-            .storage
-            .load_custom_entries()
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            state
+                .inner
+                .storage
+                .load_custom_entries()
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(!state.inner.blocklist.is_whitelisted("ads.example.com"));
 
         drop(state);

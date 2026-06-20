@@ -1,8 +1,8 @@
 [package]
 name = "ferrite"
 version = "0.1.4"
-edition = "2021"
-rust-version = "1.88"
+edition = "2024"
+rust-version = "1.96"
 
 [[bin]]
 name = "ferrite"
@@ -68,8 +68,13 @@ dirs = "6"        # locate config & data directories
 flate2 = "1"      # gzip decompression
 tar = "0.4"       # tar extraction (server binary + web bundle)
 
+# ── WireGuard egress (userspace, in-process; no TUN / no root) ────────────────
+boringtun = { version = "0.7.1", default-features = false }  # WireGuard protocol (Noise handshake + transport crypto), no netstack
+smoltcp = { version = "0.13", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }  # userspace TCP/IP stack over the tunnel
+
 # ── Misc ──────────────────────────────────────────────────────────────────────
 async-trait = "0.1"  # async methods in the Storage trait
+base64 = "0.22"
 
 [dev-dependencies]
 tower = "0.5"

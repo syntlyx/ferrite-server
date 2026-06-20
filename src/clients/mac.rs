@@ -81,28 +81,25 @@ pub fn parse_ipv4_for_mac(text: &str, target_mac: [u8; 6]) -> Option<Ipv4Addr> {
 
         // macOS: `? (192.168.1.5) at aa:bb:cc:dd:ee:ff on en0 ...`
         if tokens.first() == Some(&"?") && tokens.len() >= 4 {
-            if let Some(mac) = parse_mac(tokens[3]) {
-                if mac == target_mac {
-                    let ip_s = tokens[1].trim_start_matches('(').trim_end_matches(')');
-                    if let Ok(ip) = ip_s.parse::<Ipv4Addr>() {
-                        return Some(ip);
-                    }
+            if let Some(mac) = parse_mac(tokens[3])
+                && mac == target_mac
+            {
+                let ip_s = tokens[1].trim_start_matches('(').trim_end_matches(')');
+                if let Ok(ip) = ip_s.parse::<Ipv4Addr>() {
+                    return Some(ip);
                 }
             }
             continue;
         }
 
         // Linux: `192.168.1.5 dev eth0 lladdr aa:bb:cc:dd:ee:ff REACHABLE`
-        if let Some(pos) = tokens.iter().position(|&t| t == "lladdr") {
-            if let Some(&mac_str) = tokens.get(pos + 1) {
-                if let Some(mac) = parse_mac(mac_str) {
-                    if mac == target_mac {
-                        if let Ok(ip) = tokens[0].parse::<Ipv4Addr>() {
-                            return Some(ip);
-                        }
-                    }
-                }
-            }
+        if let Some(pos) = tokens.iter().position(|&t| t == "lladdr")
+            && let Some(&mac_str) = tokens.get(pos + 1)
+            && let Some(mac) = parse_mac(mac_str)
+            && mac == target_mac
+            && let Ok(ip) = tokens[0].parse::<Ipv4Addr>()
+        {
+            return Some(ip);
         }
     }
     None
@@ -154,11 +151,11 @@ fn parse_neighbor_line(line: &str) -> Option<(IpAddr, [u8; 6])> {
     let mut ip = None;
     let mut mac = None;
     for token in line.split_whitespace() {
-        if mac.is_none() {
-            if let Some(m) = parse_mac_token(token) {
-                mac = Some(m);
-                continue;
-            }
+        if mac.is_none()
+            && let Some(m) = parse_mac_token(token)
+        {
+            mac = Some(m);
+            continue;
         }
         if ip.is_none() {
             ip = parse_ip_token(token);
@@ -214,7 +211,7 @@ async fn ndp_table_text() -> Option<String> {
 }
 
 async fn run(cmd: &str, args: &[&str]) -> Option<String> {
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
     // 500 ms is more than enough for a local ARP/neighbour lookup.
     // Without a cap, a stuck `ip neigh show` would hold a tokio task indefinitely,
     // accumulating across many clients until the runtime is saturated.
@@ -335,7 +332,10 @@ mod tests {
     #[test]
     fn neighbor_line_without_mac_is_skipped() {
         // INCOMPLETE/FAILED neighbour entries carry no link-layer address.
-        assert_eq!(parse_neighbor_line("192.168.1.9 dev eth0  INCOMPLETE"), None);
+        assert_eq!(
+            parse_neighbor_line("192.168.1.9 dev eth0  INCOMPLETE"),
+            None
+        );
     }
 
     #[test]

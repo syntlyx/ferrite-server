@@ -1,12 +1,12 @@
 use std::{net::Ipv4Addr, path::PathBuf};
 
-use axum::{extract::State, Json};
+use axum::{Json, extract::State};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
-use crate::api::auth::hash_password;
 use crate::api::ApiError;
+use crate::api::auth::hash_password;
 use crate::app::AppState;
 use crate::clients::normalize_client_key;
 use crate::config::{UpstreamConfig, ZoneConfig};
@@ -505,14 +505,18 @@ mod tests {
             vec!["192.0.2.10".to_string(), "aa:bb:cc:dd:ee:ff".to_string()]
         );
         assert!(!state.inner.blocklist.blocking_enabled());
-        assert!(state
-            .inner
-            .blocklist
-            .client_bypasses_blocking("192.0.2.10", None));
-        assert!(state
-            .inner
-            .blocklist
-            .client_bypasses_blocking("192.0.2.99", Some("aa:bb:cc:dd:ee:ff")));
+        assert!(
+            state
+                .inner
+                .blocklist
+                .client_bypasses_blocking("192.0.2.10", None)
+        );
+        assert!(
+            state
+                .inner
+                .blocklist
+                .client_bypasses_blocking("192.0.2.99", Some("aa:bb:cc:dd:ee:ff"))
+        );
 
         let saved: Config = toml::from_str(&std::fs::read_to_string(&config_path).unwrap())
             .expect("persisted config should parse");
@@ -621,15 +625,18 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(err
-            .0
-            .to_string()
-            .contains("invalid blocklist_client_bypass"));
+        assert!(
+            err.0
+                .to_string()
+                .contains("invalid blocklist_client_bypass")
+        );
         assert!(state.live_config.read().blocklist.client_bypass.is_empty());
-        assert!(!state
-            .inner
-            .blocklist
-            .client_bypasses_blocking("192.0.2.10", None));
+        assert!(
+            !state
+                .inner
+                .blocklist
+                .client_bypasses_blocking("192.0.2.10", None)
+        );
         assert!(!config_path.exists());
 
         drop(state);

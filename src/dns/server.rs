@@ -195,7 +195,7 @@ async fn handle_tcp_connection(
     src: std::net::SocketAddr,
     state: AppState,
 ) -> anyhow::Result<()> {
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
     const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
     loop {

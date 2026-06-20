@@ -1,9 +1,9 @@
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
-    Json,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::api::ApiError;
 use crate::app::AppState;
@@ -118,13 +118,15 @@ mod tests {
             .unwrap();
 
         // The persisted row must be gone, so it can't resurrect on restart.
-        assert!(state
-            .inner
-            .storage
-            .load_custom_records()
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            state
+                .inner
+                .storage
+                .load_custom_records()
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         drop(state);
         test_support::cleanup_sqlite(&db_path);

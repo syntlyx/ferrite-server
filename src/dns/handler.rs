@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use chrono::Utc;
@@ -155,29 +155,28 @@ pub async fn handle_query(
 
     // ── Step 3: DNS response cache ────────────────────────────────────────
     if let Some((cached, remaining_ttl)) = state.dns_cache.get_with_remaining(&name, qtype) {
-        if filtering_enabled {
-            if let Some(blocked_cname) =
+        if filtering_enabled
+            && let Some(blocked_cname) =
                 cname_blocked_target(&cached.bytes, &name, &state.blocklist)
-            {
-                tracing::debug!("CNAME-blocked from cache: {} → {}", name, blocked_cname);
-                if !log_ignored {
-                    let elapsed = start.elapsed().as_millis() as u32;
-                    emit(
-                        &state,
-                        &query_tx,
-                        make_entry(
-                            &name,
-                            qtype,
-                            &client_ip,
-                            QueryStatus::Blocked,
-                            elapsed,
-                            Some(format!("cname:{}", blocked_cname)),
-                            3,
-                        ),
-                    );
-                }
-                return Ok(build_nxdomain(&query));
+        {
+            tracing::debug!("CNAME-blocked from cache: {} → {}", name, blocked_cname);
+            if !log_ignored {
+                let elapsed = start.elapsed().as_millis() as u32;
+                emit(
+                    &state,
+                    &query_tx,
+                    make_entry(
+                        &name,
+                        qtype,
+                        &client_ip,
+                        QueryStatus::Blocked,
+                        elapsed,
+                        Some(format!("cname:{}", blocked_cname)),
+                        3,
+                    ),
+                );
             }
+            return Ok(build_nxdomain(&query));
         }
 
         if !log_ignored {
@@ -225,28 +224,28 @@ pub async fn handle_query(
     // ── Step 5: CNAME inspection ───────────────────────────────────────────
     // Walk the answer section. If any CNAME target is blocked (and the queried
     // name is not whitelisted), return NXDOMAIN without caching.
-    if rcode == 0 && filtering_enabled {
-        if let Some(blocked_cname) = cname_blocked_target(&response_bytes, &name, &state.blocklist)
-        {
-            tracing::debug!("CNAME-blocked: {} → {}", name, blocked_cname);
-            if !log_ignored {
-                let elapsed = start.elapsed().as_millis() as u32;
-                emit(
-                    &state,
-                    &query_tx,
-                    make_entry(
-                        &name,
-                        qtype,
-                        &client_ip,
-                        QueryStatus::Blocked,
-                        elapsed,
-                        Some(format!("cname:{}", blocked_cname)),
-                        3,
-                    ),
-                );
-            }
-            return Ok(build_nxdomain(&query));
+    if rcode == 0
+        && filtering_enabled
+        && let Some(blocked_cname) = cname_blocked_target(&response_bytes, &name, &state.blocklist)
+    {
+        tracing::debug!("CNAME-blocked: {} → {}", name, blocked_cname);
+        if !log_ignored {
+            let elapsed = start.elapsed().as_millis() as u32;
+            emit(
+                &state,
+                &query_tx,
+                make_entry(
+                    &name,
+                    qtype,
+                    &client_ip,
+                    QueryStatus::Blocked,
+                    elapsed,
+                    Some(format!("cname:{}", blocked_cname)),
+                    3,
+                ),
+            );
         }
+        return Ok(build_nxdomain(&query));
     }
 
     // ── Step 6: Cache NOERROR responses ───────────────────────────────────

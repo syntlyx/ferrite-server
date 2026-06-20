@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 
 use crate::app::AppState;
-use crate::clients::{parse_ip, ClientRegistry};
+use crate::clients::{ClientRegistry, parse_ip};
 use crate::dns::types::QueryEntry;
 
 const BATCH_SIZE: usize = 500;
@@ -99,20 +99,23 @@ async fn flush_batch(state: &AppState, batch: &mut Vec<QueryEntry>) {
     // This is best-effort and never delays the write.
     let mut seen: HashSet<&str> = HashSet::new();
     for entry in &to_write {
-        if seen.insert(entry.client_ip.as_str()) {
-            if let Some(ip) = parse_ip(&entry.client_ip) {
-                ClientRegistry::trigger_resolve(&state.inner.client_registry, ip);
-            }
+        if seen.insert(entry.client_ip.as_str())
+            && let Some(ip) = parse_ip(&entry.client_ip)
+        {
+            ClientRegistry::trigger_resolve(&state.inner.client_registry, ip);
         }
     }
 
-    if let Err(e) = state.inner.storage.write_batch(&to_write).await {
-        tracing::error!(
-            "failed to write query batch ({} entries): {}",
-            to_write.len(),
-            e
-        );
-    } else {
-        tracing::debug!("flushed {} query entries to storage", to_write.len());
+    match state.inner.storage.write_batch(&to_write).await {
+        Err(e) => {
+            tracing::error!(
+                "failed to write query batch ({} entries): {}",
+                to_write.len(),
+                e
+            );
+        }
+        _ => {
+            tracing::debug!("flushed {} query entries to storage", to_write.len());
+        }
     }
 }

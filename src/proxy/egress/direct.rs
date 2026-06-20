@@ -20,7 +20,7 @@ use tokio::time::timeout;
 use crate::error::{FeriteError, Result};
 use crate::upstream::ZoneRouter;
 
-use super::{enable_keepalive, EgressConn};
+use super::{EgressConn, enable_keepalive};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 

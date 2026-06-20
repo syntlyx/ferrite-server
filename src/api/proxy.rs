@@ -7,8 +7,8 @@
 
 use std::collections::HashSet;
 
-use axum::{extract::State, Json};
-use serde_json::{json, Value};
+use axum::{Json, extract::State};
+use serde_json::{Value, json};
 
 use crate::api::ApiError;
 use crate::app::AppState;
@@ -140,11 +140,11 @@ fn redacted(mut p: ProxyConfig) -> ProxyConfig {
 
 fn persist(state: &AppState) -> Option<String> {
     let cfg = state.live_config.read().clone();
-    let path = state
-        .config_path
-        .as_ref()
-        .clone()
-        .or_else(|| crate::config::Config::config_candidates().into_iter().next())?;
+    let path = state.config_path.as_ref().clone().or_else(|| {
+        crate::config::Config::config_candidates()
+            .into_iter()
+            .next()
+    })?;
     match cfg.save(&path) {
         Ok(()) => {
             tracing::info!("proxy config saved to {}", path.display());
@@ -165,8 +165,8 @@ fn bad(msg: &str) -> ApiError {
 mod tests {
     use crate::config::{EgressConfig, RuleConfig};
     use crate::test_support;
-    use axum::extract::State;
     use axum::Json;
+    use axum::extract::State;
 
     use super::*;
 
@@ -184,6 +184,7 @@ mod tests {
             port: if kind == "socks5" { Some(1080) } else { None },
             username: None,
             password: None,
+            config: None,
         }
     }
 
@@ -208,7 +209,9 @@ mod tests {
             }],
             ..ProxyConfig::default()
         };
-        let err = put_proxy(State(state.clone()), Json(cfg)).await.unwrap_err();
+        let err = put_proxy(State(state.clone()), Json(cfg))
+            .await
+            .unwrap_err();
         assert!(matches!(err.0, FeriteError::Config(_)));
         drop(state);
         test_support::cleanup_sqlite(&db);

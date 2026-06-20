@@ -340,14 +340,14 @@ fn build_zones(net: &NetworkInfo, search: &[String]) -> Vec<ZoneConfig> {
     let mut zones: Vec<ZoneConfig> = vec![];
 
     // IPv4 reverse zone.
-    if let Some(ip) = net.local_ipv4 {
-        if ip.is_private() {
-            push_unique(
-                &mut zones,
-                ipv4_reverse_zone(ip, net.ipv4_prefix),
-                &upstream,
-            );
-        }
+    if let Some(ip) = net.local_ipv4
+        && ip.is_private()
+    {
+        push_unique(
+            &mut zones,
+            ipv4_reverse_zone(ip, net.ipv4_prefix),
+            &upstream,
+        );
     }
 
     // IPv6 reverse zones (one per distinct zone name).

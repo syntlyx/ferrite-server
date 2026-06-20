@@ -41,14 +41,14 @@ pub fn parse_http_host(buf: &[u8]) -> HostResult {
     }
 
     for line in lines {
-        if let Some((name, value)) = line.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("host") {
-                let host = host_without_port(value);
-                if host.is_empty() {
-                    return HostResult::NotFound;
-                }
-                return HostResult::Found(host);
+        if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("host")
+        {
+            let host = host_without_port(value);
+            if host.is_empty() {
+                return HostResult::NotFound;
             }
+            return HostResult::Found(host);
         }
     }
     HostResult::NotFound
@@ -83,9 +83,7 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]
@@ -127,7 +125,10 @@ mod tests {
     #[test]
     fn non_http_is_not_found() {
         // A TLS ClientHello arriving on :80, or random bytes.
-        assert_eq!(parse_http_host(b"\x16\x03\x01\x00\x10rubbish\r\n\r\n"), HostResult::NotFound);
+        assert_eq!(
+            parse_http_host(b"\x16\x03\x01\x00\x10rubbish\r\n\r\n"),
+            HostResult::NotFound
+        );
     }
 
     #[test]

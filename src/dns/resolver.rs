@@ -1,7 +1,7 @@
 use hickory_resolver::{
+    TokioResolver,
     config::{ResolverConfig, ResolverOpts},
     proto::rr::RData,
-    TokioResolver,
 };
 use std::net::IpAddr;
 

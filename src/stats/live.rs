@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::dns::types::{QueryEntry, QueryStatus};
 use crate::stats::recent::QueryRingBuffer;

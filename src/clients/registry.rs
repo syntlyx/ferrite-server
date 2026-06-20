@@ -6,7 +6,7 @@ use crate::error::Result;
 use crate::storage::Storage;
 use crate::upstream::ZoneRouter;
 
-use super::{format_mac, parse_ip, parse_mac, unmap_v4, ClientRegistry, DashMap, DashSet};
+use super::{ClientRegistry, DashMap, DashSet, format_mac, parse_ip, parse_mac, unmap_v4};
 
 impl ClientRegistry {
     pub async fn new(upstream: Arc<ZoneRouter>, storage: Arc<dyn Storage>) -> Arc<Self> {
@@ -108,10 +108,10 @@ impl ClientRegistry {
     }
 
     pub(super) fn mac_for_ip(&self, ip: IpAddr) -> Option<[u8; 6]> {
-        if let IpAddr::V6(v6) = ip {
-            if let Some(mac) = super::mac::extract_eui64_mac(v6) {
-                return Some(mac);
-            }
+        if let IpAddr::V6(v6) = ip
+            && let Some(mac) = super::mac::extract_eui64_mac(v6)
+        {
+            return Some(mac);
         }
         self.ip_to_mac.get(&ip).map(|e| *e)
     }
@@ -133,16 +133,16 @@ impl ClientRegistry {
             if registry.mac_aliases.contains_key(&mac) {
                 return;
             }
-            if let Some(entry) = registry.mac_to_name.get(&mac) {
-                if Instant::now() < entry.1 {
-                    return;
-                }
-            }
-        }
-        if let Some(e) = registry.ptr_cache.get(&ip) {
-            if Instant::now() < e.expires_at {
+            if let Some(entry) = registry.mac_to_name.get(&mac)
+                && Instant::now() < entry.1
+            {
                 return;
             }
+        }
+        if let Some(e) = registry.ptr_cache.get(&ip)
+            && Instant::now() < e.expires_at
+        {
+            return;
         }
 
         if !registry.in_flight.insert(ip) {
@@ -218,10 +218,10 @@ impl ClientRegistry {
         if self.ip_aliases.contains_key(&ip) {
             return true;
         }
-        if let Some(mac) = self.mac_for_ip(ip) {
-            if self.mac_aliases.contains_key(&mac) {
-                return true;
-            }
+        if let Some(mac) = self.mac_for_ip(ip)
+            && self.mac_aliases.contains_key(&mac)
+        {
+            return true;
         }
         false
     }

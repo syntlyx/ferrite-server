@@ -5,8 +5,8 @@
 /// duplicating that logic.
 use hickory_proto::op::{Edns, Message, ResponseCode};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
-use hickory_resolver::net::{DnsError, NetError};
 use hickory_resolver::TokioResolver;
+use hickory_resolver::net::{DnsError, NetError};
 
 use crate::error::{FeriteError, Result};
 

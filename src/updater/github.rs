@@ -1,4 +1,4 @@
-use reqwest::{redirect::Policy, Client, RequestBuilder};
+use reqwest::{Client, RequestBuilder, redirect::Policy};
 use serde::Deserialize;
 
 use crate::error::{FeriteError, Result};

@@ -188,11 +188,11 @@ pub fn parse_adblock(content: &str) -> (Vec<String>, AdblockStats) {
             // Skip referrer-scoped rules (`$domain=…`): they only apply when the
             // request originates from specific sites, so a global DNS block of
             // the target domain would over-block.
-            if let Some(opts) = options {
-                if opts.split(',').any(|o| o.trim().starts_with("domain=")) {
-                    scoped_skipped += 1;
-                    continue;
-                }
+            if let Some(opts) = options
+                && opts.split(',').any(|o| o.trim().starts_with("domain="))
+            {
+                scoped_skipped += 1;
+                continue;
             }
 
             match adblock_rule_domain(pattern) {

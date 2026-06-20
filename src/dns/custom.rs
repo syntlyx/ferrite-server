@@ -134,7 +134,7 @@ fn parse_record(cfg: &CustomRecordConfig) -> Result<CustomRecord> {
             return Err(FeriteError::Config(format!(
                 "unsupported record type '{}'",
                 other
-            )))
+            )));
         }
     };
 

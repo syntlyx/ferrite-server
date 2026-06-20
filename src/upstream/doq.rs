@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hickory_resolver::{
-    config::{NameServerConfig, ResolverConfig, ResolverOpts},
     TokioResolver,
+    config::{NameServerConfig, ResolverConfig, ResolverOpts},
 };
 
 use crate::error::{FeriteError, Result};

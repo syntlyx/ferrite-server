@@ -15,9 +15,9 @@ use tokio::time::timeout;
 
 use crate::app::AppState;
 
-use super::egress::{direct_connect, enable_keepalive, EgressConn};
-use super::http_host::{parse_http_host, HostResult};
-use super::sni::{parse_sni, SniResult};
+use super::egress::{EgressConn, direct_connect, enable_keepalive};
+use super::http_host::{HostResult, parse_http_host};
+use super::sni::{SniResult, parse_sni};
 
 const PEEK_TIMEOUT: Duration = Duration::from_secs(5);
 const PEEK_CAP: usize = 16 * 1024;
@@ -65,11 +65,19 @@ pub async fn run(state: AppState) {
     let mut handles = Vec::new();
     if let Some(listener) = https {
         tracing::info!("proxy: TLS/SNI listener on 0.0.0.0:{https_port}");
-        handles.push(tokio::spawn(accept_loop(listener, state.clone(), Protocol::Tls)));
+        handles.push(tokio::spawn(accept_loop(
+            listener,
+            state.clone(),
+            Protocol::Tls,
+        )));
     }
     if let Some(listener) = http {
         tracing::info!("proxy: HTTP listener on 0.0.0.0:{http_port}");
-        handles.push(tokio::spawn(accept_loop(listener, state.clone(), Protocol::Http)));
+        handles.push(tokio::spawn(accept_loop(
+            listener,
+            state.clone(),
+            Protocol::Http,
+        )));
     }
     for h in handles {
         let _ = h.await;

@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 

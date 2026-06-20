@@ -1,17 +1,17 @@
 use std::collections::HashMap;
 
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::ApiError;
 use crate::app::AppState;
-use crate::clients::{format_mac, parse_ip, parse_mac, ClientRegistry};
+use crate::clients::{ClientRegistry, format_mac, parse_ip, parse_mac};
 
 #[derive(Deserialize, Default)]
 pub struct ListClientsParams {
@@ -71,17 +71,11 @@ pub async fn list_clients(
         // The device bypasses filtering if any of its IPs (or the token itself,
         // when no IP is known) is exempt.
         let blocking_bypassed = if info.ips.is_empty() {
-            state
-                .inner
-                .blocklist
-                .client_bypasses_blocking(device, mac0)
+            state.inner.blocklist.client_bypasses_blocking(device, mac0)
         } else {
-            info.ips.iter().any(|ip| {
-                state
-                    .inner
-                    .blocklist
-                    .client_bypasses_blocking(ip, mac0)
-            })
+            info.ips
+                .iter()
+                .any(|ip| state.inner.blocklist.client_bypasses_blocking(ip, mac0))
         };
 
         let group = groups.entry(name.clone()).or_insert_with(|| ClientGroup {

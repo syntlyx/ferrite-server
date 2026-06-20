@@ -6,7 +6,7 @@ use hickory_proto::rr::{DNSClass, Name, RData, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 
 use super::{
-    ip_to_ptr_domain, is_link_local_v6, mac, mdns, ClientRegistry, PtrEntry, MISS_TTL, RESOLVE_TTL,
+    ClientRegistry, MISS_TTL, PtrEntry, RESOLVE_TTL, ip_to_ptr_domain, is_link_local_v6, mac, mdns,
 };
 
 impl ClientRegistry {
@@ -30,10 +30,10 @@ impl ClientRegistry {
     }
 
     async fn resolve(&self, ip: IpAddr, mac: Option<[u8; 6]>) -> Option<String> {
-        if let IpAddr::V6(v6) = ip {
-            if is_link_local_v6(v6) {
-                return self.resolve_link_local(v6).await;
-            }
+        if let IpAddr::V6(v6) = ip
+            && is_link_local_v6(v6)
+        {
+            return self.resolve_link_local(v6).await;
         }
         self.resolve_normal(ip, mac).await
     }
@@ -48,12 +48,11 @@ impl ClientRegistry {
             .or_else(|| super::mac::extract_eui64_mac(v6));
 
         // Fast path: fresh MAC cache hit.
-        if let Some(m) = device_mac {
-            if let Some(entry) = self.mac_to_name.get(&m) {
-                if Instant::now() < entry.1 {
-                    return Some(entry.0.clone());
-                }
-            }
+        if let Some(m) = device_mac
+            && let Some(entry) = self.mac_to_name.get(&m)
+            && Instant::now() < entry.1
+        {
+            return Some(entry.0.clone());
         }
 
         // mDNS directly on the link-local address.
@@ -135,10 +134,10 @@ impl ClientRegistry {
     /// currently offline we fall back to the last known binding so a learned
     /// mapping is never lost.
     async fn learn_ip_mac(&self, ip: IpAddr) -> Option<[u8; 6]> {
-        if let IpAddr::V6(v6) = ip {
-            if let Some(m) = super::mac::extract_eui64_mac(v6) {
-                return Some(m);
-            }
+        if let IpAddr::V6(v6) = ip
+            && let Some(m) = super::mac::extract_eui64_mac(v6)
+        {
+            return Some(m);
         }
         match mac::lookup_mac_for_ip(ip).await {
             Some(m) => {
@@ -156,7 +155,11 @@ impl ClientRegistry {
     /// Cache `name` for `mac` (in-memory, with TTL) and persist it as the device's
     /// last-known hostname. The DB write is skipped when the name is unchanged.
     pub(super) async fn cache_mac(&self, mac: [u8; 6], name: &str) {
-        let changed = self.mac_to_name.get(&mac).map(|e| e.0 != name).unwrap_or(true);
+        let changed = self
+            .mac_to_name
+            .get(&mac)
+            .map(|e| e.0 != name)
+            .unwrap_or(true);
         self.mac_to_name
             .insert(mac, (name.to_owned(), Instant::now() + RESOLVE_TTL));
         if changed {
@@ -221,10 +224,10 @@ fn parse_ptr_response(bytes: &[u8]) -> Option<String> {
 
 fn normalize_hostname(name: &str) -> String {
     for suffix in super::LOCAL_SUFFIXES {
-        if let Some(host) = name.strip_suffix(suffix) {
-            if !host.is_empty() {
-                return host.to_owned();
-            }
+        if let Some(host) = name.strip_suffix(suffix)
+            && !host.is_empty()
+        {
+            return host.to_owned();
         }
     }
     name.to_owned()

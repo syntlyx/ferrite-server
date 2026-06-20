@@ -136,19 +136,25 @@ mod tests {
         // egress "a"=idx0, "b"=idx1.
         let compiled = compile(
             &[
-                rule("google.com", "a"),        // exact apex (+hierarchy)
-                rule("*.google.com", "a"),       // wildcard subdomains
-                rule("mail.google.com", "b"),    // exact, most labels → wins for itself
+                rule("google.com", "a"),      // exact apex (+hierarchy)
+                rule("*.google.com", "a"),    // wildcard subdomains
+                rule("mail.google.com", "b"), // exact, most labels → wins for itself
             ],
             &idx(),
         );
         // `find` over the most-specific-first ordering returns the winning rule.
         // mail.google.com (3 exact labels) beats the apex and the wildcard.
-        let mail = compiled.iter().find(|r| r.matches("mail.google.com")).unwrap();
+        let mail = compiled
+            .iter()
+            .find(|r| r.matches("mail.google.com"))
+            .unwrap();
         assert_eq!(mail.egress_idx, 1);
         // A generic subdomain: exact apex (hierarchy, specificity 5) beats the
         // wildcard (specificity 4) → egress "a".
-        let docs = compiled.iter().find(|r| r.matches("docs.google.com")).unwrap();
+        let docs = compiled
+            .iter()
+            .find(|r| r.matches("docs.google.com"))
+            .unwrap();
         assert_eq!(docs.egress_idx, 0);
     }
 

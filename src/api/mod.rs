@@ -15,9 +15,8 @@ pub mod update;
 pub use error::ApiError;
 
 use axum::{
-    middleware as axum_middleware,
+    Router, middleware as axum_middleware,
     routing::{delete, get, patch, post, put},
-    Router,
 };
 use tower_http::trace::TraceLayer;
 

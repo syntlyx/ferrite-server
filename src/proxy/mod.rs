@@ -31,7 +31,7 @@ use tokio::sync::Semaphore;
 
 use crate::blocklist::Blocklist;
 use crate::config::ProxyConfig;
-use crate::dns::types::{qtype as qt, DnsResponse};
+use crate::dns::types::{DnsResponse, qtype as qt};
 use crate::upstream::ZoneRouter;
 
 use egress::Egress;
@@ -131,19 +131,31 @@ impl ProxyState {
         let rule = snap.route(name)?;
         let egress_id = snap.egresses[rule.egress_idx].id().to_string();
         let response = synth_response(query, qtype, snap.advertise_ipv4, snap.advertise_ipv6);
-        Some(Intercept { response, egress_id })
+        Some(Intercept {
+            response,
+            egress_id,
+        })
     }
 
     pub fn is_egress_healthy(&self, id: &str) -> bool {
-        self.breakers.get(id).map(|b| b.is_healthy()).unwrap_or(true)
+        self.breakers
+            .get(id)
+            .map(|b| b.is_healthy())
+            .unwrap_or(true)
     }
 
     fn note_success(&self, id: &str) {
-        self.breakers.entry(id.to_string()).or_default().record_success();
+        self.breakers
+            .entry(id.to_string())
+            .or_default()
+            .record_success();
     }
 
     fn note_failure(&self, id: &str) {
-        self.breakers.entry(id.to_string()).or_default().record_failure();
+        self.breakers
+            .entry(id.to_string())
+            .or_default()
+            .record_failure();
     }
 }
 
@@ -165,7 +177,9 @@ fn build_snapshot(cfg: &ProxyConfig, enabled: bool, upstream: &Arc<ZoneRouter>) 
     let rules = rules::compile(&cfg.rules, &by_id);
     Snapshot {
         enabled,
-        advertise_ipv4: cfg.advertise_ipv4.or_else(crate::setup::local_ipv4_for_internet),
+        advertise_ipv4: cfg
+            .advertise_ipv4
+            .or_else(crate::setup::local_ipv4_for_internet),
         advertise_ipv6: cfg.advertise_ipv6,
         egresses,
         rules,
@@ -273,6 +287,7 @@ mod tests {
                 port: None,
                 username: None,
                 password: None,
+                config: None,
             }],
             rules: vec![RuleConfig {
                 pattern: "*.example.com".to_string(),
@@ -287,7 +302,10 @@ mod tests {
     fn query(name: &str, rt: RecordType) -> Message {
         let mut m = Message::new(0xABCD, MessageType::Query, OpCode::Query);
         m.metadata.recursion_desired = true;
-        m.add_query(Query::query(Name::from_str(&format!("{name}.")).unwrap(), rt));
+        m.add_query(Query::query(
+            Name::from_str(&format!("{name}.")).unwrap(),
+            rt,
+        ));
         m
     }
 
@@ -312,9 +330,11 @@ mod tests {
         let proxy = state(true);
         let bl = blocklist(&[]);
         let q = query("other.test", RecordType::A);
-        assert!(proxy
-            .maybe_intercept(&q, "other.test", qtype::A, &bl)
-            .is_none());
+        assert!(
+            proxy
+                .maybe_intercept(&q, "other.test", qtype::A, &bl)
+                .is_none()
+        );
     }
 
     #[test]
@@ -322,9 +342,11 @@ mod tests {
         let proxy = state(false);
         let bl = blocklist(&[]);
         let q = query("www.example.com", RecordType::A);
-        assert!(proxy
-            .maybe_intercept(&q, "www.example.com", qtype::A, &bl)
-            .is_none());
+        assert!(
+            proxy
+                .maybe_intercept(&q, "www.example.com", qtype::A, &bl)
+                .is_none()
+        );
     }
 
     #[test]
@@ -332,9 +354,11 @@ mod tests {
         let proxy = state(true);
         let bl = blocklist(&["example.com"]);
         let q = query("www.example.com", RecordType::A);
-        assert!(proxy
-            .maybe_intercept(&q, "www.example.com", qtype::A, &bl)
-            .is_none());
+        assert!(
+            proxy
+                .maybe_intercept(&q, "www.example.com", qtype::A, &bl)
+                .is_none()
+        );
     }
 
     #[test]

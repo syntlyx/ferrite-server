@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 
 use crate::app::AppState;
 use crate::error::Result;
-use crate::snapshot::{DnsCacheEntry, StateSnapshot, SNAPSHOT_MAGIC, SNAPSHOT_VERSION};
+use crate::snapshot::{DnsCacheEntry, SNAPSHOT_MAGIC, SNAPSHOT_VERSION, StateSnapshot};
 
 /// Build a `StateSnapshot` from the current application state.
 pub fn build_snapshot(state: &AppState) -> StateSnapshot {

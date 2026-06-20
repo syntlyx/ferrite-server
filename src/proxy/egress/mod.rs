@@ -12,8 +12,9 @@
 
 mod direct;
 mod socks5;
+mod wireguard;
 
-pub use direct::{direct_connect, DirectEgress};
+pub use direct::{DirectEgress, direct_connect};
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -6,7 +6,7 @@ use hickory_proto::serialize::binary::BinDecodable;
 
 use crate::config::ZoneConfig;
 use crate::error::{FeriteError, Result};
-use crate::upstream::{plain::PlainResolver, UpstreamPool};
+use crate::upstream::{UpstreamPool, plain::PlainResolver};
 
 /// Routes DNS queries to zone-specific upstreams or the default pool.
 ///

@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwap;
 use fst::{Map, MapBuilder};
@@ -9,7 +9,7 @@ use parking_lot::RwLock;
 use regex::Regex;
 
 use crate::blocklist::cache::BlocklistCache;
-use crate::blocklist::{refresh, AdblockStats};
+use crate::blocklist::{AdblockStats, refresh};
 use crate::clients::normalize_client_key;
 use crate::config::{BlocklistConfig, ListConfig};
 use crate::error::{FeriteError, Result};
@@ -669,9 +669,10 @@ mod tests {
         assert!(blocklist.is_blocked("blocked.test"));
 
         let err = blocklist.refresh(false).await.unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("all enabled blocklists failed and no cached domains are available"));
+        assert!(
+            err.to_string()
+                .contains("all enabled blocklists failed and no cached domains are available")
+        );
         assert!(blocklist.is_blocked("blocked.test"));
 
         let persisted = std::fs::read(fst_path).unwrap();

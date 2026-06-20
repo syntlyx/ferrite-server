@@ -1,10 +1,10 @@
 use axum::{
+    Json,
     body::Body,
     extract::State,
     http::{Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde_json::json;
 use subtle::ConstantTimeEq;
@@ -43,12 +43,11 @@ pub async fn require_api_key(
     }
 
     // 2. Check legacy API key.
-    if let Some(expected_key) = &api_key {
-        if let Some(provided) = extract_api_key(headers) {
-            if provided.as_bytes().ct_eq(expected_key.as_bytes()).into() {
-                return next.run(request).await;
-            }
-        }
+    if let Some(expected_key) = &api_key
+        && let Some(provided) = extract_api_key(headers)
+        && provided.as_bytes().ct_eq(expected_key.as_bytes()).into()
+    {
+        return next.run(request).await;
     }
 
     unauthorized()
@@ -58,10 +57,10 @@ fn extract_api_key(headers: &axum::http::HeaderMap) -> Option<String> {
     if let Some(v) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
         return Some(v.to_string());
     }
-    if let Some(v) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        if let Some(token) = v.strip_prefix("Bearer ") {
-            return Some(token.to_string());
-        }
+    if let Some(v) = headers.get("authorization").and_then(|v| v.to_str().ok())
+        && let Some(token) = v.strip_prefix("Bearer ")
+    {
+        return Some(token.to_string());
     }
     None
 }

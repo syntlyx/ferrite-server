@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::{mpsc, Notify, Semaphore};
+use tokio::sync::{Notify, Semaphore, mpsc};
 
 use crate::blocklist::Blocklist;
 use crate::clients::ClientRegistry;
@@ -13,8 +13,8 @@ use crate::dns::cache::DnsCache;
 use crate::dns::custom::CustomRecords;
 use crate::dns::types::QueryEntry;
 use crate::error::Result;
-use crate::stats::live::LiveStats;
 use crate::stats::CpuSampler;
+use crate::stats::live::LiveStats;
 use crate::storage::{SqliteStorage, Storage};
 use crate::upstream::{UpstreamPool, ZoneRouter};
 
@@ -263,7 +263,8 @@ impl AppState {
         // Selective routing / proxy. Egresses resolve real hosts through this
         // same upstream pool (never the OS resolver, which would loop back into
         // ferrite's own DNS for routed names).
-        let proxy = crate::proxy::ProxyState::from_config(&config.proxy, Arc::clone(&upstream_pool));
+        let proxy =
+            crate::proxy::ProxyState::from_config(&config.proxy, Arc::clone(&upstream_pool));
 
         // Query channel
         let (query_tx, query_rx) = mpsc::channel(QUERY_CHANNEL_CAPACITY);

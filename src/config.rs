@@ -271,7 +271,7 @@ pub struct EgressConfig {
     pub name: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// `"direct"` | `"socks5"` (more kinds in later releases).
+    /// `"direct"` | `"socks5"` | `"wireguard"`.
     pub kind: String,
     // ── socks5 fields ──
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -282,6 +282,10 @@ pub struct EgressConfig {
     pub username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    // ── wireguard field ──
+    /// Raw WireGuard `.conf` text (`[Interface]`/`[Peer]`) pasted in the web UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<String>,
 }
 
 /// Maps a domain pattern to an egress. `pattern` is an exact domain (matches the
@@ -309,7 +313,10 @@ impl ProxyConfig {
                 continue;
             }
             if !seen.insert(e.id.clone()) {
-                tracing::warn!("proxy: duplicate egress id '{}', keeping last definition", e.id);
+                tracing::warn!(
+                    "proxy: duplicate egress id '{}', keeping last definition",
+                    e.id
+                );
                 continue;
             }
             e.name = if e.name.trim().is_empty() {
@@ -674,7 +681,10 @@ mod tests {
 
         assert!(cfg.proxy.enabled);
         assert_eq!(cfg.proxy.http_port, 8080);
-        assert_eq!(cfg.proxy.advertise_ipv4.unwrap().to_string(), "192.168.1.10");
+        assert_eq!(
+            cfg.proxy.advertise_ipv4.unwrap().to_string(),
+            "192.168.1.10"
+        );
         assert_eq!(cfg.proxy.egresses.len(), 1);
         // id lowercased, name preserved.
         assert_eq!(cfg.proxy.egresses[0].id, "work");

@@ -2,15 +2,15 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
-    extract::{Query, State},
     Json,
+    extract::{Query, State},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::api::ApiError;
 use crate::app::AppState;
-use crate::clients::{parse_ip, ClientRegistry};
+use crate::clients::{ClientRegistry, parse_ip};
 use crate::dns::types::{QueryEntry, QueryStatus};
 use crate::stats::timeseries::TimeseriesBucket;
 

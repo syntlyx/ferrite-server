@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use crate::error::{FeriteError, Result};
 use crate::updater::checksum;
 use crate::updater::github::{
-    current_platform_target, fetch_latest_release, resolve_asset_sha256, update_available,
-    with_release_auth, HTTP_CLIENT, RELEASE_OWNER, RELEASE_REPO_SERVER,
+    HTTP_CLIENT, RELEASE_OWNER, RELEASE_REPO_SERVER, current_platform_target, fetch_latest_release,
+    resolve_asset_sha256, update_available, with_release_auth,
 };
 
 /// Information about an available update.
@@ -233,9 +233,10 @@ mod tests {
     fn apply_requires_a_verified_checksum() {
         let err = require_verified_checksum(None).unwrap_err();
         assert!(matches!(err, FeriteError::Update(_)));
-        assert!(err
-            .to_string()
-            .contains("refusing to apply update without a verified SHA-256 checksum"));
+        assert!(
+            err.to_string()
+                .contains("refusing to apply update without a verified SHA-256 checksum")
+        );
 
         // Blank/whitespace-only values are treated as absent.
         assert!(require_verified_checksum(Some("   ")).is_err());

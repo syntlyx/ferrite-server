@@ -113,10 +113,10 @@ pub fn normalize_client_key(s: &str) -> Option<String> {
 
 /// Convert IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to plain IPv4.
 pub fn unmap_v4(ip: IpAddr) -> IpAddr {
-    if let IpAddr::V6(v6) = ip {
-        if let Some(v4) = v6.to_ipv4_mapped() {
-            return IpAddr::V4(v4);
-        }
+    if let IpAddr::V6(v6) = ip
+        && let Some(v4) = v6.to_ipv4_mapped()
+    {
+        return IpAddr::V4(v4);
     }
     ip
 }
