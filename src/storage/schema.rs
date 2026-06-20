@@ -131,4 +131,27 @@ CREATE TABLE IF NOT EXISTS client_aliases (
     created_at  INTEGER NOT NULL,
     PRIMARY KEY (key, key_type)
 );
+
+-- ---------------------------------------------------------------
+-- Learned device identities (one row per physical device, keyed by MAC).
+-- Persists the last hostname resolved via PTR/mDNS so it survives both an
+-- IP change (DHCP) and a process restart — identity is the device, not the IP.
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS devices (
+    mac         TEXT    PRIMARY KEY,            -- 'aa:bb:cc:dd:ee:ff'
+    hostname    TEXT,                           -- last learned PTR/mDNS name (nullable)
+    last_seen   INTEGER NOT NULL DEFAULT 0
+);
+
+-- ---------------------------------------------------------------
+-- Last-known IP → MAC binding. Lets a historical IP (one a device no longer
+-- holds, hence absent from the live neighbour table) still resolve to its
+-- device. "Last binding wins": a reassigned IP is overwritten on next learn.
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ip_bindings (
+    ip          TEXT    PRIMARY KEY,            -- normalized IP (IPv4-mapped v6 unmapped)
+    mac         TEXT    NOT NULL,
+    last_seen   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ip_bindings_mac ON ip_bindings (mac);
 "#;

@@ -18,6 +18,9 @@ pub struct ListQueriesParams {
     pub to_ts: Option<i64>,
     pub domain: Option<String>,
     pub client_ip: Option<String>,
+    /// Device identity token(s), comma-separated. Returns all of a device's
+    /// queries across every IP it used.
+    pub device: Option<String>,
     pub status: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
@@ -60,25 +63,25 @@ pub async fn list_queries(
         || params.to_ts.is_some()
         || params.domain.is_some()
         || params.client_ip.is_some()
+        || params.device.is_some()
         || params.status.is_some()
         || params.offset.unwrap_or(0) > 0
         || params.before_id.is_some()
         || params.before_ts.is_some();
 
     let entries: Vec<QueryEntry> = if has_filters {
+        let split_csv = |s: String| -> Vec<String> {
+            s.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect()
+        };
         let filter = QueryFilter {
             from_ts: params.from_ts,
             to_ts: params.to_ts,
             domain: params.domain,
-            client_ips: params
-                .client_ip
-                .map(|s| {
-                    s.split(',')
-                        .map(|p| p.trim().to_string())
-                        .filter(|p| !p.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default(),
+            client_ips: params.client_ip.map(split_csv).unwrap_or_default(),
+            devices: params.device.map(split_csv).unwrap_or_default(),
             status: params.status,
             limit: Some(params.limit.unwrap_or(100).min(1000)),
             offset: params.offset,

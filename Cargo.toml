@@ -1,6 +1,6 @@
 [package]
 name = "ferrite"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 rust-version = "1.88"
 
@@ -9,40 +9,67 @@ name = "ferrite"
 path = "src/main.rs"
 
 [dependencies]
+
+# ── Async runtime ─────────────────────────────────────────────────────────────
 tokio = { version = "1", features = ["full"] }
+
+# ── DNS ───────────────────────────────────────────────────────────────────────
+# Upstream resolution (plain + DoT/DoH/DoQ) and DNS wire-format encode/decode.
 hickory-resolver = { version = "0.26.1", features = ["tls-ring", "https-ring", "quic-ring"] }
-hickory-proto = "0.26.1"
-axum = { version = "0.8", features = ["macros"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
-fst = "0.4"
-psl = "2"
-dashmap = "6"
-postcard = { version = "1", default-features = false, features = ["use-std"] }
-async-trait = "0.1"
+hickory-proto = "0.26.1"                              # Message/Query/PTR parsing (dns/, clients/resolver)
+
+# ── HTTP: API server + outbound client ────────────────────────────────────────
+axum = { version = "0.8", features = ["macros"] }     # REST API + serves the web UI
+tower-http = { version = "0.6", features = ["cors", "trace"] }  # CORS + request tracing middleware
+reqwest = { version = "0.13.4", features = ["rustls", "json"], default-features = false }  # blocklist & update downloads
+
+# ── Blocklist engine ──────────────────────────────────────────────────────────
+fst = "0.4"        # finite-state-transducer set — fast exact-domain blocklist lookups
+psl = "2"          # public suffix list (eTLD+1 boundaries)
+regex = "1"        # wildcard / adblock-style rule matching (blocklist/engine)
+
+# ── Storage (SQLite) ──────────────────────────────────────────────────────────
+rusqlite = { version = "0.37", features = ["bundled"] }  # embedded SQLite — query log, rollups, settings
+tokio-rusqlite = "0.7"                                   # async wrapper around rusqlite
+
+# ── Caching & concurrent state ────────────────────────────────────────────────
+dashmap = "6"        # concurrent maps — client registry, sessions, in-flight resolves
+lru = "0.18"         # LRU caches — DNS response cache + blocklist decision cache
+arc-swap = "1"       # lock-free hot-swap of the blocklist FST on reload
+parking_lot = "0.12" # faster Mutex / RwLock
+
+# ── Serialization ─────────────────────────────────────────────────────────────
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-toml = "1"
+serde_json = "1"     # JSON API payloads
+toml = "1"           # config file parsing (config.toml)
+postcard = { version = "1", default-features = false, features = ["use-std"] }  # compact binary state snapshots (snapshot/)
+chrono = { version = "0.4", features = ["serde"] }  # timestamps
+bytes = "1"          # zero-copy byte buffers for DNS wire data
+
+# ── Logging ───────────────────────────────────────────────────────────────────
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-thiserror = "2"
-anyhow = "1"
-lru = "0.18"
-regex = "1"
-rusqlite = { version = "0.37", features = ["bundled"] }
-tokio-rusqlite = "0.7"
-chrono = { version = "0.4", features = ["serde"] }
-bytes = "1"
-parking_lot = "0.12"
-arc-swap = "1"
-dirs = "6"
-reqwest = { version = "0.13.4", features = ["rustls", "json"], default-features = false }
-ring = "0.17"
-argon2 = "0.5"
-subtle = "2"
-socket2 = "0.6"
-flate2 = "1"
-tar = "0.4"
-sysinfo = "0.39"
+
+# ── Error handling ────────────────────────────────────────────────────────────
+thiserror = "2"   # typed library errors (FeriteError)
+anyhow = "1"      # app-level error context
+
+# ── Crypto / auth ─────────────────────────────────────────────────────────────
+ring = "0.17"     # secure RNG (DNS query IDs) + SHA checksums (updater) + auth tokens
+argon2 = "0.5"    # web UI password hashing (Argon2id)
+subtle = "2"      # constant-time comparison (API key check)
+
+# ── Networking & system ───────────────────────────────────────────────────────
+socket2 = "0.6"   # low-level UDP socket options (mDNS multicast)
+sysinfo = "0.39"  # CPU / memory / system stats
+dirs = "6"        # locate config & data directories
+
+# ── Self-update (download & unpack release archives) ──────────────────────────
+flate2 = "1"      # gzip decompression
+tar = "0.4"       # tar extraction (server binary + web bundle)
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+async-trait = "0.1"  # async methods in the Storage trait
 
 [dev-dependencies]
 tower = "0.5"

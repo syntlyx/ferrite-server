@@ -15,6 +15,9 @@ pub struct QueryFilter {
     pub to_ts: Option<i64>,
     pub domain: Option<String>,
     pub client_ips: Vec<String>,
+    /// Filter by device identity (MAC or IP fallback). Returns all of a device's
+    /// queries regardless of which IP it used. Combined with `client_ips` via OR.
+    pub devices: Vec<String>,
     pub status: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
@@ -22,10 +25,12 @@ pub struct QueryFilter {
     pub before_ts: Option<i64>,
 }
 
-/// Aggregated statistics per client.
+/// Aggregated statistics per device (keyed by the device identity token: a MAC
+/// when known, else an IP fallback — see [`crate::dns::types::QueryEntry::device`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientStats {
-    pub client_ip: String,
+    /// Device identity token (MAC or IP fallback).
+    pub device: String,
     pub total: u64,
     pub blocked: u64,
     pub last_seen: i64,
@@ -67,8 +72,8 @@ pub trait Storage: Send + Sync {
     /// Return timeseries buckets for the last 24 hours.
     async fn timeseries(&self, bucket_secs: u64) -> Result<Vec<TimeseriesBucket>>;
 
-    /// Return per-client stats for a specific IP.
-    async fn client_stats(&self, client_ip: &str) -> Result<Option<ClientStats>>;
+    /// Return aggregated stats for a specific device identity token (MAC or IP).
+    async fn client_stats(&self, device: &str) -> Result<Option<ClientStats>>;
 
     /// Return summary stats: (total, blocked) for the last `secs` seconds.
     async fn summary(&self, secs: u64) -> Result<(u64, u64)>;
@@ -106,6 +111,20 @@ pub trait Storage: Send + Sync {
 
     /// Load all manual client aliases: returns (key, key_type, name) triples.
     async fn load_client_aliases(&self) -> Result<Vec<(String, String, String)>>;
+
+    // ── Learned device identities & IP bindings ───────────────────────────────
+
+    /// Upsert a learned device: MAC → last-known hostname. Bumps `last_seen`.
+    async fn upsert_device(&self, mac: &str, hostname: Option<&str>) -> Result<()>;
+
+    /// Upsert the last-known IP → MAC binding ("last binding wins"). Bumps `last_seen`.
+    async fn upsert_ip_binding(&self, ip: &str, mac: &str) -> Result<()>;
+
+    /// Load all learned devices: returns (mac, hostname) pairs.
+    async fn load_devices(&self) -> Result<Vec<(String, Option<String>)>>;
+
+    /// Load all IP → MAC bindings: returns (ip, mac) pairs.
+    async fn load_ip_bindings(&self) -> Result<Vec<(String, String)>>;
 
     // ── Custom DNS records ────────────────────────────────────────────────────
 

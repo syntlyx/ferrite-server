@@ -36,6 +36,19 @@ struct PtrEntry {
     expires_at: Instant,
 }
 
+/// Resolved display info for a device identity token (a MAC, or an IP fallback).
+/// Built by [`ClientRegistry::describe_device`] for the clients API.
+pub struct DeviceInfo {
+    /// Friendly name (alias or resolved hostname), if any.
+    pub name: Option<String>,
+    /// IP addresses currently associated with this device.
+    pub ips: Vec<String>,
+    /// MAC addresses for this device (at most one).
+    pub macs: Vec<String>,
+    /// `true` when the name came from a manual alias.
+    pub is_alias: bool,
+}
+
 /// Maps client IP addresses to human-readable names.
 ///
 /// # Resolution pipeline (fastest → slowest)

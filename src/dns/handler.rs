@@ -302,6 +302,8 @@ fn make_entry(
         domain: domain.to_string(),
         query_type,
         client_ip: client_ip.to_string(),
+        // Tagged by the stats writer at drain time (see stats/writer.rs).
+        device: String::new(),
         status,
         latency_ms,
         upstream,

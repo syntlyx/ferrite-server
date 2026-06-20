@@ -47,42 +47,10 @@ impl SqliteStorage {
 
         let conn = Connection::open(path).await?;
 
-        // Apply schema.
+        // Apply the baseline schema (all CREATE … IF NOT EXISTS, idempotent),
+        // then run the versioned migration ladder. See `run_migrations`.
         conn.call(|c| c.execute_batch(SCHEMA)).await?;
-
-        // Migration: upgrade client_aliases to keyed-by-key+key_type schema.
-        conn.call(|c| {
-            // If old schema (single 'ip' primary key column), migrate.
-            let has_key_col: bool = c
-                .query_row(
-                    "SELECT COUNT(*) FROM pragma_table_info('client_aliases') WHERE name='key'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap_or(0)
-                > 0;
-
-            if !has_key_col {
-                // Old schema: ip TEXT PRIMARY KEY. Recreate with new schema preserving data.
-                c.execute_batch(
-                    "ALTER TABLE client_aliases RENAME TO client_aliases_old;
-                     CREATE TABLE client_aliases (
-                         key         TEXT    NOT NULL,
-                         key_type    TEXT    NOT NULL DEFAULT 'ip',
-                         name        TEXT    NOT NULL,
-                         created_at  INTEGER NOT NULL,
-                         PRIMARY KEY (key, key_type)
-                     );
-                     INSERT INTO client_aliases (key, key_type, name, created_at)
-                         SELECT ip, 'ip', name, created_at FROM client_aliases_old;
-                     DROP TABLE client_aliases_old;",
-                )?;
-            }
-            Ok(())
-        })
-        .await?;
-
-        conn.call(backfill_rollups_if_needed).await?;
+        conn.call(run_migrations).await?;
 
         tracing::info!("SQLite storage opened at {}", path.display());
         Ok(Arc::new(Self { conn }))
@@ -102,23 +70,27 @@ impl Storage for SqliteStorage {
                 let tx = c.unchecked_transaction()?;
                 let mut query_buckets: HashMap<i64, QueryBucketAgg> = HashMap::new();
                 let mut domain_buckets: HashMap<(i64, String), DomainBucketAgg> = HashMap::new();
-                let mut client_buckets: HashMap<(i64, String), ClientBucketAgg> = HashMap::new();
+                let mut device_buckets: HashMap<(i64, String), ClientBucketAgg> = HashMap::new();
 
                 {
                     // Explicit id: keeps SQLite ids identical to in-memory ids
                     // (counter is seeded from MAX(id) at startup, so no collisions).
                     let mut stmt = tx.prepare_cached(
-                        "INSERT INTO queries (id, timestamp, domain, query_type, client_ip, status, latency_ms, upstream, rcode)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        "INSERT INTO queries (id, timestamp, domain, query_type, client_ip, device, status, latency_ms, upstream, rcode)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     )?;
                     for e in &entries {
                         let ts = e.timestamp.timestamp();
+                        // Defensive fallback: an untagged entry keys to its IP so it is
+                        // never written with an empty device token.
+                        let device = device_token(e);
                         stmt.execute(rusqlite::params![
                             e.id as i64,
                             ts,
                             e.domain,
                             e.query_type as i64,
                             e.client_ip,
+                            device,
                             e.status.as_str(),
                             e.latency_ms as i64,
                             e.upstream,
@@ -127,9 +99,10 @@ impl Storage for SqliteStorage {
 
                         collect_rollup_aggregates(
                             e,
+                            &device,
                             &mut query_buckets,
                             &mut domain_buckets,
-                            &mut client_buckets,
+                            &mut device_buckets,
                         );
                     }
                 }
@@ -172,17 +145,17 @@ impl Storage for SqliteStorage {
                 }
                 {
                     let mut stmt = tx.prepare_cached(
-                        "INSERT INTO client_buckets_10m (bucket, client_ip, total, blocked, last_seen)
+                        "INSERT INTO device_buckets_10m (bucket, device, total, blocked, last_seen)
                          VALUES (?1, ?2, ?3, ?4, ?5)
-                         ON CONFLICT(bucket, client_ip) DO UPDATE SET
-                            total = client_buckets_10m.total + excluded.total,
-                            blocked = client_buckets_10m.blocked + excluded.blocked,
-                            last_seen = MAX(client_buckets_10m.last_seen, excluded.last_seen)",
+                         ON CONFLICT(bucket, device) DO UPDATE SET
+                            total = device_buckets_10m.total + excluded.total,
+                            blocked = device_buckets_10m.blocked + excluded.blocked,
+                            last_seen = MAX(device_buckets_10m.last_seen, excluded.last_seen)",
                     )?;
-                    for ((bucket, client_ip), agg) in &client_buckets {
+                    for ((bucket, device), agg) in &device_buckets {
                         stmt.execute(rusqlite::params![
                             bucket,
-                            client_ip,
+                            device,
                             agg.total as i64,
                             agg.blocked as i64,
                             agg.last_seen,
@@ -201,7 +174,7 @@ impl Storage for SqliteStorage {
         let rows = self.conn
             .call(move |c| {
                 let mut sql = String::from(
-                    "SELECT id, timestamp, domain, query_type, client_ip, status, latency_ms, upstream, rcode FROM queries WHERE 1=1",
+                    "SELECT id, timestamp, domain, query_type, client_ip, device, status, latency_ms, upstream, rcode FROM queries WHERE 1=1",
                 );
                 let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
@@ -221,12 +194,25 @@ impl Storage for SqliteStorage {
                     sql.push_str(" AND domain LIKE ? ESCAPE '\\'");
                     params.push(Box::new(format!("%{}%", escaped)));
                 }
+                // Identity filter: match by raw IP and/or by device token, OR-combined
+                // so "all queries from device X" spans every IP it ever used.
+                let mut id_clauses: Vec<String> = Vec::new();
                 if !filter.client_ips.is_empty() {
                     let placeholders = filter.client_ips.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-                    sql.push_str(&format!(" AND client_ip IN ({})", placeholders));
+                    id_clauses.push(format!("client_ip IN ({})", placeholders));
                     for ip in &filter.client_ips {
                         params.push(Box::new(ip.clone()));
                     }
+                }
+                if !filter.devices.is_empty() {
+                    let placeholders = filter.devices.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+                    id_clauses.push(format!("device IN ({})", placeholders));
+                    for d in &filter.devices {
+                        params.push(Box::new(d.clone()));
+                    }
+                }
+                if !id_clauses.is_empty() {
+                    sql.push_str(&format!(" AND ({})", id_clauses.join(" OR ")));
                 }
                 if let Some(ref status) = filter.status {
                     sql.push_str(" AND status = ?");
@@ -259,12 +245,14 @@ impl Storage for SqliteStorage {
                     let domain: String = row.get(2)?;
                     let query_type: i64 = row.get(3)?;
                     let client_ip: String = row.get(4)?;
-                    let status_str: String = row.get(5)?;
-                    let latency_ms: i64 = row.get(6)?;
-                    let upstream: Option<String> = row.get(7)?;
-                    let rcode: i64 = row.get(8)?;
+                    // Legacy rows may still be NULL until backfilled — fall back to the IP.
+                    let device: Option<String> = row.get(5)?;
+                    let status_str: String = row.get(6)?;
+                    let latency_ms: i64 = row.get(7)?;
+                    let upstream: Option<String> = row.get(8)?;
+                    let rcode: i64 = row.get(9)?;
 
-                    Ok((id, ts, domain, query_type, client_ip, status_str, latency_ms, upstream, rcode))
+                    Ok((id, ts, domain, query_type, client_ip, device, status_str, latency_ms, upstream, rcode))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
 
@@ -282,6 +270,7 @@ impl Storage for SqliteStorage {
                     domain,
                     query_type,
                     client_ip,
+                    device,
                     status_str,
                     latency_ms,
                     upstream,
@@ -293,6 +282,7 @@ impl Storage for SqliteStorage {
                         "allowed" => QueryStatus::Allowed,
                         _ => QueryStatus::Upstream,
                     };
+                    let device = device.unwrap_or_else(|| client_ip.clone());
                     QueryEntry {
                         id: id as u64,
                         timestamp: chrono::DateTime::from_timestamp(ts, 0)
@@ -301,6 +291,7 @@ impl Storage for SqliteStorage {
                         domain,
                         query_type: query_type as u16,
                         client_ip,
+                        device,
                         status,
                         latency_ms: latency_ms as u32,
                         upstream,
@@ -333,19 +324,19 @@ impl Storage for SqliteStorage {
             .conn
             .call(move |c| {
                 let mut stmt = c.prepare(
-                    "SELECT client_ip,
+                    "SELECT device,
                             SUM(total) as total,
                             SUM(blocked) as blocked,
                             MAX(last_seen) as last_seen
-                     FROM client_buckets_10m
+                     FROM device_buckets_10m
                      WHERE bucket >= ?1 AND bucket <= ?2
-                     GROUP BY client_ip
+                     GROUP BY device
                      ORDER BY total DESC LIMIT ?3",
                 )?;
                 let rows = stmt
                     .query_map(rusqlite::params![from_bucket, to_bucket, n as i64], |row| {
                         Ok(ClientStats {
-                            client_ip: row.get(0)?,
+                            device: row.get(0)?,
                             total: row.get::<_, i64>(1)? as u64,
                             blocked: row.get::<_, i64>(2)? as u64,
                             last_seen: row.get(3)?,
@@ -393,22 +384,22 @@ impl Storage for SqliteStorage {
         Ok(rows)
     }
 
-    async fn client_stats(&self, client_ip: &str) -> Result<Option<ClientStats>> {
-        let ip = client_ip.to_string();
+    async fn client_stats(&self, device: &str) -> Result<Option<ClientStats>> {
+        let device = device.to_string();
         let result = self
             .conn
             .call(move |c| {
                 let mut stmt = c.prepare(
-                    "SELECT client_ip,
+                    "SELECT device,
                             SUM(total) as total,
                             SUM(blocked) as blocked,
                             MAX(last_seen) as last_seen
-                     FROM client_buckets_10m WHERE client_ip = ?1 GROUP BY client_ip",
+                     FROM device_buckets_10m WHERE device = ?1 GROUP BY device",
                 )?;
                 let row = stmt
-                    .query_row(rusqlite::params![ip], |row| {
+                    .query_row(rusqlite::params![device], |row| {
                         Ok(ClientStats {
-                            client_ip: row.get(0)?,
+                            device: row.get(0)?,
                             total: row.get::<_, i64>(1)? as u64,
                             blocked: row.get::<_, i64>(2)? as u64,
                             last_seen: row.get(3)?,
@@ -429,7 +420,8 @@ impl Storage for SqliteStorage {
                     "DELETE FROM queries;
                      DELETE FROM query_buckets_10m;
                      DELETE FROM domain_buckets_10m;
-                     DELETE FROM client_buckets_10m;",
+                     DELETE FROM client_buckets_10m;
+                     DELETE FROM device_buckets_10m;",
                 )?;
                 Ok(())
             })
@@ -456,6 +448,10 @@ impl Storage for SqliteStorage {
                 )?;
                 tx.execute(
                     "DELETE FROM client_buckets_10m WHERE bucket < ?1",
+                    rusqlite::params![cutoff_bucket],
+                )?;
+                tx.execute(
+                    "DELETE FROM device_buckets_10m WHERE bucket < ?1",
                     rusqlite::params![cutoff_bucket],
                 )?;
                 tx.commit()?;
@@ -607,6 +603,78 @@ impl Storage for SqliteStorage {
             .map_err(FeriteError::TokioDatabase)
     }
 
+    async fn upsert_device(&self, mac: &str, hostname: Option<&str>) -> Result<()> {
+        let mac = mac.to_string();
+        let hostname = hostname.map(|s| s.to_string());
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .call(move |c| {
+                // COALESCE keeps a previously learned hostname if this call has none,
+                // so a transient nameless resolve never blanks a known device.
+                c.execute(
+                    "INSERT INTO devices (mac, hostname, last_seen)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(mac) DO UPDATE SET
+                         hostname  = COALESCE(excluded.hostname, devices.hostname),
+                         last_seen = excluded.last_seen",
+                    rusqlite::params![mac, hostname, now],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(FeriteError::TokioDatabase)
+    }
+
+    async fn upsert_ip_binding(&self, ip: &str, mac: &str) -> Result<()> {
+        let ip = ip.to_string();
+        let mac = mac.to_string();
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO ip_bindings (ip, mac, last_seen)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(ip) DO UPDATE SET
+                         mac       = excluded.mac,
+                         last_seen = excluded.last_seen",
+                    rusqlite::params![ip, mac, now],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(FeriteError::TokioDatabase)
+    }
+
+    async fn load_devices(&self) -> Result<Vec<(String, Option<String>)>> {
+        self.conn
+            .call(|c| {
+                let mut stmt = c.prepare("SELECT mac, hostname FROM devices")?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .map_err(FeriteError::TokioDatabase)
+    }
+
+    async fn load_ip_bindings(&self) -> Result<Vec<(String, String)>> {
+        self.conn
+            .call(|c| {
+                let mut stmt = c.prepare("SELECT ip, mac FROM ip_bindings")?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .map_err(FeriteError::TokioDatabase)
+    }
+
     async fn upsert_custom_record(
         &self,
         domain: &str,
@@ -673,11 +741,22 @@ impl Storage for SqliteStorage {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// The device identity token a query is written under: its tagged `device`
+/// (set by the stats writer), falling back to the client IP when untagged.
+fn device_token(entry: &QueryEntry) -> String {
+    if entry.device.is_empty() {
+        entry.client_ip.clone()
+    } else {
+        entry.device.clone()
+    }
+}
+
 fn collect_rollup_aggregates(
     entry: &QueryEntry,
+    device: &str,
     query_buckets: &mut HashMap<i64, QueryBucketAgg>,
     domain_buckets: &mut HashMap<(i64, String), DomainBucketAgg>,
-    client_buckets: &mut HashMap<(i64, String), ClientBucketAgg>,
+    device_buckets: &mut HashMap<(i64, String), ClientBucketAgg>,
 ) {
     let ts = entry.timestamp.timestamp();
     let bucket = align_bucket(ts);
@@ -700,29 +779,89 @@ fn collect_rollup_aggregates(
         domain_agg.blocked += 1;
     }
 
-    let client_agg = client_buckets
-        .entry((bucket, entry.client_ip.clone()))
+    let device_agg = device_buckets
+        .entry((bucket, device.to_string()))
         .or_default();
-    client_agg.total += 1;
+    device_agg.total += 1;
     if is_blocked {
-        client_agg.blocked += 1;
+        device_agg.blocked += 1;
     }
-    client_agg.last_seen = client_agg.last_seen.max(ts);
+    device_agg.last_seen = device_agg.last_seen.max(ts);
 }
 
 fn align_bucket(ts: i64) -> i64 {
     (ts / ROLLUP_BUCKET_SECS) * ROLLUP_BUCKET_SECS
 }
 
-fn backfill_rollups_if_needed(c: &mut rusqlite::Connection) -> rusqlite::Result<()> {
-    let query_count: i64 = c.query_row("SELECT COUNT(*) FROM queries", [], |row| row.get(0))?;
+/// Latest schema version. Bump when adding a migration step below.
+const SCHEMA_VERSION: i64 = 5;
+
+/// Apply versioned migrations on top of the baseline `SCHEMA`.
+///
+/// Versioning uses the built-in `PRAGMA user_version` (a free integer in the DB
+/// header — no extra table). Each step runs in its own transaction together with
+/// the version bump, so a crash mid-migration rolls the step back cleanly. Every
+/// step is written to be **idempotent / guarded** so it is safe on a fresh DB, on
+/// an old DB, and on a half-migrated DB (e.g. tables added out-of-band while
+/// `user_version` was still 0).
+fn run_migrations(c: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    let mut version: i64 = c.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    while version < SCHEMA_VERSION {
+        let next = version + 1;
+        let tx = c.unchecked_transaction()?;
+        match next {
+            1 => migrate_v1_client_aliases(&tx)?,
+            2 => migrate_v2_backfill_rollups(&tx)?,
+            3 => migrate_v3_device_column(&tx)?,
+            4 => migrate_v4_device_buckets(&tx)?,
+            5 => migrate_v5_backfill_devices(&tx)?,
+            _ => unreachable!("no migration step for v{next}"),
+        }
+        // PRAGMA can't be parameter-bound; the value is our own constant.
+        tx.execute_batch(&format!("PRAGMA user_version = {next}"))?;
+        tx.commit()?;
+        tracing::info!("migrated database schema to v{next}");
+        version = next;
+    }
+    Ok(())
+}
+
+/// v1: upgrade `client_aliases` from single `ip` PK to `(key, key_type)` PK.
+fn migrate_v1_client_aliases(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
+    let has_key_col: bool = tx
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('client_aliases') WHERE name='key'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !has_key_col {
+        tx.execute_batch(
+            "ALTER TABLE client_aliases RENAME TO client_aliases_old;
+             CREATE TABLE client_aliases (
+                 key         TEXT    NOT NULL,
+                 key_type    TEXT    NOT NULL DEFAULT 'ip',
+                 name        TEXT    NOT NULL,
+                 created_at  INTEGER NOT NULL,
+                 PRIMARY KEY (key, key_type)
+             );
+             INSERT INTO client_aliases (key, key_type, name, created_at)
+                 SELECT ip, 'ip', name, created_at FROM client_aliases_old;
+             DROP TABLE client_aliases_old;",
+        )?;
+    }
+    Ok(())
+}
+
+/// v2: backfill the original rollup tables from existing query rows (one-time).
+fn migrate_v2_backfill_rollups(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
+    let query_count: i64 = tx.query_row("SELECT COUNT(*) FROM queries", [], |row| row.get(0))?;
     if query_count == 0 {
         return Ok(());
     }
-
-    let rollup_count: i64 = c.query_row("SELECT COUNT(*) FROM query_buckets_10m", [], |row| {
-        row.get(0)
-    })?;
+    let rollup_count: i64 =
+        tx.query_row("SELECT COUNT(*) FROM query_buckets_10m", [], |row| row.get(0))?;
     if rollup_count > 0 {
         return Ok(());
     }
@@ -731,7 +870,6 @@ fn backfill_rollups_if_needed(c: &mut rusqlite::Connection) -> rusqlite::Result<
         "backfilling SQLite query rollups from {} existing query rows",
         query_count
     );
-    let tx = c.unchecked_transaction()?;
     let sql = format!(
         r#"
         DELETE FROM query_buckets_10m;
@@ -767,7 +905,76 @@ fn backfill_rollups_if_needed(c: &mut rusqlite::Connection) -> rusqlite::Result<
         bucket_secs = ROLLUP_BUCKET_SECS
     );
     tx.execute_batch(&sql)?;
-    tx.commit()?;
+    Ok(())
+}
+
+/// v3: add the per-query `device` column + its keyset index.
+fn migrate_v3_device_column(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
+    let has_device: bool = tx
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('queries') WHERE name='device'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !has_device {
+        tx.execute_batch("ALTER TABLE queries ADD COLUMN device TEXT")?;
+    }
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_queries_device_time_id_desc
+             ON queries (device, timestamp DESC, id DESC)",
+    )?;
+    Ok(())
+}
+
+/// v4: per-device rollup table (mirrors `client_buckets_10m`, keyed by device).
+fn migrate_v4_device_buckets(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS device_buckets_10m (
+             bucket     INTEGER NOT NULL,
+             device     TEXT    NOT NULL,
+             total      INTEGER NOT NULL DEFAULT 0,
+             blocked    INTEGER NOT NULL DEFAULT 0,
+             last_seen  INTEGER NOT NULL DEFAULT 0,
+             PRIMARY KEY (bucket, device)
+         );
+         CREATE INDEX IF NOT EXISTS idx_device_buckets_device_bucket
+             ON device_buckets_10m (device, bucket);",
+    )?;
+    Ok(())
+}
+
+/// v5: tag legacy query rows with a device and build the device rollups.
+///
+/// Old rows predate device tagging: map each `client_ip` to its last-known MAC
+/// via `ip_bindings` if known, else fall back to the IP itself. On databases that
+/// predate `ip_bindings` it is empty, so virtually all historical rows fall back
+/// to `device = client_ip` — accepted; accuracy improves for rows written later.
+fn migrate_v5_backfill_devices(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "UPDATE queries
+         SET device = COALESCE((SELECT mac FROM ip_bindings WHERE ip = client_ip), client_ip)
+         WHERE device IS NULL",
+    )?;
+
+    let device_rollup_count: i64 =
+        tx.query_row("SELECT COUNT(*) FROM device_buckets_10m", [], |row| row.get(0))?;
+    if device_rollup_count == 0 {
+        let sql = format!(
+            "INSERT INTO device_buckets_10m (bucket, device, total, blocked, last_seen)
+             SELECT (timestamp / {bucket_secs}) * {bucket_secs} as bucket,
+                    device,
+                    COUNT(*) as total,
+                    SUM(CASE WHEN status='blocked' THEN 1 ELSE 0 END) as blocked,
+                    MAX(timestamp) as last_seen
+             FROM queries
+             WHERE device IS NOT NULL
+             GROUP BY bucket, device",
+            bucket_secs = ROLLUP_BUCKET_SECS
+        );
+        tx.execute_batch(&sql)?;
+    }
     Ok(())
 }
 
@@ -821,6 +1028,18 @@ mod tests {
     }
 
     fn query_entry(ts: i64, domain: &str, client_ip: &str, status: QueryStatus) -> QueryEntry {
+        // Default device == client_ip, so device-keyed rollups match IP-keyed
+        // expectations. Use `query_entry_dev` to attribute to an explicit device.
+        query_entry_dev(ts, domain, client_ip, client_ip, status)
+    }
+
+    fn query_entry_dev(
+        ts: i64,
+        domain: &str,
+        client_ip: &str,
+        device: &str,
+        status: QueryStatus,
+    ) -> QueryEntry {
         // Unique monotonic ids: write_batch persists entry ids verbatim,
         // and queries.id is a PRIMARY KEY.
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -830,6 +1049,7 @@ mod tests {
             domain: domain.to_string(),
             query_type: 1,
             client_ip: client_ip.to_string(),
+            device: device.to_string(),
             status,
             latency_ms: 1,
             upstream: None,
@@ -888,7 +1108,7 @@ mod tests {
         assert_eq!(blocked, vec![("ads.test".to_string(), 2)]);
 
         let clients = storage.top_clients(bucket, bucket + 599, 10).await.unwrap();
-        assert_eq!(clients[0].client_ip, "192.168.1.11");
+        assert_eq!(clients[0].device, "192.168.1.11");
         assert_eq!(clients[0].total, 2);
         assert_eq!(clients[0].blocked, 2);
 
@@ -1029,6 +1249,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn devices_and_ip_bindings_round_trip_and_last_binding_wins() {
+        let storage = SqliteStorage::open(&temp_db_path("ferrite-devices"))
+            .await
+            .unwrap();
+
+        // Learn a device name, then refine it — upsert should overwrite.
+        storage.upsert_device("aa:bb:cc:dd:ee:ff", Some("laptop")).await.unwrap();
+        storage
+            .upsert_device("aa:bb:cc:dd:ee:ff", Some("alex-laptop"))
+            .await
+            .unwrap();
+        // A nameless re-learn must NOT blank an existing hostname (COALESCE).
+        storage.upsert_device("aa:bb:cc:dd:ee:ff", None).await.unwrap();
+        // A device seen only by MAC, hostname not yet resolved.
+        storage.upsert_device("11:22:33:44:55:66", None).await.unwrap();
+
+        let devices = storage.load_devices().await.unwrap();
+        assert_eq!(devices.len(), 2);
+        let laptop = devices.iter().find(|(m, _)| m == "aa:bb:cc:dd:ee:ff").unwrap();
+        assert_eq!(laptop.1.as_deref(), Some("alex-laptop"));
+        let nameless = devices.iter().find(|(m, _)| m == "11:22:33:44:55:66").unwrap();
+        assert_eq!(nameless.1, None);
+
+        // IP .50 first belongs to the laptop, then is reassigned ("last binding wins").
+        storage.upsert_ip_binding("192.168.1.50", "aa:bb:cc:dd:ee:ff").await.unwrap();
+        storage.upsert_ip_binding("192.168.1.77", "aa:bb:cc:dd:ee:ff").await.unwrap();
+        storage.upsert_ip_binding("192.168.1.50", "11:22:33:44:55:66").await.unwrap();
+
+        let mut bindings = storage.load_ip_bindings().await.unwrap();
+        bindings.sort();
+        assert_eq!(
+            bindings,
+            vec![
+                ("192.168.1.50".to_string(), "11:22:33:44:55:66".to_string()),
+                ("192.168.1.77".to_string(), "aa:bb:cc:dd:ee:ff".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn custom_dns_records_round_trip_update_and_delete_by_domain() {
         let storage = SqliteStorage::open(&temp_db_path("ferrite-custom-records"))
             .await
@@ -1158,5 +1418,121 @@ mod tests {
                 .unwrap(),
             vec![("new.test".to_string(), 1)]
         );
+    }
+
+    #[tokio::test]
+    async fn device_keyed_rollups_merge_a_devices_ips_across_an_ip_change() {
+        let storage = SqliteStorage::open(&temp_db_path("ferrite-device-rollup"))
+            .await
+            .unwrap();
+        let bucket = align_bucket(chrono::Utc::now().timestamp());
+        let mac = "aa:bb:cc:dd:ee:ff";
+        // One device, three queries spanning two different IPs (it changed IP),
+        // plus a second device that has no MAC (IP fallback token).
+        storage
+            .write_batch(&[
+                query_entry_dev(bucket + 1, "a.test", "192.168.1.50", mac, QueryStatus::Upstream),
+                query_entry_dev(bucket + 2, "b.test", "192.168.1.50", mac, QueryStatus::Blocked),
+                query_entry_dev(bucket + 3, "c.test", "192.168.1.77", mac, QueryStatus::Upstream),
+                query_entry_dev(bucket + 4, "d.test", "10.0.0.9", "10.0.0.9", QueryStatus::Upstream),
+            ])
+            .await
+            .unwrap();
+
+        // The device's three queries (two IPs) aggregate into a single row.
+        let clients = storage.top_clients(bucket, bucket + 599, 10).await.unwrap();
+        assert_eq!(clients.len(), 2);
+        let dev = clients.iter().find(|c| c.device == mac).unwrap();
+        assert_eq!(dev.total, 3);
+        assert_eq!(dev.blocked, 1);
+
+        // Filtering the log by device returns every IP the device used.
+        let rows = storage
+            .query_range(&QueryFilter {
+                devices: vec![mac.to_string()],
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| r.device == mac));
+        assert!(rows.iter().any(|r| r.client_ip == "192.168.1.50"));
+        assert!(rows.iter().any(|r| r.client_ip == "192.168.1.77"));
+
+        // Per-device stats are keyed by the device token.
+        let cs = storage.client_stats(mac).await.unwrap().unwrap();
+        assert_eq!(cs.device, mac);
+        assert_eq!(cs.total, 3);
+    }
+
+    #[tokio::test]
+    async fn migration_upgrades_a_legacy_v0_database() {
+        let path = temp_db_path("ferrite-migrate-v0");
+
+        // Build a pre-versioning database: old single-`ip` client_aliases, a
+        // `queries` table without the `device` column, and user_version = 0.
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE queries (
+                     id INTEGER PRIMARY KEY, timestamp INTEGER NOT NULL, domain TEXT NOT NULL,
+                     query_type INTEGER NOT NULL, client_ip TEXT NOT NULL, status TEXT NOT NULL,
+                     latency_ms INTEGER NOT NULL DEFAULT 0, upstream TEXT, rcode INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE client_aliases (ip TEXT PRIMARY KEY, name TEXT NOT NULL, created_at INTEGER NOT NULL);
+                 INSERT INTO client_aliases (ip, name, created_at) VALUES ('192.168.1.10', 'Laptop', 0);
+                 INSERT INTO queries (id, timestamp, domain, query_type, client_ip, status, latency_ms, upstream, rcode)
+                     VALUES (1, 1000, 'a.test', 1, '192.168.1.50', 'upstream', 0, NULL, 0),
+                            (2, 1001, 'b.test', 1, '192.168.1.50', 'blocked', 0, NULL, 3);
+                 PRAGMA user_version = 0;",
+            )
+            .unwrap();
+        }
+
+        let storage = SqliteStorage::open(&path).await.unwrap();
+
+        // user_version stamped to latest; `device` column added.
+        let (version, has_device): (i64, bool) = {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            let v = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            let d: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('queries') WHERE name='device'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            (v, d > 0)
+        };
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(has_device);
+
+        // client_aliases upgraded to (key, key_type) without losing data.
+        assert_eq!(
+            storage.load_client_aliases().await.unwrap(),
+            vec![("192.168.1.10".to_string(), "ip".to_string(), "Laptop".to_string())]
+        );
+
+        // Legacy query rows backfilled to device = client_ip (no MAC history).
+        let rows = storage
+            .query_range(&QueryFilter {
+                devices: vec!["192.168.1.50".to_string()],
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.device == "192.168.1.50"));
+
+        // Device rollups were built from the backfilled rows.
+        let cs = storage.client_stats("192.168.1.50").await.unwrap().unwrap();
+        assert_eq!(cs.total, 2);
+        assert_eq!(cs.blocked, 1);
+
+        // Re-opening is a no-op: migrations are idempotent and data is preserved.
+        drop(storage);
+        let storage2 = SqliteStorage::open(&path).await.unwrap();
+        assert_eq!(storage2.client_stats("192.168.1.50").await.unwrap().unwrap().total, 2);
     }
 }

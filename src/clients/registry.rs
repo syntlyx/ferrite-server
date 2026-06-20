@@ -46,6 +46,40 @@ impl ClientRegistry {
             Err(e) => tracing::warn!("failed to load client aliases: {}", e),
         }
 
+        // Restore learned device identities. Names are inserted already-expired
+        // (TTL = now) so they show instantly (stale-while-revalidate) yet still
+        // trigger a background refresh on the next lookup.
+        match registry.storage.load_devices().await {
+            Ok(devices) => {
+                let now = Instant::now();
+                for (mac_s, hostname) in devices {
+                    if let (Some(mac), Some(name)) = (parse_mac(&mac_s), hostname) {
+                        registry.mac_to_name.insert(mac, (name, now));
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("failed to load devices: {}", e),
+        }
+
+        // Restore last-known IP → MAC bindings so a historical IP (one the device
+        // no longer holds) still resolves to its device after a restart.
+        match registry.storage.load_ip_bindings().await {
+            Ok(bindings) => {
+                for (ip_s, mac_s) in bindings {
+                    if let (Some(ip), Some(mac)) = (parse_ip(&ip_s), parse_mac(&mac_s)) {
+                        registry.ip_to_mac.insert(unmap_v4(ip), mac);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("failed to load IP bindings: {}", e),
+        }
+
+        tracing::info!(
+            "restored {} devices, {} IP bindings",
+            registry.mac_to_name.len(),
+            registry.ip_to_mac.len()
+        );
+
         registry
     }
 
@@ -58,16 +92,16 @@ impl ClientRegistry {
         if let Some(name) = self.ip_aliases.get(&ip) {
             return Some(name.clone());
         }
+        // Resolve via the device behind this IP: manual MAC alias first, then the
+        // last learned hostname for that device. `mac_for_ip` covers EUI-64 IPv6
+        // and the persisted IP→MAC binding, so a device's name follows it across
+        // IP changes and restarts instead of being tied to the ephemeral IP.
         if let Some(mac) = self.mac_for_ip(ip) {
             if let Some(name) = self.mac_aliases.get(&mac) {
                 return Some(name.clone());
             }
-        }
-        if let IpAddr::V6(v6) = ip {
-            if let Some(mac) = super::mac::extract_eui64_mac(v6) {
-                if let Some(entry) = self.mac_to_name.get(&mac) {
-                    return Some(entry.0.clone());
-                }
+            if let Some(entry) = self.mac_to_name.get(&mac) {
+                return Some(entry.0.clone());
             }
         }
         self.ptr_cache.get(&ip)?.name.clone()
@@ -190,5 +224,87 @@ impl ClientRegistry {
             }
         }
         false
+    }
+
+    // ── Device-token helpers (MAC or IP fallback) ───────────────────────────────
+
+    /// All IPs currently mapped to this device (for MAC tokens, every IP whose
+    /// learned binding points at the MAC; for IP tokens, just that IP).
+    fn ips_for_device(&self, device: &str) -> Vec<String> {
+        if let Some(mac) = parse_mac(device) {
+            return self
+                .ip_to_mac
+                .iter()
+                .filter(|e| *e.value() == mac)
+                .map(|e| e.key().to_string())
+                .collect();
+        }
+        parse_ip(device)
+            .map(|ip| vec![unmap_v4(ip).to_string()])
+            .unwrap_or_default()
+    }
+
+    /// Full display descriptor for a device token, used by the clients API.
+    pub fn describe_device(&self, device: &str) -> super::DeviceInfo {
+        if let Some(mac) = parse_mac(device) {
+            let name = self
+                .mac_aliases
+                .get(&mac)
+                .map(|n| n.clone())
+                .or_else(|| self.mac_to_name.get(&mac).map(|e| e.0.clone()));
+            return super::DeviceInfo {
+                name,
+                ips: self.ips_for_device(device),
+                macs: vec![format_mac(&mac)],
+                is_alias: self.mac_aliases.contains_key(&mac),
+            };
+        }
+        if let Some(ip) = parse_ip(device) {
+            let ip = unmap_v4(ip);
+            return super::DeviceInfo {
+                name: self.get_name(ip),
+                ips: vec![ip.to_string()],
+                macs: self.get_mac(ip).into_iter().collect(),
+                is_alias: self.is_aliased(ip),
+            };
+        }
+        super::DeviceInfo {
+            name: None,
+            ips: vec![device.to_string()],
+            macs: Vec::new(),
+            is_alias: false,
+        }
+    }
+
+    /// Schedule background resolution for every IP currently tied to a device.
+    pub fn trigger_resolve_device(registry: &Arc<Self>, device: &str) {
+        for ip in registry.ips_for_device(device) {
+            if let Some(addr) = parse_ip(&ip) {
+                Self::trigger_resolve(registry, addr);
+            }
+        }
+    }
+
+    /// Mirror the OS ARP + NDP neighbour tables into the in-memory IP→MAC map,
+    /// persisting only new or changed bindings. Driven by a periodic background
+    /// task so a MAC is warm in RAM by the time queries from a freshly-rotated
+    /// address are tagged — without a subprocess per IP.
+    pub async fn refresh_neighbor_table(&self) {
+        let pairs = super::mac::scan_neighbors().await;
+        let mut learned = 0usize;
+        for (ip, mac) in pairs {
+            let ip = unmap_v4(ip);
+            // Read-and-copy in one expression so no DashMap guard is held across
+            // the `.await` below (parking_lot is not reentrant — see freeze notes).
+            let changed = self.ip_to_mac.get(&ip).map(|e| *e) != Some(mac);
+            if changed {
+                self.ip_to_mac.insert(ip, mac);
+                self.persist_binding(ip, mac).await;
+                learned += 1;
+            }
+        }
+        if learned > 0 {
+            tracing::debug!("neighbor mirror: {} new/changed bindings", learned);
+        }
     }
 }

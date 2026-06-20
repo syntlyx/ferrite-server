@@ -11,8 +11,10 @@ use super::{
 
 impl ClientRegistry {
     pub(super) async fn run_pipeline(&self, ip: IpAddr) {
-        self.learn_ip_mac(ip).await;
-        let name = self.resolve(ip).await;
+        // Learn (and persist) the IP→MAC binding first, then reuse the MAC for the
+        // name lookup so we never query the neighbour table twice in one pipeline.
+        let mac = self.learn_ip_mac(ip).await;
+        let name = self.resolve(ip, mac).await;
         let ttl = if name.is_some() {
             RESOLVE_TTL
         } else {
@@ -27,13 +29,13 @@ impl ClientRegistry {
         );
     }
 
-    async fn resolve(&self, ip: IpAddr) -> Option<String> {
+    async fn resolve(&self, ip: IpAddr, mac: Option<[u8; 6]>) -> Option<String> {
         if let IpAddr::V6(v6) = ip {
             if is_link_local_v6(v6) {
                 return self.resolve_link_local(v6).await;
             }
         }
-        self.resolve_normal(ip).await
+        self.resolve_normal(ip, mac).await
     }
 
     /// Link-local IPv6 pipeline:
@@ -59,7 +61,7 @@ impl ClientRegistry {
             let name = normalize_hostname(&raw);
             tracing::debug!("fe80::{} → '{}' via mDNS", v6, name);
             if let Some(m) = device_mac {
-                self.cache_mac(m, &name);
+                self.cache_mac(m, &name).await;
             }
             return Some(name);
         }
@@ -75,25 +77,32 @@ impl ClientRegistry {
         };
         tracing::debug!("fe80::{} → ARP {:02x?} → IPv4 {}", v6, m, ipv4);
 
-        let name = self.resolve_normal(IpAddr::V4(ipv4)).await;
+        // Resolve the IPv4 PTR directly; cache the result under the link-local
+        // device's MAC (passing None avoids a redundant ARP lookup for the v4).
+        let name = self.resolve_normal(IpAddr::V4(ipv4), None).await;
         if let Some(ref n) = name {
             tracing::debug!("fe80::{} → '{}' via MAC→IPv4→resolve", v6, n);
-            self.cache_mac(m, n);
+            self.cache_mac(m, n).await;
         }
         name
     }
 
     /// Normal (non-link-local) pipeline: upstream PTR → mDNS.
-    async fn resolve_normal(&self, ip: IpAddr) -> Option<String> {
+    /// When `mac` is known, the resolved name is cached and persisted against it.
+    async fn resolve_normal(&self, ip: IpAddr, mac: Option<[u8; 6]>) -> Option<String> {
         if let Some(raw) = self.upstream_ptr(ip).await {
             let name = normalize_hostname(&raw);
-            self.learn_mac(ip, &name).await;
+            if let Some(m) = mac {
+                self.cache_mac(m, &name).await;
+            }
             return Some(name);
         }
         if let Some(raw) = mdns::mdns_ptr_lookup(ip).await {
             let name = normalize_hostname(&raw);
             tracing::debug!("mDNS {} → '{}'", ip, name);
-            self.learn_mac(ip, &name).await;
+            if let Some(m) = mac {
+                self.cache_mac(m, &name).await;
+            }
             return Some(name);
         }
         None
@@ -118,28 +127,64 @@ impl ClientRegistry {
         }
     }
 
-    /// Look up the neighbour-table MAC for `ip` and keep the IP→MAC map warm.
+    /// Resolve the current MAC for `ip` and keep the persisted binding in sync.
+    ///
+    /// EUI-64 IPv6 carries its MAC inline, so no neighbour lookup is needed. For
+    /// everything else we consult the live neighbour table and persist the binding
+    /// whenever it is new or changed ("last binding wins"). If the device is
+    /// currently offline we fall back to the last known binding so a learned
+    /// mapping is never lost.
     async fn learn_ip_mac(&self, ip: IpAddr) -> Option<[u8; 6]> {
-        if let Some(m) = self.mac_for_ip(ip) {
-            return Some(m);
+        if let IpAddr::V6(v6) = ip {
+            if let Some(m) = super::mac::extract_eui64_mac(v6) {
+                return Some(m);
+            }
         }
-        let m = mac::lookup_mac_for_ip(ip).await?;
-        tracing::debug!("learned MAC {:02x?} from {}", m, ip);
-        self.ip_to_mac.insert(ip, m);
-        Some(m)
+        match mac::lookup_mac_for_ip(ip).await {
+            Some(m) => {
+                if self.ip_to_mac.get(&ip).map(|e| *e) != Some(m) {
+                    tracing::debug!("learned MAC {:02x?} for {}", m, ip);
+                    self.ip_to_mac.insert(ip, m);
+                    self.persist_binding(ip, m).await;
+                }
+                Some(m)
+            }
+            None => self.ip_to_mac.get(&ip).map(|e| *e),
+        }
     }
 
-    /// Look up the neighbour-table MAC for `ip` and store `name` in the MAC cache.
-    async fn learn_mac(&self, ip: IpAddr, name: &str) {
-        if let Some(m) = self.learn_ip_mac(ip).await {
-            tracing::debug!("learned MAC {:02x?} → '{}' from {}", m, name, ip);
-            self.cache_mac(m, name);
-        }
-    }
-
-    pub(super) fn cache_mac(&self, mac: [u8; 6], name: &str) {
+    /// Cache `name` for `mac` (in-memory, with TTL) and persist it as the device's
+    /// last-known hostname. The DB write is skipped when the name is unchanged.
+    pub(super) async fn cache_mac(&self, mac: [u8; 6], name: &str) {
+        let changed = self.mac_to_name.get(&mac).map(|e| e.0 != name).unwrap_or(true);
         self.mac_to_name
             .insert(mac, (name.to_owned(), Instant::now() + RESOLVE_TTL));
+        if changed {
+            self.persist_device(mac, name).await;
+        }
+    }
+
+    /// Best-effort persistence of a device's last-known hostname. Never blocks
+    /// resolution: a failed write is logged and dropped.
+    async fn persist_device(&self, mac: [u8; 6], name: &str) {
+        if let Err(e) = self
+            .storage
+            .upsert_device(&super::format_mac(&mac), Some(name))
+            .await
+        {
+            tracing::debug!("failed to persist device {:02x?}: {}", mac, e);
+        }
+    }
+
+    /// Best-effort persistence of an IP→MAC binding.
+    pub(super) async fn persist_binding(&self, ip: IpAddr, mac: [u8; 6]) {
+        if let Err(e) = self
+            .storage
+            .upsert_ip_binding(&ip.to_string(), &super::format_mac(&mac))
+            .await
+        {
+            tracing::debug!("failed to persist binding {} → {:02x?}: {}", ip, mac, e);
+        }
     }
 }
 

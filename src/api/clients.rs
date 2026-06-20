@@ -48,8 +48,9 @@ pub async fn list_clients(
     let (now, from) = client_time_window(&params);
     let limit = params.limit.unwrap_or(50).min(500);
 
-    // Fetch more raw IPs than the final limit because merging may reduce count.
-    let ip_stats = state
+    // Fetch more raw devices than the final limit because merging by resolved
+    // name (e.g. a MAC device and its warm-up IP-tagged rows) may reduce count.
+    let device_stats = state
         .inner
         .storage
         .top_clients(from, now, limit * 4)
@@ -58,25 +59,30 @@ pub async fn list_clients(
     // Group by resolved name.
     let mut groups: HashMap<String, ClientGroup> = HashMap::new();
 
-    for stat in &ip_stats {
-        let ip = match parse_ip(&stat.client_ip) {
-            Some(ip) => ip,
-            None => continue,
+    for stat in &device_stats {
+        let device = &stat.device;
+
+        // Trigger background resolution for this device's IPs not yet in cache.
+        ClientRegistry::trigger_resolve_device(&state.inner.client_registry, device);
+
+        let info = state.inner.client_registry.describe_device(device);
+        let name = info.name.clone().unwrap_or_else(|| device.clone());
+        let mac0 = info.macs.first().map(|s| s.as_str());
+        // The device bypasses filtering if any of its IPs (or the token itself,
+        // when no IP is known) is exempt.
+        let blocking_bypassed = if info.ips.is_empty() {
+            state
+                .inner
+                .blocklist
+                .client_bypasses_blocking(device, mac0)
+        } else {
+            info.ips.iter().any(|ip| {
+                state
+                    .inner
+                    .blocklist
+                    .client_bypasses_blocking(ip, mac0)
+            })
         };
-
-        // Trigger background PTR resolution for IPs not yet in cache.
-        ClientRegistry::trigger_resolve(&state.inner.client_registry, ip);
-
-        let resolved_name = state.inner.client_registry.get_name(ip);
-        let name = resolved_name
-            .clone()
-            .unwrap_or_else(|| stat.client_ip.clone());
-        let mac = state.inner.client_registry.get_mac(ip);
-        let is_alias = state.inner.client_registry.is_aliased(ip);
-        let blocking_bypassed = state
-            .inner
-            .blocklist
-            .client_bypasses_blocking(&stat.client_ip, mac.as_deref());
 
         let group = groups.entry(name.clone()).or_insert_with(|| ClientGroup {
             name,
@@ -85,20 +91,23 @@ pub async fn list_clients(
             total: 0,
             blocked: 0,
             last_seen: 0,
-            is_alias,
+            is_alias: info.is_alias,
             blocking_bypassed,
         });
-        group.ips.push(stat.client_ip.clone());
-        if let Some(mac) = mac {
-            if !group.macs.iter().any(|m| m == &mac) {
-                group.macs.push(mac);
+        for ip in &info.ips {
+            if !group.ips.iter().any(|x| x == ip) {
+                group.ips.push(ip.clone());
+            }
+        }
+        for mac in &info.macs {
+            if !group.macs.iter().any(|m| m == mac) {
+                group.macs.push(mac.clone());
             }
         }
         group.total += stat.total;
         group.blocked += stat.blocked;
         group.last_seen = group.last_seen.max(stat.last_seen);
-        // An entry is an alias if *any* of its IPs has a manual alias.
-        if is_alias {
+        if info.is_alias {
             group.is_alias = true;
         }
         if blocking_bypassed {
@@ -208,34 +217,32 @@ pub async fn add_alias(
     }
 }
 
-/// GET /api/clients/:ip/stats — per-client query stats
+/// GET /api/clients/:device/stats — per-device query stats.
+/// `:device` is a device identity token: a MAC, or an IP fallback.
 pub async fn client_ip_stats(
     State(state): State<AppState>,
-    Path(ip): Path<String>,
+    Path(device): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let stats = state
         .inner
         .storage
-        .client_stats(&ip)
+        .client_stats(&device)
         .await?
         .ok_or_else(|| {
             ApiError(crate::error::FeriteError::NotFound(format!(
                 "client '{}' not found",
-                ip
+                device
             )))
         })?;
 
-    let parsed = parse_ip(&ip);
-    if let Some(addr) = parsed {
-        ClientRegistry::trigger_resolve(&state.inner.client_registry, addr);
-    }
-    let name = parsed.and_then(|addr| state.inner.client_registry.get_name(addr));
-    let mac = parsed.and_then(|addr| state.inner.client_registry.get_mac(addr));
+    ClientRegistry::trigger_resolve_device(&state.inner.client_registry, &device);
+    let info = state.inner.client_registry.describe_device(&device);
 
     Ok(Json(json!({
-        "client_ip": stats.client_ip,
-        "name": name,
-        "mac": mac,
+        "device": stats.device,
+        "name": info.name,
+        "ips": info.ips,
+        "mac": info.macs.first(),
         "total": stats.total,
         "blocked": stats.blocked,
         "last_seen": stats.last_seen,

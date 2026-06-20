@@ -61,8 +61,14 @@ pub struct QueryEntry {
     pub domain: String,
     /// Query type (A=1, AAAA=28, CAA=257, …). Matches the 16-bit wire format.
     pub query_type: u16,
-    /// Source IP of the client.
+    /// Source IP of the client at the time of the query.
     pub client_ip: String,
+    /// Stable device identity this query is attributed to: the client's MAC
+    /// (`aa:bb:cc:dd:ee:ff`) when known, else the IP as a fallback. Assigned by
+    /// the stats writer at drain time. Lets a device's history stay contiguous
+    /// across IP changes. Empty until tagged.
+    #[serde(default)]
+    pub device: String,
     /// How the query was resolved.
     pub status: QueryStatus,
     /// Round-trip latency in milliseconds.

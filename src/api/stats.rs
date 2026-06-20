@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::api::ApiError;
 use crate::app::AppState;
-use crate::clients::{parse_ip, unmap_v4, ClientRegistry};
+use crate::clients::{parse_ip, ClientRegistry};
 use crate::dns::types::{QueryEntry, QueryStatus};
 use crate::stats::timeseries::TimeseriesBucket;
 
@@ -75,23 +75,20 @@ pub async fn get_summary(State(state): State<AppState>) -> Result<Json<SummaryRe
             macs: Vec<String>,
         }
         let mut by_name: HashMap<String, Agg> = HashMap::new();
-        for (ip, count) in live.top_clients.top(50) {
-            let parsed = parse_ip(&ip).map(unmap_v4);
-            if let Some(addr) = parsed {
-                ClientRegistry::trigger_resolve(&state.inner.client_registry, addr);
-            }
-            let name = parsed
-                .and_then(|addr| state.inner.client_registry.get_name(addr))
-                .unwrap_or_else(|| ip.clone());
-            let mac = parsed.and_then(|addr| state.inner.client_registry.get_mac(addr));
+        for (device, count) in live.top_clients.top(50) {
+            ClientRegistry::trigger_resolve_device(&state.inner.client_registry, &device);
+            let info = state.inner.client_registry.describe_device(&device);
+            let name = info.name.unwrap_or_else(|| device.clone());
             let agg = by_name.entry(name).or_insert(Agg {
                 total: 0,
                 ips: vec![],
                 macs: vec![],
             });
             agg.total += count;
-            agg.ips.push(ip);
-            if let Some(mac) = mac {
+            for ip in info.ips {
+                push_unique(&mut agg.ips, ip);
+            }
+            for mac in info.macs {
                 push_unique(&mut agg.macs, mac);
             }
         }
@@ -196,22 +193,19 @@ pub async fn get_top_clients(
     }
     let mut by_name: HashMap<String, Agg> = HashMap::new();
     for cs in clients {
-        let parsed = parse_ip(&cs.client_ip).map(unmap_v4);
-        if let Some(addr) = parsed {
-            ClientRegistry::trigger_resolve(&state.inner.client_registry, addr);
-        }
-        let name = parsed
-            .and_then(|addr| state.inner.client_registry.get_name(addr))
-            .unwrap_or_else(|| cs.client_ip.clone());
-        let mac = parsed.and_then(|addr| state.inner.client_registry.get_mac(addr));
+        ClientRegistry::trigger_resolve_device(&state.inner.client_registry, &cs.device);
+        let info = state.inner.client_registry.describe_device(&cs.device);
+        let name = info.name.unwrap_or_else(|| cs.device.clone());
         let agg = by_name.entry(name).or_insert(Agg {
             total: 0,
             ips: vec![],
             macs: vec![],
         });
         agg.total += cs.total;
-        agg.ips.push(cs.client_ip);
-        if let Some(mac) = mac {
+        for ip in info.ips {
+            push_unique(&mut agg.ips, ip);
+        }
+        for mac in info.macs {
             push_unique(&mut agg.macs, mac);
         }
     }

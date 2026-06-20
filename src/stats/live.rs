@@ -68,7 +68,14 @@ impl LiveStats {
         if status == QueryStatus::Blocked {
             self.top_blocked.increment(&entry.domain);
         }
-        self.top_clients.increment(&entry.client_ip);
+        // Key by device (MAC when known, else IP) so the live summary matches the
+        // device-keyed DB rollups. Falls back to the IP for not-yet-tagged entries.
+        let device_key = if entry.device.is_empty() {
+            &entry.client_ip
+        } else {
+            &entry.device
+        };
+        self.top_clients.increment(device_key);
         self.timeseries
             .increment(entry.timestamp.timestamp() as u64, status);
         self.recent_queries.push(entry);

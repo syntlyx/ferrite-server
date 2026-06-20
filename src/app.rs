@@ -185,7 +185,7 @@ impl AppState {
             Ok(rows) => {
                 tracing::info!("seeded top_clients with {} entries", rows.len());
                 let pairs: Vec<(String, u64)> =
-                    rows.into_iter().map(|c| (c.client_ip, c.total)).collect();
+                    rows.into_iter().map(|c| (c.device, c.total)).collect();
                 live_stats.top_clients.seed(&pairs);
             }
             Err(e) => tracing::warn!("failed to seed top_clients: {}", e),
@@ -468,6 +468,7 @@ mod tests {
             domain: domain.to_string(),
             query_type: 1,
             client_ip: client_ip.to_string(),
+            device: client_ip.to_string(),
             status,
             latency_ms: 1,
             upstream: None,

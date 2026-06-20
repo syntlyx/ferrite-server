@@ -102,6 +102,7 @@ mod tests {
             domain: format!("d{id}.test"),
             query_type: 1,
             client_ip: "192.168.1.2".to_string(),
+            device: "192.168.1.2".to_string(),
             status: QueryStatus::Upstream,
             latency_ms: 1,
             upstream: None,

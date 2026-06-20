@@ -27,7 +27,8 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
             // Flush signal from shutdown handler — drain everything then return.
             _ = flush_notify.notified() => {
                 // Drain any remaining entries queued before the signal.
-                while let Ok(entry) = rx.try_recv() {
+                while let Ok(mut entry) = rx.try_recv() {
+                    tag_device(&state, &mut entry);
                     state.inner.live_stats.push_entry(entry.clone());
                     batch.push(entry);
                 }
@@ -42,7 +43,8 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
             result = async {
                 loop {
                     match timeout(FLUSH_INTERVAL, rx.recv()).await {
-                        Ok(Some(entry)) => {
+                        Ok(Some(mut entry)) => {
+                            tag_device(&state, &mut entry);
                             state.inner.live_stats.push_entry(entry.clone());
                             batch.push(entry);
                             if batch.len() >= BATCH_SIZE {
@@ -69,6 +71,21 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
             }
         }
     }
+}
+
+/// Attach a stable device identity to a query as it is drained from the channel.
+///
+/// Tagging here (rather than on the DNS hot path) gives background resolution and
+/// the neighbour-table mirror a few seconds to warm the IP→MAC cache, so a query
+/// from a freshly-rotated address (e.g. an Apple privacy IPv6) lands on its device
+/// MAC instead of fragmenting per IP. Falls back to the IP when no MAC is known.
+fn tag_device(state: &AppState, entry: &mut QueryEntry) {
+    if !entry.device.is_empty() {
+        return;
+    }
+    entry.device = parse_ip(&entry.client_ip)
+        .and_then(|ip| state.inner.client_registry.get_mac(ip))
+        .unwrap_or_else(|| entry.client_ip.clone());
 }
 
 async fn flush_batch(state: &AppState, batch: &mut Vec<QueryEntry>) {

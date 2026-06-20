@@ -180,6 +180,11 @@ async fn run() -> anyhow::Result<()> {
     // so log_retention_days can be changed via PATCH /api/settings without restart.
     tokio::spawn(log_retention_loop(state.clone()));
 
+    // ── Neighbour-table mirror ────────────────────────────────────────────────
+    // Keeps the IP→MAC map warm from the OS ARP/NDP tables so queries from
+    // freshly-rotated addresses are tagged with their device MAC.
+    tokio::spawn(neighbor_mirror_loop(state.clone()));
+
     // ── CPU sampling ────────────────────────────────────────────────────────
     let sampler = state.cpu_sampler.clone();
     tokio::spawn(async move {
@@ -258,6 +263,19 @@ async fn log_retention_loop(state: app::AppState) {
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
+    }
+}
+
+async fn neighbor_mirror_loop(state: app::AppState) {
+    // Small initial delay so startup I/O settles first.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    // A single sequential interval task: ticks never overlap (the loop awaits the
+    // scan before the next tick), so there is at most one ARP/NDP scan in flight.
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+    loop {
+        interval.tick().await;
+        state.inner.client_registry.refresh_neighbor_table().await;
     }
 }
 

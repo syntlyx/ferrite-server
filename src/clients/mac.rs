@@ -141,6 +141,46 @@ fn parse_mac_token(token: &str) -> Option<[u8; 6]> {
     parse_mac(token)
 }
 
+/// Parse any IP token (v4 or v6), stripping `()?,;` decoration and `%scope`.
+fn parse_ip_token(token: &str) -> Option<IpAddr> {
+    let token = token.trim_matches(|c: char| matches!(c, '(' | ')' | '?' | ',' | ';'));
+    token.split('%').next()?.parse().ok()
+}
+
+/// Extract the first `(IP, MAC)` pair from a neighbour-table line. Works across
+/// the macOS (`arp -an`, `ndp -an`) and Linux (`ip neigh show`) formats: a MAC is
+/// exactly 6 colon/hyphen hex groups, so it never collides with an IP token.
+fn parse_neighbor_line(line: &str) -> Option<(IpAddr, [u8; 6])> {
+    let mut ip = None;
+    let mut mac = None;
+    for token in line.split_whitespace() {
+        if mac.is_none() {
+            if let Some(m) = parse_mac_token(token) {
+                mac = Some(m);
+                continue;
+            }
+        }
+        if ip.is_none() {
+            ip = parse_ip_token(token);
+        }
+    }
+    Some((ip?, mac?))
+}
+
+/// Bulk-scan the full ARP + NDP neighbour tables into `(IP, MAC)` pairs.
+/// One subprocess per table (each capped by the 500 ms timeout in `run`), far
+/// cheaper than a per-IP lookup. Incomplete/failed entries (no MAC) are skipped.
+pub async fn scan_neighbors() -> Vec<(IpAddr, [u8; 6])> {
+    let mut out = Vec::new();
+    if let Some(text) = arp_table_text().await {
+        out.extend(text.lines().filter_map(parse_neighbor_line));
+    }
+    if let Some(text) = ndp_table_text().await {
+        out.extend(text.lines().filter_map(parse_neighbor_line));
+    }
+    out
+}
+
 // ── OS-specific ARP I/O ──────────────────────────────────────────────────────
 
 #[cfg(target_os = "macos")]
@@ -257,6 +297,45 @@ mod tests {
             ),
             Some([0xa2, 0xce, 0xc8, 0x12, 0x34, 0x56])
         );
+    }
+
+    #[test]
+    fn neighbor_line_parses_macos_arp() {
+        assert_eq!(
+            parse_neighbor_line("? (192.168.1.5) at a2:ce:c8:12:34:56 on en0 ifscope [ethernet]"),
+            Some((
+                "192.168.1.5".parse::<IpAddr>().unwrap(),
+                [0xa2, 0xce, 0xc8, 0x12, 0x34, 0x56]
+            ))
+        );
+    }
+
+    #[test]
+    fn neighbor_line_parses_linux_neigh() {
+        assert_eq!(
+            parse_neighbor_line("192.168.1.5 dev eth0 lladdr a2:ce:c8:12:34:56 REACHABLE"),
+            Some((
+                "192.168.1.5".parse::<IpAddr>().unwrap(),
+                [0xa2, 0xce, 0xc8, 0x12, 0x34, 0x56]
+            ))
+        );
+    }
+
+    #[test]
+    fn neighbor_line_parses_ipv6_ndp_with_scope() {
+        assert_eq!(
+            parse_neighbor_line("fe80::a0ce:c8ff:fe12:3456%en0 a2:ce:c8:12:34:56 en0 23h59m R"),
+            Some((
+                "fe80::a0ce:c8ff:fe12:3456".parse::<IpAddr>().unwrap(),
+                [0xa2, 0xce, 0xc8, 0x12, 0x34, 0x56]
+            ))
+        );
+    }
+
+    #[test]
+    fn neighbor_line_without_mac_is_skipped() {
+        // INCOMPLETE/FAILED neighbour entries carry no link-layer address.
+        assert_eq!(parse_neighbor_line("192.168.1.9 dev eth0  INCOMPLETE"), None);
     }
 
     #[test]
