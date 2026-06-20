@@ -84,7 +84,10 @@ async fn start_session(state: &AppState) -> Vec<tokio::task::JoinHandle<()>> {
     // panel's listener demuxes by Host and forwards non-panel hosts here via
     // `forward_http`. Otherwise the proxy binds its own HTTP listener.
     let http = if cfg.http_port == state.inner.config.api.bind_addr.port() {
-        tracing::info!("proxy: HTTP routing shared with the panel listener on :{}", cfg.http_port);
+        tracing::info!(
+            "proxy: HTTP routing shared with the panel listener on :{}",
+            cfg.http_port
+        );
         None
     } else {
         bind(cfg.http_port).await

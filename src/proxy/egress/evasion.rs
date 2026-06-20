@@ -34,7 +34,11 @@ pub struct EvasionEgress {
 
 impl EvasionEgress {
     pub fn new(id: String, upstream: Arc<ZoneRouter>, seg_position: Option<u16>) -> Self {
-        Self { id, upstream, params: EvasionParams { seg_position } }
+        Self {
+            id,
+            upstream,
+            params: EvasionParams { seg_position },
+        }
     }
 
     pub fn id(&self) -> &str {
@@ -96,16 +100,43 @@ mod tests {
     #[test]
     fn configured_offset_is_used_when_in_bounds() {
         let buf = vec![0u8; 40];
-        assert_eq!(split_position(&buf, &EvasionParams { seg_position: Some(10) }), Some(10));
+        assert_eq!(
+            split_position(
+                &buf,
+                &EvasionParams {
+                    seg_position: Some(10)
+                }
+            ),
+            Some(10)
+        );
     }
 
     #[test]
     fn out_of_range_or_zero_offset_falls_through_to_sni() {
         // Junk has no SNI, so with no usable offset there's no split point.
         let junk = b"GET / HTTP/1.1\r\n\r\n".to_vec();
-        assert_eq!(split_position(&junk, &EvasionParams { seg_position: Some(0) }), None);
-        assert_eq!(split_position(&junk, &EvasionParams { seg_position: Some(9999) }), None);
-        assert_eq!(split_position(&junk, &EvasionParams { seg_position: None }), None);
+        assert_eq!(
+            split_position(
+                &junk,
+                &EvasionParams {
+                    seg_position: Some(0)
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            split_position(
+                &junk,
+                &EvasionParams {
+                    seg_position: Some(9999)
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            split_position(&junk, &EvasionParams { seg_position: None }),
+            None
+        );
     }
 
     #[tokio::test]
@@ -114,9 +145,15 @@ mod tests {
         let (mut tx, mut rx) = tokio::io::duplex(64 * 1024);
         let payload = data.clone();
         let writer = tokio::spawn(async move {
-            write_split(&mut tx, &payload, &EvasionParams { seg_position: Some(73) })
-                .await
-                .unwrap();
+            write_split(
+                &mut tx,
+                &payload,
+                &EvasionParams {
+                    seg_position: Some(73),
+                },
+            )
+            .await
+            .unwrap();
             tx.shutdown().await.unwrap();
         });
         let mut got = Vec::new();

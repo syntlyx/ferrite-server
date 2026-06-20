@@ -160,7 +160,6 @@ fn validate(cfg: &ProxyConfig) -> Result<(), ApiError> {
     Ok(())
 }
 
-
 /// Strip secrets before returning config to the UI: the socks5 password and the
 /// whole wireguard `.conf` (it embeds the PrivateKey). The UI re-sends them only
 /// when changing them; a blank value on save means "keep the stored one".
@@ -223,7 +222,9 @@ fn private_key_value(text: &str) -> Option<String> {
 }
 
 fn is_private_key_line(line: &str) -> bool {
-    line.trim_start().to_ascii_lowercase().starts_with("privatekey")
+    line.trim_start()
+        .to_ascii_lowercase()
+        .starts_with("privatekey")
 }
 
 /// The `PublicKey` value from a `.conf` — a stable per-peer identity (it isn't
@@ -247,7 +248,8 @@ fn match_prev<'a>(old: &'a ProxyConfig, e: &EgressConfig, id: &str) -> Option<&'
             let pk = wg_public_key(e.config.as_deref().unwrap_or(""))?;
             old.egresses.iter().find(|p| {
                 p.kind.eq_ignore_ascii_case("wireguard")
-                    && wg_public_key(p.config.as_deref().unwrap_or("")).as_deref() == Some(pk.as_str())
+                    && wg_public_key(p.config.as_deref().unwrap_or("")).as_deref()
+                        == Some(pk.as_str())
             })
         }
         "socks5" => {
@@ -435,10 +437,22 @@ mod tests {
 
         // GET shows the .conf with ONLY the PrivateKey masked (Proton-style).
         let Json(v) = get_proxy(State(state.clone())).await;
-        let shown = v["proxy"]["egresses"][0]["config"].as_str().unwrap().to_string();
-        assert!(shown.contains("PrivateKey = ********"), "key must be masked: {shown}");
-        assert!(!shown.contains(&format!("PrivateKey = {k}")), "raw key leaked: {shown}");
-        assert!(shown.contains("Address = 10.9.0.2/32"), "non-secret lines must stay");
+        let shown = v["proxy"]["egresses"][0]["config"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            shown.contains("PrivateKey = ********"),
+            "key must be masked: {shown}"
+        );
+        assert!(
+            !shown.contains(&format!("PrivateKey = {k}")),
+            "raw key leaked: {shown}"
+        );
+        assert!(
+            shown.contains("Address = 10.9.0.2/32"),
+            "non-secret lines must stay"
+        );
 
         // Re-saving the masked .conf (what the UI echoes back) restores the real key.
         let cfg2 = ProxyConfig {

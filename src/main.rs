@@ -96,8 +96,10 @@ async fn run() -> anyhow::Result<()> {
         // configured `debug_logging` flag adjust it once config is loaded (and the
         // Settings API toggle it live). The filter sits behind a reload layer so
         // that toggle needs no restart.
-        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(logbuf::filter_directive(false)));
+        let env_filter =
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(logbuf::filter_directive(false))
+            });
         let (filter, filter_handle) = tracing_subscriber::reload::Layer::new(env_filter);
         logbuf::install_filter_handle(filter_handle);
         // stdout (journald/Docker) as before + an in-memory ring for GET /api/logs.

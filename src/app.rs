@@ -375,7 +375,9 @@ fn panel_hosts(config: &Config) -> std::collections::HashSet<String> {
     hosts.insert("localhost".to_string());
     hosts.insert(Ipv4Addr::LOCALHOST.to_string());
     hosts.insert("::1".to_string());
-    let domain = panel_domain(config).trim_end_matches('.').to_ascii_lowercase();
+    let domain = panel_domain(config)
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
     if !domain.is_empty() {
         hosts.insert(domain);
     }

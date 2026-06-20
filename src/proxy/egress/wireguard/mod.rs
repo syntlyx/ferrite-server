@@ -169,7 +169,10 @@ impl WgEgress {
         let conf = parse(text)?;
         let dns = conf.dns.clone();
         // Per-connection socket buffer (bytes), clamped; drives the TCP window.
-        let buffer = cfg.buffer_kb.unwrap_or(DEFAULT_BUFFER_KB).clamp(MIN_BUFFER_KB, MAX_BUFFER_KB) as usize
+        let buffer = cfg
+            .buffer_kb
+            .unwrap_or(DEFAULT_BUFFER_KB)
+            .clamp(MIN_BUFFER_KB, MAX_BUFFER_KB) as usize
             * 1024;
 
         let (ctrl_tx, ctrl_rx) = mpsc::channel(64);
@@ -401,7 +404,14 @@ async fn run_tunnel(
     // connection that would re-trigger the handshake. An explicit `0` (disabled)
     // is respected — only `None` gets the default.
     let keepalive = conf.persistent_keepalive.or(Some(DEFAULT_KEEPALIVE));
-    let mut tunn = Tunn::new(static_private, peer_public, conf.preshared_key, keepalive, 0, None);
+    let mut tunn = Tunn::new(
+        static_private,
+        peer_public,
+        conf.preshared_key,
+        keepalive,
+        0,
+        None,
+    );
 
     // ── smoltcp interface over the packet-shuttle device ──
     let mtu = conf.mtu.map(|m| m as usize).unwrap_or(DEFAULT_MTU);

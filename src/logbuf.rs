@@ -28,7 +28,11 @@ static FILTER_HANDLE: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::
 /// The env-filter directive for a debug state. Debug raises the `ferrite` target
 /// to debug level only — dependencies stay at info so the log doesn't flood.
 pub fn filter_directive(debug: bool) -> &'static str {
-    if debug { "ferrite=debug" } else { "ferrite=info" }
+    if debug {
+        "ferrite=debug"
+    } else {
+        "ferrite=info"
+    }
 }
 
 /// Store the reload handle (called by `main` right after building the subscriber).

@@ -250,7 +250,10 @@ mod tests {
     #[test]
     fn dot_builds_with_literal_ip_and_tls_name() {
         let cfg = client_config().expect("client config");
-        assert!(TunneledResolver::dot(no_proxy(), "eg", "1.1.1.1", 853, "cloudflare-dns.com", cfg).is_ok());
+        assert!(
+            TunneledResolver::dot(no_proxy(), "eg", "1.1.1.1", 853, "cloudflare-dns.com", cfg)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -298,9 +301,8 @@ mod tests {
             s.flush().await.unwrap();
         });
 
-        let r =
-            TunneledResolver::plain(no_proxy(), "proton", &addr.ip().to_string(), addr.port())
-                .unwrap();
+        let r = TunneledResolver::plain(no_proxy(), "proton", &addr.ip().to_string(), addr.port())
+            .unwrap();
         let (resp, label) = r.resolve_raw(vec![0xab, 0xcd, 0x01, 0x02]).await.unwrap();
         assert_eq!(resp, vec![0xab, 0xcd, 0x01, 0x02]);
         assert!(label.contains("direct fallback"), "label was {label}");

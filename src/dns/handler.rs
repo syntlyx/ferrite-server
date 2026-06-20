@@ -111,9 +111,10 @@ pub async fn handle_query(
     // domain is never blocked (you asked for it on purpose). Synthetic + returned
     // early (NOT cached): routing rules are runtime-mutable, so a cached redirect
     // could outlive a deletion.
-    if let Some(intercept) = state
-        .proxy
-        .maybe_intercept(&query, &name, qtype, &client_ip, client_mac.as_deref())
+    if let Some(intercept) =
+        state
+            .proxy
+            .maybe_intercept(&query, &name, qtype, &client_ip, client_mac.as_deref())
     {
         if !log_ignored {
             let elapsed = start.elapsed().as_millis() as u32;
@@ -297,7 +298,10 @@ pub async fn handle_query(
     // covers the first, uncached lookup so `max_ttl` reliably bounds what every
     // client caches — e.g. how long a client clings to a pre-rule direct answer
     // before re-querying and getting routed.
-    Ok(cap_ttls(response_bytes, state.dns_cache.max_ttl_secs() as u32))
+    Ok(cap_ttls(
+        response_bytes,
+        state.dns_cache.max_ttl_secs() as u32,
+    ))
 }
 
 // ---------------------------------------------------------------------------

@@ -14,8 +14,8 @@ mod intercept;
 mod rules;
 mod sni;
 
-pub use intercept::run;
 pub(crate) use intercept::forward_http;
+pub use intercept::run;
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -99,7 +99,12 @@ struct Snapshot {
 }
 
 impl Snapshot {
-    fn route(&self, name: &str, client_ip: &str, client_mac: Option<&str>) -> Option<&CompiledRule> {
+    fn route(
+        &self,
+        name: &str,
+        client_ip: &str,
+        client_mac: Option<&str>,
+    ) -> Option<&CompiledRule> {
         self.rules
             .iter()
             .find(|r| r.matches(name) && r.matches_client(client_ip, client_mac))
@@ -153,7 +158,11 @@ impl ProxyState {
     /// Does any rule restrict to specific clients? The DNS handler resolves the
     /// client MAC for routing only when this is true (otherwise it's free).
     pub fn has_client_rules(&self) -> bool {
-        self.registry.load().rules.iter().any(|r| !r.clients.is_empty())
+        self.registry
+            .load()
+            .rules
+            .iter()
+            .any(|r| !r.clients.is_empty())
     }
 
     /// DNS hot-path hook: returns an answer pointing at our advertise IP when
@@ -390,7 +399,11 @@ mod tests {
     fn does_not_route_unmatched_domain() {
         let proxy = state(true);
         let q = query("other.test", RecordType::A);
-        assert!(proxy.maybe_intercept(&q, "other.test", qtype::A, "0.0.0.0", None).is_none());
+        assert!(
+            proxy
+                .maybe_intercept(&q, "other.test", qtype::A, "0.0.0.0", None)
+                .is_none()
+        );
     }
 
     #[test]

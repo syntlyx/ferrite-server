@@ -32,10 +32,10 @@ pub(super) async fn dispatch(mut stream: TcpStream, state: AppState, router: Rou
     let host = loop {
         let mut tmp = [0u8; 4096];
         let n = match timeout(PEEK_TIMEOUT, stream.read(&mut tmp)).await {
-            Ok(Ok(0)) => break None,  // client closed before sending a request
+            Ok(Ok(0)) => break None, // client closed before sending a request
             Ok(Ok(n)) => n,
-            Ok(Err(_)) => return,     // read error — drop
-            Err(_) => break None,     // peek timed out — treat as panel
+            Ok(Err(_)) => return, // read error — drop
+            Err(_) => break None, // peek timed out — treat as panel
         };
         buf.extend_from_slice(&tmp[..n]);
         match parse_http_host(&buf) {
@@ -78,7 +78,11 @@ struct Prefixed<S> {
 
 impl<S> Prefixed<S> {
     fn new(prefix: Vec<u8>, inner: S) -> Self {
-        Self { prefix, pos: 0, inner }
+        Self {
+            prefix,
+            pos: 0,
+            inner,
+        }
     }
 }
 
@@ -101,7 +105,11 @@ impl<S: AsyncRead + Unpin> AsyncRead for Prefixed<S> {
 }
 
 impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
