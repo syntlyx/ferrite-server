@@ -36,6 +36,8 @@ pub struct AppStateInner {
     pub upstream_pool: Arc<ZoneRouter>,
     pub custom_records: Arc<CustomRecords>,
     pub client_registry: Arc<ClientRegistry>,
+    /// Selective per-domain routing (egresses + rules + listeners).
+    pub proxy: Arc<crate::proxy::ProxyState>,
     /// Path to the warm-restart snapshot file.
     pub snapshot_path: std::path::PathBuf,
     /// Hot-patchable list of domain patterns to suppress from the query log.
@@ -258,6 +260,11 @@ impl AppState {
         let client_registry =
             ClientRegistry::new(Arc::clone(&upstream_pool), Arc::clone(&storage)).await;
 
+        // Selective routing / proxy. Egresses resolve real hosts through this
+        // same upstream pool (never the OS resolver, which would loop back into
+        // ferrite's own DNS for routed names).
+        let proxy = crate::proxy::ProxyState::from_config(&config.proxy, Arc::clone(&upstream_pool));
+
         // Query channel
         let (query_tx, query_rx) = mpsc::channel(QUERY_CHANNEL_CAPACITY);
 
@@ -272,6 +279,7 @@ impl AppState {
             upstream_pool,
             custom_records,
             client_registry,
+            proxy,
             snapshot_path,
             log_ignore: Arc::new(RwLock::new(config.dns.log_ignore.clone())),
             query_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),

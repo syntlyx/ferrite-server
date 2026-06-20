@@ -126,6 +126,33 @@ pub async fn handle_query(
         return Ok(build_nxdomain(&query));
     }
 
+    // ── Step 2.5: Selective routing / proxy interception ──────────────────
+    // For a routed domain, answer with our advertise IP so the client connects
+    // to the proxy listeners. Synthetic + returned early (NOT cached): routing
+    // rules are runtime-mutable, so a cached redirect could outlive a deletion.
+    if let Some(intercept) = state
+        .proxy
+        .maybe_intercept(&query, &name, qtype, &state.blocklist)
+    {
+        if !log_ignored {
+            let elapsed = start.elapsed().as_millis() as u32;
+            emit(
+                &state,
+                &query_tx,
+                make_entry(
+                    &name,
+                    qtype,
+                    &client_ip,
+                    QueryStatus::Allowed,
+                    elapsed,
+                    Some(format!("proxy:{}", intercept.egress_id)),
+                    0,
+                ),
+            );
+        }
+        return Ok(patch_id(&intercept.response.bytes, query.metadata.id));
+    }
+
     // ── Step 3: DNS response cache ────────────────────────────────────────
     if let Some((cached, remaining_ttl)) = state.dns_cache.get_with_remaining(&name, qtype) {
         if filtering_enabled {

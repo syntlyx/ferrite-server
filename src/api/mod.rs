@@ -5,6 +5,7 @@ pub mod custom_records;
 pub mod error;
 pub mod lists;
 pub mod middleware;
+pub mod proxy;
 pub mod queries;
 pub mod settings;
 pub mod stats;
@@ -15,7 +16,7 @@ pub use error::ApiError;
 
 use axum::{
     middleware as axum_middleware,
-    routing::{delete, get, patch, post},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use tower_http::trace::TraceLayer;
@@ -79,6 +80,9 @@ pub fn build_router(state: AppState) -> Router {
         // Settings
         .route("/settings", get(settings::get_settings))
         .route("/settings", patch(settings::update_settings))
+        // Selective routing / proxy
+        .route("/proxy", get(proxy::get_proxy))
+        .route("/proxy", put(proxy::put_proxy))
         // Updates
         .route("/update/check", get(update::check_update))
         .route("/update/server", post(update::update_server))

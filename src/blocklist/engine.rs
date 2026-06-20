@@ -591,7 +591,10 @@ fn compile_wildcards(patterns: &[String]) -> Vec<Regex> {
         .collect()
 }
 
-fn wildcard_to_regex(pattern: &str) -> Result<Regex> {
+/// Compile a domain wildcard pattern (`*.example.com`) into an anchored regex.
+/// Exposed to the crate so the proxy routing engine can reuse the exact same
+/// wildcard semantics as the blocklist (`\*` → `.*`, anchored `^…$`).
+pub(crate) fn wildcard_to_regex(pattern: &str) -> Result<Regex> {
     if pattern == "*" || pattern.trim_matches('*').is_empty() {
         return Err(FeriteError::Config(
             "wildcard pattern cannot match everything".into(),

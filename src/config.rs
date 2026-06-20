@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::collections::{BTreeSet, HashSet};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 
 use crate::clients::normalize_client_key;
@@ -38,6 +38,9 @@ pub struct Config {
     pub zones: Vec<ZoneConfig>,
     #[serde(default)]
     pub custom_records: Vec<CustomRecordConfig>,
+    /// Selective per-domain routing through tunnels/proxies (egresses).
+    #[serde(default)]
+    pub proxy: ProxyConfig,
     /// Override path for static web UI files. If unset, defaults to `data_dir()/web`.
     /// Useful during frontend development to point at a local `dist/` folder.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -195,6 +198,154 @@ pub struct ListConfig {
     pub enabled: bool,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_http_port() -> u16 {
+    80
+}
+
+fn default_https_port() -> u16 {
+    443
+}
+
+fn default_max_connections() -> usize {
+    128
+}
+
+/// Selective per-domain routing.
+///
+/// For a domain that matches a rule, DNS answers with ferrite's own LAN IP so
+/// the client connects to us; the proxy listeners on `http_port`/`https_port`
+/// then read the SNI/Host and forward the connection through the named egress.
+/// The config file is written by the server (web UI is the primary editor);
+/// hand-editing is supported but not required.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ProxyConfig {
+    pub enabled: bool,
+    /// Plain-HTTP listener port (privileged 80 by default; override for non-root dev).
+    pub http_port: u16,
+    /// TLS (SNI) listener port (privileged 443 by default; override for non-root dev).
+    pub https_port: u16,
+    /// IPv4 address advertised in DNS answers for routed domains. Auto-detected
+    /// at startup when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub advertise_ipv4: Option<Ipv4Addr>,
+    /// IPv6 address advertised for routed domains. When unset, AAAA queries for
+    /// routed domains return NODATA so clients fall back to IPv4.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub advertise_ipv6: Option<Ipv6Addr>,
+    /// Hard cap on simultaneous proxied connections (bounds memory).
+    pub max_connections: usize,
+    pub egresses: Vec<EgressConfig>,
+    pub rules: Vec<RuleConfig>,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            http_port: default_http_port(),
+            https_port: default_https_port(),
+            advertise_ipv4: None,
+            advertise_ipv6: None,
+            max_connections: default_max_connections(),
+            egresses: Vec::new(),
+            rules: Vec::new(),
+        }
+    }
+}
+
+/// A named egress backend. Flat (not a flattened tagged enum) so it round-trips
+/// cleanly through TOML serialization, which `persist_config` relies on. The
+/// `kind` discriminator selects which of the optional fields apply; the egress
+/// builder validates that the required ones are present.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EgressConfig {
+    /// Stable identifier referenced by rules (lowercased).
+    pub id: String,
+    /// Human-friendly display name (defaults to `id`).
+    #[serde(default)]
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// `"direct"` | `"socks5"` (more kinds in later releases).
+    pub kind: String,
+    // ── socks5 fields ──
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+/// Maps a domain pattern to an egress. `pattern` is an exact domain (matches the
+/// name and its subdomains) or a wildcard (`*.example.com`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RuleConfig {
+    pub pattern: String,
+    pub egress: String,
+    /// When the chosen egress is unhealthy: refuse the connection (true) rather
+    /// than leak it directly (false). Enforced at connect time, not DNS time.
+    #[serde(default = "default_true")]
+    pub fail_closed: bool,
+}
+
+impl ProxyConfig {
+    pub fn normalize(&mut self) {
+        // Normalize egress ids/names; drop empties and duplicate ids (last wins).
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut kept: Vec<EgressConfig> = Vec::with_capacity(self.egresses.len());
+        for mut e in std::mem::take(&mut self.egresses).into_iter().rev() {
+            e.id = e.id.trim().to_ascii_lowercase();
+            e.kind = e.kind.trim().to_ascii_lowercase();
+            if e.id.is_empty() {
+                tracing::warn!("proxy: dropping egress with empty id");
+                continue;
+            }
+            if !seen.insert(e.id.clone()) {
+                tracing::warn!("proxy: duplicate egress id '{}', keeping last definition", e.id);
+                continue;
+            }
+            e.name = if e.name.trim().is_empty() {
+                e.id.clone()
+            } else {
+                e.name.trim().to_string()
+            };
+            kept.push(e);
+        }
+        kept.reverse();
+        self.egresses = kept;
+
+        // Normalize rule patterns; drop rules referencing an unknown egress.
+        let ids: HashSet<&str> = self.egresses.iter().map(|e| e.id.as_str()).collect();
+        let mut rules = std::mem::take(&mut self.rules);
+        rules.retain_mut(|r| {
+            r.pattern = r.pattern.trim().trim_end_matches('.').to_ascii_lowercase();
+            r.egress = r.egress.trim().to_ascii_lowercase();
+            if r.pattern.is_empty() {
+                tracing::warn!("proxy: dropping rule with empty pattern");
+                return false;
+            }
+            if !ids.contains(r.egress.as_str()) {
+                tracing::warn!(
+                    "proxy: rule '{}' references unknown egress '{}', dropping",
+                    r.pattern,
+                    r.egress
+                );
+                return false;
+            }
+            true
+        });
+        self.rules = rules;
+    }
+}
+
 impl Default for DnsConfig {
     fn default() -> Self {
         Self {
@@ -279,6 +430,7 @@ impl Default for Config {
             blocklist: BlocklistConfig::default(),
             zones: vec![],
             custom_records: vec![],
+            proxy: ProxyConfig::default(),
             web_dir: None,
         }
     }
@@ -318,6 +470,7 @@ impl Config {
         self.api.normalize();
         self.panel.normalize();
         self.blocklist.normalize();
+        self.proxy.normalize();
     }
 
     pub fn config_candidates() -> Vec<PathBuf> {
@@ -481,6 +634,101 @@ mod tests {
 
         assert!(!raw.contains("api_key"));
         assert!(!raw.contains("password_hash"));
+    }
+
+    #[test]
+    fn proxy_config_defaults_to_disabled_on_standard_ports() {
+        let cfg = Config::default();
+        assert!(!cfg.proxy.enabled);
+        assert_eq!(cfg.proxy.http_port, 80);
+        assert_eq!(cfg.proxy.https_port, 443);
+        assert_eq!(cfg.proxy.max_connections, 128);
+        assert!(cfg.proxy.egresses.is_empty());
+        assert!(cfg.proxy.rules.is_empty());
+    }
+
+    #[test]
+    fn proxy_config_parses_egresses_and_rules_and_round_trips_toml() {
+        let cfg = toml::from_str::<Config>(
+            r#"
+            [proxy]
+            enabled = true
+            http_port = 8080
+            https_port = 8443
+            advertise_ipv4 = "192.168.1.10"
+
+            [[proxy.egresses]]
+            id = "Work"
+            name = "Work SOCKS"
+            kind = "socks5"
+            address = "10.0.0.1"
+            port = 1080
+
+            [[proxy.rules]]
+            pattern = "*.Google.com"
+            egress = "work"
+            "#,
+        )
+        .unwrap()
+        .normalized();
+
+        assert!(cfg.proxy.enabled);
+        assert_eq!(cfg.proxy.http_port, 8080);
+        assert_eq!(cfg.proxy.advertise_ipv4.unwrap().to_string(), "192.168.1.10");
+        assert_eq!(cfg.proxy.egresses.len(), 1);
+        // id lowercased, name preserved.
+        assert_eq!(cfg.proxy.egresses[0].id, "work");
+        assert_eq!(cfg.proxy.egresses[0].name, "Work SOCKS");
+        assert_eq!(cfg.proxy.egresses[0].kind, "socks5");
+        assert_eq!(cfg.proxy.egresses[0].port, Some(1080));
+        // rule pattern lowercased + trailing dot stripped; fail_closed defaults true.
+        assert_eq!(cfg.proxy.rules.len(), 1);
+        assert_eq!(cfg.proxy.rules[0].pattern, "*.google.com");
+        assert_eq!(cfg.proxy.rules[0].egress, "work");
+        assert!(cfg.proxy.rules[0].fail_closed);
+
+        // Must round-trip through TOML serialization (persist_config relies on it).
+        let raw = toml::to_string_pretty(&cfg).unwrap();
+        let reparsed = toml::from_str::<Config>(&raw).unwrap().normalized();
+        assert_eq!(reparsed.proxy.egresses.len(), 1);
+        assert_eq!(reparsed.proxy.rules.len(), 1);
+    }
+
+    #[test]
+    fn proxy_normalize_drops_dup_egress_ids_and_dangling_rules() {
+        let cfg = toml::from_str::<Config>(
+            r#"
+            [proxy]
+            enabled = true
+
+            [[proxy.egresses]]
+            id = "a"
+            kind = "direct"
+
+            [[proxy.egresses]]
+            id = "A"
+            kind = "direct"
+
+            [[proxy.rules]]
+            pattern = "example.com"
+            egress = "a"
+
+            [[proxy.rules]]
+            pattern = "leak.com"
+            egress = "ghost"
+            "#,
+        )
+        .unwrap()
+        .normalized();
+
+        // Duplicate id (case-insensitive) collapses to one.
+        assert_eq!(cfg.proxy.egresses.len(), 1);
+        assert_eq!(cfg.proxy.egresses[0].id, "a");
+        // name defaulted to id.
+        assert_eq!(cfg.proxy.egresses[0].name, "a");
+        // The rule pointing at a non-existent egress is dropped; the valid one stays.
+        assert_eq!(cfg.proxy.rules.len(), 1);
+        assert_eq!(cfg.proxy.rules[0].pattern, "example.com");
     }
 
     #[test]

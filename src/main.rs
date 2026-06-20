@@ -5,6 +5,7 @@ mod clients;
 mod config;
 mod dns;
 mod error;
+mod proxy;
 mod setup;
 mod snapshot;
 mod stats;
@@ -184,6 +185,12 @@ async fn run() -> anyhow::Result<()> {
     // Keeps the IP→MAC map warm from the OS ARP/NDP tables so queries from
     // freshly-rotated addresses are tagged with their device MAC.
     tokio::spawn(neighbor_mirror_loop(state.clone()));
+
+    // ── Selective routing / proxy ─────────────────────────────────────────────
+    // Detached (not in the try_join! below) so a listener bind failure — :80/:443
+    // already in use, or no privilege to bind them — degrades gracefully instead
+    // of taking down DNS/API. No-op when proxy is disabled.
+    tokio::spawn(proxy::run(state.clone()));
 
     // ── CPU sampling ────────────────────────────────────────────────────────
     let sampler = state.cpu_sampler.clone();
