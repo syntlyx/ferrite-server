@@ -4,8 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use chrono::Utc;
-use hickory_proto::op::{Message, OpCode, ResponseCode};
+use hickory_proto::op::{Edns, Message, OpCode, ResponseCode};
 use hickory_proto::rr::RData;
+use hickory_proto::rr::rdata::opt::EdnsCode;
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use tokio::sync::mpsc;
 
@@ -210,8 +211,11 @@ pub async fn handle_query(
     }
 
     // ── Step 4: Forward to upstream ───────────────────────────────────────
+    // Harden the outbound query: drop EDNS Client Subnet (so the resolver never
+    // learns the client's subnet) and request DNSSEC (DO bit), per config.
+    let upstream_query = sanitize_query(&raw, state.config.dns.strip_ecs, state.config.dns.dnssec);
     let (response_bytes, rcode, upstream_label) =
-        match state.upstream_pool.resolve_raw(raw.clone()).await {
+        match state.upstream_pool.resolve_raw(upstream_query).await {
             // Only trust a response we can actually decode. Unparseable bytes
             // are turned into SERVFAIL so they're never cached (step 6 caches
             // rcode==0 only) or served as if they were a valid NOERROR answer.
@@ -516,6 +520,38 @@ fn cache_ttl(bytes: &[u8]) -> Option<u32> {
     (neg > 0).then_some(neg)
 }
 
+/// Harden a client query before it leaves ferrite: with `strip_ecs`, drop the
+/// EDNS Client Subnet option (so the upstream resolver never learns the client's
+/// subnet); with `dnssec`, set the DNSSEC-OK (DO) bit so the resolver returns
+/// signatures and validates. Returns the original bytes unchanged when both are
+/// off, or on any parse/encode error — a sanitization hiccup must never break
+/// forwarding.
+fn sanitize_query(raw: &[u8], strip_ecs: bool, dnssec: bool) -> Vec<u8> {
+    if !strip_ecs && !dnssec {
+        return raw.to_vec();
+    }
+    let Ok(mut msg) = Message::from_bytes(raw) else {
+        return raw.to_vec();
+    };
+    if strip_ecs && let Some(edns) = msg.edns.as_mut() {
+        edns.options_mut().remove(EdnsCode::Subnet);
+    }
+    if dnssec {
+        match msg.edns.as_mut() {
+            Some(edns) => {
+                edns.set_dnssec_ok(true);
+            }
+            None => {
+                let mut edns = Edns::new();
+                edns.set_max_payload(1232);
+                edns.set_dnssec_ok(true);
+                msg.set_edns(edns);
+            }
+        }
+    }
+    msg.to_bytes().unwrap_or_else(|_| raw.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,6 +566,52 @@ mod tests {
     use crate::blocklist::Blocklist;
     use crate::config::{BlocklistConfig, CustomRecordConfig};
     use crate::test_support;
+
+    #[test]
+    fn sanitize_query_strips_ecs_and_sets_do() {
+        use hickory_proto::op::Edns;
+        use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
+
+        // A query carrying EDNS Client Subnet and no DO bit.
+        let mut q = Message::new(0x1234, MessageType::Query, OpCode::Query);
+        q.add_query(Query::query(
+            Name::from_str("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let mut edns = Edns::new();
+        edns.options_mut()
+            .insert(EdnsOption::Subnet(ClientSubnet::new(
+                "1.2.3.0".parse().unwrap(),
+                24,
+                0,
+            )));
+        q.set_edns(edns);
+        let raw = q.to_bytes().unwrap();
+
+        // Strip ECS + set DO.
+        let out = sanitize_query(&raw, true, true);
+        let parsed = Message::from_bytes(&out).unwrap();
+        let edns = parsed.edns.as_ref().expect("edns present");
+        assert!(
+            edns.options().get(EdnsCode::Subnet).is_none(),
+            "ECS must be stripped"
+        );
+        assert!(edns.flags().dnssec_ok, "DO bit must be set");
+
+        // Both off → bytes returned unchanged.
+        assert_eq!(sanitize_query(&raw, false, false), raw);
+
+        // DNSSEC on a query with no EDNS adds an OPT with DO set.
+        let mut bare = Message::new(1, MessageType::Query, OpCode::Query);
+        bare.add_query(Query::query(
+            Name::from_str("test.").unwrap(),
+            RecordType::A,
+        ));
+        let raw_bare = bare.to_bytes().unwrap();
+        let out_bare = sanitize_query(&raw_bare, true, true);
+        let parsed_bare = Message::from_bytes(&out_bare).unwrap();
+        assert!(parsed_bare.edns.as_ref().unwrap().flags().dnssec_ok);
+    }
 
     fn temp_fst_path(name: &str) -> PathBuf {
         let unique = format!(

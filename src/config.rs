@@ -96,6 +96,15 @@ pub struct DnsConfig {
     /// Domains to suppress from the query log entirely.
     /// Supports exact names (`fe.te`) and wildcard suffixes (`*.local`).
     pub log_ignore: Vec<String>,
+    /// Strip EDNS Client Subnet (RFC 7871) from upstream queries so a resolver
+    /// never learns the client's subnet. On by default.
+    #[serde(default = "default_true")]
+    pub strip_ecs: bool,
+    /// Set the DNSSEC-OK (DO) bit on upstream queries and forward signatures
+    /// untouched. Enforcement relies on a validating upstream over a secure
+    /// channel (DoT/DoH/tunnel) — ferrite does not validate locally yet. On by default.
+    #[serde(default = "default_true")]
+    pub dnssec: bool,
 }
 
 /// Route a DNS zone to a specific upstream server instead of the default pool.
@@ -398,6 +407,8 @@ impl Default for DnsConfig {
                 "*.local".to_string(),
                 "*.localdomain".to_string(),
             ],
+            strip_ecs: true,
+            dnssec: true,
         }
     }
 }

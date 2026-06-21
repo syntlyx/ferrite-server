@@ -68,7 +68,8 @@ mod nullable {
 ///                             `dns_log_ignore`, `web_dir`, `log_retention_days`,
 ///                             `blocklist_enabled`, `blocklist_client_bypass`,
 ///                             `debug_logging`.
-/// Restart-required:           `dns_bind_addr`, `dns_cache_size`, `api_bind_addr`,
+/// Restart-required:           `dns_bind_addr`, `dns_cache_size`, `dns_strip_ecs`,
+///                             `dns_dnssec`, `api_bind_addr`,
 ///                             `blocklist_decision_cache_size`, `upstream`, `zones`,
 ///                             `panel_enabled`, `panel_domain`, `panel_ipv4`, `panel_url`.
 #[derive(Debug, Deserialize, Default)]
@@ -91,6 +92,8 @@ pub struct SettingsPatch {
     // ── Restart-required ─────────────────────────────────────────────────────
     pub dns_bind_addr: Option<String>,
     pub dns_cache_size: Option<usize>,
+    pub dns_strip_ecs: Option<bool>,
+    pub dns_dnssec: Option<bool>,
     pub blocklist_decision_cache_size: Option<usize>,
     pub api_bind_addr: Option<String>,
     pub upstream: Option<Vec<UpstreamConfig>>,
@@ -250,6 +253,16 @@ pub async fn update_settings(
         if let Some(size) = patch.dns_cache_size {
             cfg.dns.cache_size = size;
             restart_changed.push("dns_cache_size");
+        }
+
+        if let Some(v) = patch.dns_strip_ecs {
+            cfg.dns.strip_ecs = v;
+            restart_changed.push("dns_strip_ecs");
+        }
+
+        if let Some(v) = patch.dns_dnssec {
+            cfg.dns.dnssec = v;
+            restart_changed.push("dns_dnssec");
         }
 
         if let Some(size) = patch.blocklist_decision_cache_size {
