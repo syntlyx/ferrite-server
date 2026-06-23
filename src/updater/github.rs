@@ -76,11 +76,15 @@ pub fn update_available(
     let latest = parse_semver(latest_version);
     let current = parse_semver(current_version);
     let version_newer = latest > current;
+    // A same-version update is only real when we can PROVE the artifact bytes
+    // differ — i.e. both checksums are known and mismatched. When our installed
+    // checksum is unknown (e.g. a locally-built binary with no `.sha256` sidecar)
+    // we must NOT claim an update at the same version, or every such install sees
+    // a spurious "0.1.4 → 0.1.4" offer.
     let checksum_changed = match (latest_sha256, installed_sha256) {
         (Some(latest_sha256), Some(current_sha256)) => {
             latest == current && latest_sha256 != current_sha256
         }
-        (Some(_), None) => latest == current,
         _ => false,
     };
 
@@ -419,6 +423,13 @@ mod tests {
     #[test]
     fn update_available_when_newer_version_has_no_installed_checksum() {
         assert!(update_available("0.1.1", "0.1.0", Some(SHA_A), None));
+    }
+
+    #[test]
+    fn update_not_available_at_same_version_when_installed_checksum_unknown() {
+        // Locally-built binary (no .sha256 sidecar) on the latest version must not
+        // see a spurious same-version "update available".
+        assert!(!update_available("0.1.4", "0.1.4", Some(SHA_A), None));
     }
 
     #[test]

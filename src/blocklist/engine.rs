@@ -178,6 +178,7 @@ impl Blocklist {
                     .collect();
                 self.data.store(Arc::new(BlocklistData { fst, wildcards }));
                 self.cache.clear();
+                self.restore_list_stats_from_cache();
                 tracing::info!("blocklist loaded from disk: {} domains", count);
                 true
             }
@@ -185,6 +186,39 @@ impl Blocklist {
                 tracing::warn!("cached FST on disk is invalid, will re-fetch: {}", e);
                 false
             }
+        }
+    }
+
+    /// Restore per-list domain counts and Adblock parse stats from the on-disk
+    /// caches the last refresh wrote (`<list>.fst` / `<list>.stats.json` under the
+    /// list cache dir). `load_from_disk` only loads the merged FST, so without this
+    /// the Lists page would show blank counts/stats after a restart until the next
+    /// refresh repopulated them over the network. Read-only and synchronous —
+    /// missing/garbage caches are simply skipped, and a later refresh overwrites
+    /// these with authoritative values.
+    fn restore_list_stats_from_cache(&self) {
+        let lists: Vec<ListConfig> = self.lists.read().iter().cloned().collect();
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        let mut stats: HashMap<String, AdblockStats> = HashMap::new();
+        for list in &lists {
+            let safe = refresh::sanitize_name(&list.name);
+            // Count = entries in the per-list FST (exactly what a refresh records).
+            if let Ok(bytes) = std::fs::read(self.list_cache_dir.join(format!("{safe}.fst")))
+                && let Ok(map) = Map::new(bytes)
+            {
+                counts.insert(list.name.clone(), map.len());
+            }
+            if let Ok(bytes) = std::fs::read(self.list_cache_dir.join(format!("{safe}.stats.json")))
+                && let Ok(s) = serde_json::from_slice::<AdblockStats>(&bytes)
+            {
+                stats.insert(list.name.clone(), s);
+            }
+        }
+        if !counts.is_empty() {
+            *self.domain_counts.write() = counts;
+        }
+        if !stats.is_empty() {
+            *self.adblock_stats.write() = stats;
         }
     }
 
@@ -812,6 +846,62 @@ mod tests {
         assert!(blocklist.is_blocked("tracker.ads.test"));
         blocklist.refresh(false).await.unwrap();
         assert!(blocklist.is_blocked("tracker.ads.test"));
+    }
+
+    #[test]
+    fn load_from_disk_restores_per_list_counts_and_stats_from_cache() {
+        let fst_path = temp_fst_path("ferrite-blocklist-restore-stats");
+        let cache_dir = fst_path.parent().unwrap().join("lists");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        // Merged FST (what load_from_disk loads) plus the per-list caches a refresh
+        // would have written: a `<list>.fst` and a `<list>.stats.json` sidecar.
+        let domains = vec!["a.ads.test".to_string(), "b.ads.test".to_string()];
+        std::fs::write(
+            &fst_path,
+            crate::blocklist::loader::build_fst(domains.clone()).unwrap(),
+        )
+        .unwrap();
+
+        let safe = refresh::sanitize_name("My List");
+        std::fs::write(
+            cache_dir.join(format!("{safe}.fst")),
+            crate::blocklist::loader::build_fst(domains).unwrap(),
+        )
+        .unwrap();
+        let stats = AdblockStats {
+            kept: 2,
+            exceptions: 1,
+            ..Default::default()
+        };
+        std::fs::write(
+            cache_dir.join(format!("{safe}.stats.json")),
+            serde_json::to_vec(&stats).unwrap(),
+        )
+        .unwrap();
+
+        let blocklist = Blocklist::new(
+            BlocklistConfig {
+                enabled: true,
+                decision_cache_size: 1000,
+                lists: vec![ListConfig {
+                    name: "My List".to_string(),
+                    url: "https://example.test/list.txt".to_string(),
+                    enabled: true,
+                }],
+                wildcard_block: vec![],
+                whitelist: vec![],
+                client_bypass: vec![],
+            },
+            fst_path,
+        );
+
+        assert!(blocklist.load_from_disk());
+        // Per-list count + Adblock stats restored from cache — no network refresh.
+        assert_eq!(blocklist.domain_count("My List"), Some(2));
+        let restored = blocklist.parse_stats("My List").expect("stats restored");
+        assert_eq!(restored.kept, 2);
+        assert_eq!(restored.exceptions, 1);
     }
 
     #[tokio::test]

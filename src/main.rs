@@ -119,6 +119,20 @@ async fn run() -> anyhow::Result<()> {
         logbuf::set_debug(runtime_config.debug_logging);
     }
 
+    // Loud warning when the panel is reachable off-loopback with no auth at all.
+    // The default bind is loopback, so this only fires once it's exposed on the
+    // LAN without a password or API key — the first thing a reviewer checks.
+    if !runtime_config.api.bind_addr.ip().is_loopback()
+        && !runtime_config.api.has_password()
+        && !runtime_config.api.has_api_key()
+    {
+        tracing::warn!(
+            "admin panel is reachable on {} with NO password or API key set — \
+             anyone on the network can change settings. Run `ferrite passwd` to protect it.",
+            runtime_config.api.bind_addr
+        );
+    }
+
     // Auto-detect local zones when none are configured.
     // Runs only once at startup; nothing is written to disk.
     if runtime_config.zones.is_empty() {

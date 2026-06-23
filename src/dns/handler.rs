@@ -537,17 +537,16 @@ fn sanitize_query(raw: &[u8], strip_ecs: bool, dnssec: bool) -> Vec<u8> {
         edns.options_mut().remove(EdnsCode::Subnet);
     }
     if dnssec {
-        match msg.edns.as_mut() {
-            Some(edns) => {
-                edns.set_dnssec_ok(true);
-            }
-            None => {
-                let mut edns = Edns::new();
-                edns.set_max_payload(1232);
-                edns.set_dnssec_ok(true);
-                msg.set_edns(edns);
-            }
-        }
+        // Request DNSSEC (DO bit) and normalize the upstream UDP payload to 1232
+        // bytes — the DNS-flag-day-2020 / RFC 8900 anti-fragmentation value. We
+        // override whatever the client advertised in both directions: a tiny
+        // client buffer (e.g. 512) would force the resolver to truncate every
+        // signed answer, costing a TCP round trip per query; an oversized buffer
+        // (e.g. 4096) risks IP fragmentation on the path to the upstream, which
+        // is both unreliable and a cache-poisoning vector. 1232 is the sweet spot.
+        let edns = msg.edns.get_or_insert_with(Edns::new);
+        edns.set_max_payload(1232);
+        edns.set_dnssec_ok(true);
     }
     msg.to_bytes().unwrap_or_else(|_| raw.to_vec())
 }
@@ -597,6 +596,11 @@ mod tests {
             "ECS must be stripped"
         );
         assert!(edns.flags().dnssec_ok, "DO bit must be set");
+        assert_eq!(
+            edns.max_payload(),
+            1232,
+            "upstream UDP payload must be normalized to 1232 even if the client advertised otherwise"
+        );
 
         // Both off → bytes returned unchanged.
         assert_eq!(sanitize_query(&raw, false, false), raw);

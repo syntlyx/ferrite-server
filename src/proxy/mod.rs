@@ -34,6 +34,8 @@ use crate::config::ProxyConfig;
 use crate::dns::types::{DnsResponse, qtype as qt};
 use crate::upstream::ZoneRouter;
 
+pub(crate) use egress::direct_connect;
+pub(crate) use egress::usable_rcvbuf_bytes;
 pub use egress::{Egress, EgressConn};
 use health::Breaker;
 use rules::CompiledRule;
@@ -203,6 +205,18 @@ impl ProxyState {
             .iter()
             .find(|e| e.id() == id)
             .cloned()
+    }
+
+    /// Diagnostic: which egress (if any) a domain would route to, ignoring client
+    /// scope. Returns the egress id and whether the matching rule is client-scoped
+    /// (so the caller can note "applies only to specific clients"). A read-only
+    /// snapshot load — does not consider whether routing is currently enabled
+    /// (the caller pairs this with [`Self::is_enabled`]).
+    pub fn route_egress(&self, name: &str) -> Option<(String, bool)> {
+        let snap = self.registry.load();
+        let rule = snap.rules.iter().find(|r| r.matches(name))?;
+        let egress_id = snap.egresses[rule.egress_idx].id().to_string();
+        Some((egress_id, !rule.clients.is_empty()))
     }
 
     pub fn is_egress_healthy(&self, id: &str) -> bool {

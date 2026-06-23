@@ -14,6 +14,7 @@ use crate::api::ApiError;
 use crate::app::AppState;
 use crate::config::{EgressConfig, ProxyConfig};
 use crate::error::FeriteError;
+use crate::proxy::usable_rcvbuf_bytes;
 
 /// GET /api/proxy — current config (socks5 passwords redacted) + egress health.
 pub async fn get_proxy(State(state): State<AppState>) -> Json<Value> {
@@ -43,15 +44,22 @@ pub async fn get_proxy(State(state): State<AppState>) -> Json<Value> {
 }
 
 /// Probe the effective UDP receive-buffer ceiling the kernel grants (KiB) by
-/// requesting a large `SO_RCVBUF` on a throwaway socket and reading it back. The
-/// kernel clamps to `net.core.rmem_max`, so this reveals the real limit the
-/// WireGuard tunnel is subject to. Re-probed per call so a live sysctl change is
-/// reflected without a restart.
+/// requesting an oversized `SO_RCVBUF` on a throwaway socket and reading it back.
+/// The kernel clamps the request to `net.core.rmem_max`, so the read-back reveals
+/// the real limit the WireGuard tunnel is subject to — reported in usable bytes
+/// (see [`usable_rcvbuf_bytes`]) so it's comparable to a per-connection buffer
+/// setting. Requesting a small value (e.g. 8 MiB) would self-cap the answer at that
+/// request rather than the kernel limit, making the "raise net.core.rmem_max"
+/// advice unverifiable. Re-probed per call so a live sysctl change is reflected
+/// without a restart.
 fn kernel_udp_recv_kb() -> Option<u64> {
     let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     let r = socket2::SockRef::from(&sock);
-    let _ = r.set_recv_buffer_size(8 * 1024 * 1024);
-    r.recv_buffer_size().ok().map(|b| (b / 1024) as u64)
+    // Ask for far more than any real rmem_max so the read-back reflects the kernel
+    // ceiling, not our request. i32::MAX is the largest SO_RCVBUF the syscall accepts.
+    let _ = r.set_recv_buffer_size(i32::MAX as usize);
+    let usable = usable_rcvbuf_bytes(r.recv_buffer_size().ok()?);
+    Some((usable / 1024) as u64)
 }
 
 /// PUT /api/proxy — replace the whole proxy config.

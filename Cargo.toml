@@ -22,6 +22,7 @@ hickory-proto = "0.26.1"                              # Message/Query/PTR parsin
 # can ride the tunnel. hickory/reqwest own their sockets and can't, hence raw TLS.
 tokio-rustls = "0.26"   # TLS client over an arbitrary egress stream (tunneled DoT)
 webpki-roots = "1"      # Mozilla root store for tunneled DoT certificate verification
+x509-parser = "0.18"    # parse presented certs for the /tools/cert inspector
 
 # ── HTTP: API server + outbound client ────────────────────────────────────────
 axum = { version = "0.8", features = ["macros"] }     # REST API + serves the web UI

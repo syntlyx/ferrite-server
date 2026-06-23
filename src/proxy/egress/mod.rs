@@ -157,3 +157,17 @@ pub fn enable_keepalive(stream: &TcpStream) {
     let ka = TcpKeepalive::new().with_time(Duration::from_secs(60));
     let _ = SockRef::from(stream).set_tcp_keepalive(&ka);
 }
+
+/// Translate a `SO_RCVBUF` read-back into usable bytes. Linux reports 2× the
+/// granted size (the other half is reserved for `sk_buff` bookkeeping), so the
+/// usable capacity is half the read-back; other platforms report it directly.
+/// Keep every UDP-buffer figure we surface (API ceiling probe, tunnel log) in
+/// these same usable-byte units so they're comparable against a per-connection
+/// buffer setting, which is a real, single-window byte count.
+pub(crate) fn usable_rcvbuf_bytes(readback: usize) -> usize {
+    if cfg!(target_os = "linux") {
+        readback / 2
+    } else {
+        readback
+    }
+}

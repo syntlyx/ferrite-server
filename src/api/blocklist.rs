@@ -127,18 +127,34 @@ pub async fn del_whitelist(
 /// GET /api/blocklist/check/:domain
 ///
 /// Returns the block decision **plus attribution**: which source(s) match (manual
-/// blacklist, wildcard, or a named subscription list) and the whitelist entry that
-/// exempts it. The attribution scans each list's on-disk FST, so it runs in
-/// `spawn_blocking` and off the DNS hot path.
+/// blacklist, wildcard, or a named subscription list), the whitelist entry that
+/// exempts it, and the **routing decision** — which egress (if any) the domain
+/// would be tunnelled through. The attribution scans each list's on-disk FST, so it
+/// runs in `spawn_blocking` and off the DNS hot path.
 pub async fn check_domain(
     State(state): State<AppState>,
     Path(domain): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    // Routing decision (cheap, in-memory snapshot): paired with `enabled` so the UI
+    // can distinguish "no rule matches" from "matches a rule but routing is off".
+    let route = state
+        .inner
+        .proxy
+        .route_egress(&domain.trim_end_matches('.').to_ascii_lowercase())
+        .map(|(egress, client_scoped)| {
+            let healthy = state.inner.proxy.is_egress_healthy(&egress);
+            json!({ "egress": egress, "client_scoped": client_scoped, "healthy": healthy })
+        });
+    let routing = json!({ "enabled": state.inner.proxy.is_enabled(), "match": route });
+
     let explanation = tokio::task::spawn_blocking(move || state.inner.blocklist.explain(&domain))
         .await
         .map_err(|e| ApiError(FeriteError::Internal(format!("explain task failed: {e}"))))?;
-    let value = serde_json::to_value(explanation)
+    let mut value = serde_json::to_value(explanation)
         .map_err(|e| ApiError(FeriteError::Internal(format!("serialize explanation: {e}"))))?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("routing".to_string(), routing);
+    }
     Ok(Json(value))
 }
 

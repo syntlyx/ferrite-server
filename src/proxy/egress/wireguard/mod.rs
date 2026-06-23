@@ -381,16 +381,19 @@ async fn run_tunnel(
         let _ = sock.set_send_buffer_size((want / 2).max(2 * 1024 * 1024));
         // Warn only when the EFFECTIVE recv buffer is actually smaller than one
         // window (raising net.core.rmem_max would then help); otherwise just note it.
+        // Compare in usable bytes — the raw read-back is 2× on Linux, which would
+        // otherwise hide a too-small buffer (and overstate the logged figure 2×).
         if let Ok(rcv) = sock.recv_buffer_size() {
-            if rcv < buffer {
+            let usable = super::usable_rcvbuf_bytes(rcv);
+            if usable < buffer {
                 tracing::warn!(
                     "wg '{}': kernel UDP recv buffer {} KiB < per-conn buffer {} KiB — large bursts may drop; raise net.core.rmem_max",
                     id,
-                    rcv / 1024,
+                    usable / 1024,
                     buffer / 1024,
                 );
             } else {
-                tracing::info!("wg '{}': UDP recv buffer {} KiB", id, rcv / 1024);
+                tracing::info!("wg '{}': UDP recv buffer {} KiB", id, usable / 1024);
             }
         }
     }
