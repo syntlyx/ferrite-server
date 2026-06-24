@@ -43,9 +43,19 @@ impl DnsCache {
         }
     }
 
-    /// Build a cache key from (name, qtype).
-    pub fn cache_key(name: &str, qtype: u16) -> String {
-        format!("{}/{}", name.to_ascii_lowercase(), qtype)
+    /// Build a cache key from (name, qtype, dnssec). DNSSEC-OK responses carry
+    /// signatures and differ from the bare ones, so they're cached separately:
+    /// a DO client must never be served an unsigned answer (validation would
+    /// fail), nor a non-DO client the bulky signed one (oversized → truncation
+    /// → TCP). The non-DO form keeps the original two-part key so snapshots
+    /// written before this split still restore and match.
+    pub fn cache_key(name: &str, qtype: u16, dnssec: bool) -> String {
+        let name = name.to_ascii_lowercase();
+        if dnssec {
+            format!("{name}/{qtype}/do")
+        } else {
+            format!("{name}/{qtype}")
+        }
     }
 
     /// Retrieve a cached entry. Returns `None` if not present or expired.
@@ -55,8 +65,8 @@ impl DnsCache {
     /// The query path uses `get_with_remaining` (which also returns the
     /// remaining TTL); this is retained for snapshot restore tests.
     #[allow(dead_code)]
-    pub fn get(&self, name: &str, qtype: u16) -> Option<DnsResponse> {
-        let key = Self::cache_key(name, qtype);
+    pub fn get(&self, name: &str, qtype: u16, dnssec: bool) -> Option<DnsResponse> {
+        let key = Self::cache_key(name, qtype, dnssec);
         let guard = self.inner.read();
         match guard.peek(&key) {
             Some(entry) if !entry.is_expired() => Some(entry.response.clone()),
@@ -67,8 +77,13 @@ impl DnsCache {
     /// Like `get`, but also returns the entry's remaining lifetime in seconds.
     /// Callers rewrite the record TTLs to this value so clients receive the
     /// real remaining TTL rather than the original (over-long) one (RFC 2181).
-    pub fn get_with_remaining(&self, name: &str, qtype: u16) -> Option<(DnsResponse, u32)> {
-        let key = Self::cache_key(name, qtype);
+    pub fn get_with_remaining(
+        &self,
+        name: &str,
+        qtype: u16,
+        dnssec: bool,
+    ) -> Option<(DnsResponse, u32)> {
+        let key = Self::cache_key(name, qtype, dnssec);
         let guard = self.inner.read();
         match guard.peek(&key) {
             Some(entry) if !entry.is_expired() => {
@@ -84,8 +99,8 @@ impl DnsCache {
     }
 
     /// Insert a DNS response into the cache.
-    pub fn insert(&self, name: &str, qtype: u16, response: DnsResponse) {
-        let key = Self::cache_key(name, qtype);
+    pub fn insert(&self, name: &str, qtype: u16, dnssec: bool, response: DnsResponse) {
+        let key = Self::cache_key(name, qtype, dnssec);
         let ttl_secs = response.ttl as u64;
         let bounds = *self.ttl_bounds.read();
         let clamped = ttl_secs.max(bounds.min_secs).min(bounds.max_secs);
@@ -113,8 +128,8 @@ impl DnsCache {
 
     /// Explicitly evict an entry.
     #[allow(dead_code)]
-    pub fn evict(&self, name: &str, qtype: u16) {
-        let key = Self::cache_key(name, qtype);
+    pub fn evict(&self, name: &str, qtype: u16, dnssec: bool) {
+        let key = Self::cache_key(name, qtype, dnssec);
         self.inner.write().pop(&key);
     }
 
@@ -237,7 +252,7 @@ mod tests {
     fn hot_ttl_bounds_apply_to_future_inserts() {
         let cache = DnsCache::new(8, 60, 300);
         cache.set_ttl_bounds(120, 120);
-        cache.insert("example.com", 1, response(30));
+        cache.insert("example.com", 1, false, response(30));
 
         let expires_at = cache.snapshot()[0].2;
         let remaining = expires_at.saturating_duration_since(Instant::now());
@@ -253,20 +268,45 @@ mod tests {
     #[test]
     fn evict_domain_removes_all_qtypes_for_that_name_only() {
         let cache = DnsCache::new(16, 60, 300);
-        cache.insert("router.lan", 1, response(120)); // A
-        cache.insert("router.lan", 28, response(120)); // AAAA
-        cache.insert("router.lan", 255, response(120)); // ANY
-        cache.insert("other.lan", 1, response(120));
+        cache.insert("router.lan", 1, false, response(120)); // A
+        cache.insert("router.lan", 28, false, response(120)); // AAAA
+        cache.insert("router.lan", 255, false, response(120)); // ANY
+        cache.insert("other.lan", 1, false, response(120));
+        // A DNSSEC-keyed entry shares the `router.lan/` prefix and must go too.
+        cache.insert("router.lan", 1, true, response(120));
 
         cache.evict_domain("router.lan");
 
-        assert!(cache.get("router.lan", 1).is_none());
-        assert!(cache.get("router.lan", 28).is_none());
+        assert!(cache.get("router.lan", 1, false).is_none());
+        assert!(cache.get("router.lan", 28, false).is_none());
         assert!(
-            cache.get("router.lan", 255).is_none(),
+            cache.get("router.lan", 255, false).is_none(),
             "ANY must be evicted too"
         );
+        assert!(
+            cache.get("router.lan", 1, true).is_none(),
+            "DNSSEC-keyed entry must be evicted too"
+        );
         // A different domain is untouched.
-        assert!(cache.get("other.lan", 1).is_some());
+        assert!(cache.get("other.lan", 1, false).is_some());
+    }
+
+    #[test]
+    fn dnssec_and_plain_entries_do_not_collide() {
+        let cache = DnsCache::new(8, 60, 300);
+        // A signed (DO) entry must never be visible to a non-DO lookup — that's
+        // what bloated non-DO clients and what served unsigned answers to DO
+        // clients before the cache learned the DO dimension.
+        cache.insert("example.com", 1, true, response(120));
+        assert!(
+            cache.get("example.com", 1, false).is_none(),
+            "non-DO lookup must not see the signed entry"
+        );
+        assert!(cache.get("example.com", 1, true).is_some());
+
+        // The two coexist as independent entries.
+        cache.insert("example.com", 1, false, response(120));
+        assert!(cache.get("example.com", 1, false).is_some());
+        assert!(cache.get("example.com", 1, true).is_some());
     }
 }

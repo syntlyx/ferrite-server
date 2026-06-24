@@ -6,12 +6,15 @@ use tokio_rustls::rustls::ClientConfig;
 use crate::config::UpstreamConfig;
 use crate::error::{FeriteError, Result};
 use crate::upstream::tunneled::{ProxyHandle, TunneledResolver, client_config};
-use crate::upstream::{doh::DohResolver, doq::DoqResolver, dot::DotResolver, plain::PlainResolver};
+use crate::upstream::{
+    doh::DohResolver, doq::DoqResolver, plain::PlainResolver, stream::StreamResolver,
+};
 
 /// A single upstream entry, wrapping one of the protocol variants.
 pub enum UpstreamEntry {
     Plain(PlainResolver),
-    Tls(Box<DotResolver>),
+    /// Direct DoT (no egress), raw-forwarding over a pooled TLS connection.
+    Tls(Box<StreamResolver>),
     Https(DohResolver),
     Quic(Box<DoqResolver>),
     /// Plain DNS-over-TCP or DoT routed through an egress (tunnel).
@@ -103,7 +106,7 @@ impl UpstreamPool {
                     port,
                     tls_name,
                     ..
-                } => UpstreamEntry::Tls(Box::new(DotResolver::new(address, *port, tls_name)?)),
+                } => UpstreamEntry::Tls(Box::new(StreamResolver::dot(address, *port, tls_name)?)),
                 UpstreamConfig::Https { url, bootstrap_ip } => {
                     UpstreamEntry::Https(DohResolver::new(url, bootstrap_ip.as_deref())?)
                 }

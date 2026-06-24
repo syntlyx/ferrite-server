@@ -190,10 +190,21 @@ mod tests {
         apply_snapshot(&state, &snapshot);
 
         assert_eq!(
-            state.inner.dns_cache.get("fresh.test", 1).unwrap().bytes,
+            state
+                .inner
+                .dns_cache
+                .get("fresh.test", 1, false)
+                .unwrap()
+                .bytes,
             bytes::Bytes::from_static(b"fresh")
         );
-        assert!(state.inner.dns_cache.get("expired.test", 1).is_none());
+        assert!(
+            state
+                .inner
+                .dns_cache
+                .get("expired.test", 1, false)
+                .is_none()
+        );
 
         drop(state);
         cleanup_sqlite(&db_path);

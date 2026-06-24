@@ -1,9 +1,9 @@
 pub mod doh;
 pub mod doq;
-pub mod dot;
 pub mod hickory_util;
 pub mod plain;
 pub mod pool;
+pub mod stream;
 pub mod tunneled;
 pub mod zone_router;
 

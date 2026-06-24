@@ -80,13 +80,23 @@ pub async fn handle_query(
             .blocklist
             .client_bypasses_blocking_normalized(&client_ip, client_mac.as_deref());
     let qtype: u16 = question.query_type().into();
+    // DNSSEC is honored per-client. We only request signatures upstream — and
+    // cache/serve them — when this client set the DO bit AND the feature is on.
+    // Forwarding signatures to a client that didn't ask bloats the answer past
+    // the UDP limit → truncation → TCP retry on every query, which is what made
+    // DNSSEC feel slow. This flag also keys the cache so a DO client never gets
+    // a stale unsigned answer (nor a non-DO client the bulky signed one).
+    let want_dnssec =
+        state.config.dns.dnssec && query.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok);
     let log_ignored = is_log_ignored(&name, &state.log_ignore.read());
 
     tracing::debug!("query {:?} {} from {}", question.query_type(), name, src);
 
     // ── Step 1: Custom DNS records (local overrides, beat blocklist) ──────
     if let Some(custom_resp) = state.custom_records.lookup(&query, &name, qtype) {
-        state.dns_cache.insert(&name, qtype, custom_resp.clone());
+        state
+            .dns_cache
+            .insert(&name, qtype, want_dnssec, custom_resp.clone());
         if !log_ignored {
             let elapsed = start.elapsed().as_millis() as u32;
             emit(
@@ -162,7 +172,11 @@ pub async fn handle_query(
     }
 
     // ── Step 3: DNS response cache ────────────────────────────────────────
-    if let Some((cached, remaining_ttl)) = state.dns_cache.get_with_remaining(&name, qtype) {
+    if let Some((cached, remaining_ttl)) =
+        state
+            .dns_cache
+            .get_with_remaining(&name, qtype, want_dnssec)
+    {
         if filtering_enabled
             && let Some(blocked_cname) =
                 cname_blocked_target(&cached.bytes, &name, &state.blocklist)
@@ -212,8 +226,9 @@ pub async fn handle_query(
 
     // ── Step 4: Forward to upstream ───────────────────────────────────────
     // Harden the outbound query: drop EDNS Client Subnet (so the resolver never
-    // learns the client's subnet) and request DNSSEC (DO bit), per config.
-    let upstream_query = sanitize_query(&raw, state.config.dns.strip_ecs, state.config.dns.dnssec);
+    // learns the client's subnet) and set the upstream DO bit to `want_dnssec`
+    // (honor this client's request, or strip it when the feature is off).
+    let upstream_query = sanitize_query(&raw, state.config.dns.strip_ecs, want_dnssec);
     let (response_bytes, rcode, upstream_label) =
         match state.upstream_pool.resolve_raw(upstream_query).await {
             // Only trust a response we can actually decode. Unparseable bytes
@@ -270,6 +285,7 @@ pub async fn handle_query(
                 state.dns_cache.insert(
                     &name,
                     qtype,
+                    want_dnssec,
                     DnsResponse {
                         bytes: bytes::Bytes::copy_from_slice(&response_bytes),
                         ttl,
@@ -522,21 +538,22 @@ fn cache_ttl(bytes: &[u8]) -> Option<u32> {
 
 /// Harden a client query before it leaves ferrite: with `strip_ecs`, drop the
 /// EDNS Client Subnet option (so the upstream resolver never learns the client's
-/// subnet); with `dnssec`, set the DNSSEC-OK (DO) bit so the resolver returns
-/// signatures and validates. Returns the original bytes unchanged when both are
-/// off, or on any parse/encode error — a sanitization hiccup must never break
-/// forwarding.
-fn sanitize_query(raw: &[u8], strip_ecs: bool, dnssec: bool) -> Vec<u8> {
-    if !strip_ecs && !dnssec {
-        return raw.to_vec();
-    }
+/// subnet); set the upstream DNSSEC-OK (DO) bit to exactly `want_do`.
+///
+/// `want_do` reflects *this* client's request (see `want_dnssec` in the handler):
+/// when set we request signatures, when clear we strip any DO bit the client
+/// sent. Enforcing the bit both ways keeps the upstream query consistent with
+/// the cache key the response is stored under — a DO and a non-DO query for the
+/// same name must never share an entry. Returns the original bytes on any
+/// parse/encode error — a sanitization hiccup must never break forwarding.
+fn sanitize_query(raw: &[u8], strip_ecs: bool, want_do: bool) -> Vec<u8> {
     let Ok(mut msg) = Message::from_bytes(raw) else {
         return raw.to_vec();
     };
     if strip_ecs && let Some(edns) = msg.edns.as_mut() {
         edns.options_mut().remove(EdnsCode::Subnet);
     }
-    if dnssec {
+    if want_do {
         // Request DNSSEC (DO bit) and normalize the upstream UDP payload to 1232
         // bytes — the DNS-flag-day-2020 / RFC 8900 anti-fragmentation value. We
         // override whatever the client advertised in both directions: a tiny
@@ -547,6 +564,11 @@ fn sanitize_query(raw: &[u8], strip_ecs: bool, dnssec: bool) -> Vec<u8> {
         let edns = msg.edns.get_or_insert_with(Edns::new);
         edns.set_max_payload(1232);
         edns.set_dnssec_ok(true);
+    } else if let Some(edns) = msg.edns.as_mut() {
+        // No DNSSEC wanted for this query (client didn't ask, or the feature is
+        // off): clear any DO bit so the upstream returns no signatures and the
+        // lean response matches its non-DO cache key.
+        edns.set_dnssec_ok(false);
     }
     msg.to_bytes().unwrap_or_else(|_| raw.to_vec())
 }
@@ -602,8 +624,23 @@ mod tests {
             "upstream UDP payload must be normalized to 1232 even if the client advertised otherwise"
         );
 
-        // Both off → bytes returned unchanged.
-        assert_eq!(sanitize_query(&raw, false, false), raw);
+        // want_do = false must CLEAR a DO bit the client set, so the upstream
+        // returns no signatures and the response matches its non-DO cache key.
+        let mut q_do = Message::new(0x1234, MessageType::Query, OpCode::Query);
+        q_do.add_query(Query::query(
+            Name::from_str("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let mut edns_do = Edns::new();
+        edns_do.set_dnssec_ok(true);
+        q_do.set_edns(edns_do);
+        let raw_do = q_do.to_bytes().unwrap();
+        let stripped = sanitize_query(&raw_do, false, false);
+        let parsed = Message::from_bytes(&stripped).unwrap();
+        assert!(
+            !parsed.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok),
+            "DO bit must be cleared when DNSSEC is not wanted"
+        );
 
         // DNSSEC on a query with no EDNS adds an OPT with DO set.
         let mut bare = Message::new(1, MessageType::Query, OpCode::Query);
@@ -969,6 +1006,7 @@ mod tests {
         state.inner.dns_cache.insert(
             "ads.test",
             1,
+            false,
             DnsResponse {
                 bytes: bytes::Bytes::from(a_response(
                     0x1111,
@@ -1011,6 +1049,7 @@ mod tests {
         state.inner.dns_cache.insert(
             "ads.test",
             1,
+            false,
             DnsResponse {
                 bytes: bytes::Bytes::from(a_response(
                     0x1111,
@@ -1094,6 +1133,7 @@ mod tests {
         state.inner.dns_cache.insert(
             "cache.test",
             1,
+            false,
             DnsResponse {
                 bytes: bytes::Bytes::from(cached_bytes.clone()),
                 ttl: 120,

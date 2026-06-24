@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use reqwest::Client;
 
 use crate::error::{FeriteError, Result};
@@ -41,12 +43,20 @@ impl DohResolver {
 
         let mut builder = Client::builder()
             .user_agent(concat!("ferrite/", env!("CARGO_PKG_VERSION")))
-            // Force HTTPS — TLS ALPN negotiates HTTP/2 automatically.
+            // Force HTTPS — TLS ALPN negotiates HTTP/2 (the `http2` feature is on).
             .https_only(true)
             // Connection pool: keep up to 5 idle connections per host.
             .pool_max_idle_per_host(5)
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(60))
+            // HTTP/2 keep-alive PINGs. Some DoH servers (e.g. Quad9) close idle h2
+            // connections faster than our pool would, so a reused connection would
+            // fail mid-send with "broken pipe" — and DoH POSTs aren't auto-retried.
+            // Pinging while idle keeps healthy connections warm and detects dead
+            // ones so they're evicted before reuse instead of being handed out.
+            .http2_keep_alive_interval(Duration::from_secs(20))
+            .http2_keep_alive_timeout(Duration::from_secs(10))
+            .http2_keep_alive_while_idle(true)
             // Per-request timeout.
             .timeout(Duration::from_secs(10));
 
@@ -71,17 +81,43 @@ impl DohResolver {
         })
     }
 
-    /// POST the raw DNS query to the DoH endpoint and return the raw response.
+    /// Send the raw DNS query to the DoH endpoint (RFC 8484 GET form) and return
+    /// the raw response.
+    ///
+    /// We use GET — the query base64url-encoded in the `dns` parameter — rather
+    /// than POST: some DoH fronts (observed with Quad9) reset the HTTP/2
+    /// connection mid-send on a POST ("stream closed because of a broken pipe")
+    /// while answering the GET form cleanly. GET is mandatory for DoH servers
+    /// (RFC 8484 §4.1) and universally supported, so this works everywhere.
     pub async fn resolve_raw(&self, raw: Vec<u8>) -> Result<(Vec<u8>, String)> {
-        let resp = self
-            .client
-            .post(self.url.as_str())
-            .header("content-type", "application/dns-message")
-            .header("accept", "application/dns-message")
-            .body(raw)
-            .send()
-            .await
-            .map_err(FeriteError::Http)?;
+        // base64url (no padding) uses only `A-Za-z0-9-_`, all URL-safe, so it can
+        // be appended to the query string without percent-encoding. DoH endpoints
+        // carry no query of their own, so `?dns=` is unambiguous.
+        let dns = URL_SAFE_NO_PAD.encode(&raw);
+        let url = format!("{}?dns={}", self.url, dns);
+
+        // reqwest pools HTTP/2 connections and never retries itself. Some DoH
+        // fronts (Quad9) close a connection between requests, so a *reused* one
+        // fails mid-send with "broken pipe" — exactly what a browser/curl dodges
+        // by using a fresh connection. A DoH GET is idempotent, so retry: each
+        // errored connection is dropped from the pool, so within a few attempts
+        // we land on a healthy/fresh one. Timeouts aren't retried (no point
+        // stacking 10s waits — the pool fails over to the next upstream instead).
+        const MAX_ATTEMPTS: u32 = 3;
+        let resp = {
+            let mut attempt = 0;
+            loop {
+                match self.send(&url).await {
+                    Ok(r) => break r,
+                    Err(e) => {
+                        attempt += 1;
+                        if attempt >= MAX_ATTEMPTS || e.is_timeout() {
+                            return Err(http_err(&self.label, &e));
+                        }
+                    }
+                }
+            }
+        };
 
         if !resp.status().is_success() {
             return Err(FeriteError::Dns(format!(
@@ -104,7 +140,7 @@ impl DohResolver {
             )));
         }
 
-        let bytes = resp.bytes().await.map_err(FeriteError::Http)?;
+        let bytes = resp.bytes().await.map_err(|e| http_err(&self.label, &e))?;
         if bytes.len() > 65535 {
             return Err(FeriteError::Dns(format!(
                 "DoH {} response too large ({} bytes)",
@@ -115,7 +151,41 @@ impl DohResolver {
         Ok((bytes.to_vec(), self.label.clone()))
     }
 
+    /// One DoH GET attempt. Separated so `resolve_raw` can retry on a dropped
+    /// connection without duplicating the request build.
+    async fn send(&self, url: &str) -> std::result::Result<reqwest::Response, reqwest::Error> {
+        self.client
+            .get(url)
+            .header("accept", "application/dns-message")
+            .send()
+            .await
+    }
+
     pub fn label(&self) -> &str {
         &self.label
     }
+}
+
+/// Build a descriptive error from a reqwest failure. reqwest's own `Display` is
+/// deliberately terse ("error sending request for url (...)") and hides the real
+/// cause in the `source()` chain — so we walk it and tag the common kinds, to
+/// turn an opaque warning into something actionable (DNS lookup vs connect vs
+/// TLS vs HTTP/2).
+fn http_err(label: &str, e: &reqwest::Error) -> FeriteError {
+    use std::error::Error;
+    use std::fmt::Write;
+
+    let mut msg = format!("DoH {label}: {e}");
+    if e.is_connect() {
+        msg.push_str(" [connect]");
+    }
+    if e.is_timeout() {
+        msg.push_str(" [timeout]");
+    }
+    let mut src = e.source();
+    while let Some(s) = src {
+        let _ = write!(msg, " → {s}");
+        src = s.source();
+    }
+    FeriteError::Dns(msg)
 }

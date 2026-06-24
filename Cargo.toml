@@ -1,6 +1,6 @@
 [package]
 name = "ferrite"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.96"
 
@@ -31,7 +31,7 @@ axum = { version = "0.8", features = ["macros"] }     # REST API + serves the we
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }  # CORS + request tracing middleware
-reqwest = { version = "0.13.4", features = ["rustls", "json"], default-features = false }  # blocklist & update downloads
+reqwest = { version = "0.13.4", features = ["rustls", "json", "http2"], default-features = false }  # blocklist & update downloads; http2 required for DoH endpoints that reject HTTP/1.1 (e.g. Quad9 → HTTP 505)
 
 # ── Blocklist engine ──────────────────────────────────────────────────────────
 fst = "0.4"        # finite-state-transducer set — fast exact-domain blocklist lookups

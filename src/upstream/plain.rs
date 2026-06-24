@@ -1,21 +1,26 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
 use crate::error::{FeriteError, Result};
+use crate::upstream::stream::StreamPool;
 
 const UDP_TIMEOUT: Duration = Duration::from_secs(5);
-const TCP_TIMEOUT: Duration = Duration::from_secs(8);
 /// Max DNS message size over UDP (EDNS0).
 const MAX_UDP_SIZE: usize = 4096;
 
 /// A plain DNS upstream (UDP with automatic TCP fallback on truncation).
+///
+/// The TCP fallback rides a pooled, persistent connection (`tcp_pool`) rather
+/// than dialing fresh each time — with DNSSEC the truncation path is hot (large
+/// signed answers don't fit a UDP datagram), so reconnecting per query was the
+/// dominant cost.
 pub struct PlainResolver {
     addr: SocketAddr,
     label: String,
+    tcp_pool: StreamPool,
 }
 
 impl PlainResolver {
@@ -26,6 +31,7 @@ impl PlainResolver {
         Ok(Self {
             addr,
             label: format!("{}:{}", address, port),
+            tcp_pool: StreamPool::plain(addr),
         })
     }
 
@@ -52,10 +58,10 @@ impl PlainResolver {
         // Try UDP first.
         let mut response = self.send_udp(&query).await?;
 
-        // If TC (truncated) bit is set, retry over TCP.
+        // If TC (truncated) bit is set, retry over TCP (pooled connection).
         if is_truncated(&response) {
             tracing::debug!("upstream {} set TC bit, retrying over TCP", self.addr);
-            response = self.send_tcp(&query).await?;
+            response = self.tcp_pool.exchange(&query).await?;
         }
 
         // Restore the client's transaction ID before handing the response back.
@@ -109,47 +115,6 @@ impl PlainResolver {
         }
 
         Ok(response.to_vec())
-    }
-
-    async fn send_tcp(&self, raw: &[u8]) -> Result<Vec<u8>> {
-        let mut stream = timeout(TCP_TIMEOUT, TcpStream::connect(self.addr))
-            .await
-            .map_err(|_| FeriteError::Dns(format!("tcp connect timeout to {}", self.addr)))?
-            .map_err(|e| FeriteError::Dns(format!("tcp connect to {}: {}", self.addr, e)))?;
-
-        // DNS over TCP: 2-byte length prefix (big-endian) + message bytes.
-        let len = raw.len() as u16;
-        let mut framed = Vec::with_capacity(2 + raw.len());
-        framed.extend_from_slice(&len.to_be_bytes());
-        framed.extend_from_slice(raw);
-
-        timeout(TCP_TIMEOUT, stream.write_all(&framed))
-            .await
-            .map_err(|_| FeriteError::Dns(format!("tcp write timeout to {}", self.addr)))?
-            .map_err(|e| FeriteError::Dns(format!("tcp write to {}: {}", self.addr, e)))?;
-
-        // Read the 2-byte length prefix.
-        let mut len_buf = [0u8; 2];
-        timeout(TCP_TIMEOUT, stream.read_exact(&mut len_buf))
-            .await
-            .map_err(|_| FeriteError::Dns(format!("tcp read len timeout from {}", self.addr)))?
-            .map_err(|e| FeriteError::Dns(format!("tcp read len from {}: {}", self.addr, e)))?;
-
-        let msg_len = u16::from_be_bytes(len_buf) as usize;
-        if msg_len == 0 || msg_len > 8192 {
-            return Err(FeriteError::Dns(format!(
-                "tcp response length invalid ({} bytes) from {}",
-                msg_len, self.addr
-            )));
-        }
-
-        let mut response = vec![0u8; msg_len];
-        timeout(TCP_TIMEOUT, stream.read_exact(&mut response))
-            .await
-            .map_err(|_| FeriteError::Dns(format!("tcp read body timeout from {}", self.addr)))?
-            .map_err(|e| FeriteError::Dns(format!("tcp read body from {}: {}", self.addr, e)))?;
-
-        Ok(response)
     }
 
     pub fn label(&self) -> &str {
