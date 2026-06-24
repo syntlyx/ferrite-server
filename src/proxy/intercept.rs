@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
@@ -22,6 +22,16 @@ use super::sni::{SniResult, parse_sni};
 
 const PEEK_TIMEOUT: Duration = Duration::from_secs(5);
 const PEEK_CAP: usize = 16 * 1024;
+/// Reap a spliced connection after this long with no bytes in EITHER direction.
+/// `copy_bidirectional` has no idle timeout, so a keep-alive / HTTP-2 idle
+/// session — or a half-closed one (the peer sent FIN but the client lingers) —
+/// would otherwise hold its egress connection (for a WireGuard tunnel: a smoltcp
+/// socket and its per-connection buffer) open until the client physically
+/// disconnects. With many such idle sessions that buffer memory is the dominant
+/// proxy cost, so once a connection goes quiet we close it; clients transparently
+/// reconnect on next use. The OS TCP keepalive only reaps *dead* peers, not
+/// alive-but-idle ones, so it does not cover this on its own.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Copy)]
 enum Protocol {
@@ -295,6 +305,112 @@ async fn splice_through(
         Some(p) if matches!(proto, Protocol::Tls) => write_split(&mut conn, &buf, &p).await?,
         _ => conn.write_all(&buf).await?,
     }
-    tokio::io::copy_bidirectional(&mut client, &mut conn).await?;
+    copy_bidirectional_idle(&mut client, &mut conn, IDLE_TIMEOUT).await
+}
+
+/// Splice bytes both ways between `a` and `b` until both directions close, an I/O
+/// error occurs, or no byte flows in EITHER direction for `idle`.
+///
+/// This is `tokio::io::copy_bidirectional` plus an idle timeout — the timeout is
+/// the whole point. Without it an idle keep-alive or half-closed connection pins
+/// its egress connection (and, for a WireGuard tunnel, a ~`2 × buffer_kb` socket
+/// buffer) open indefinitely, which is what made proxy memory grow without bound.
+/// The timer is reset on every transfer, so an active-but-slow stream (e.g. a long
+/// download) is never cut off — only genuinely quiet connections are reaped.
+///
+/// A one-way EOF half-closes that direction (the peer can still send the other
+/// way), matching `copy_bidirectional`; a returned idle timeout is reported as a
+/// clean close (`Ok`), not an error.
+async fn copy_bidirectional_idle<A, B>(a: &mut A, b: &mut B, idle: Duration) -> std::io::Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut buf_a = vec![0u8; 16 * 1024];
+    let mut buf_b = vec![0u8; 16 * 1024];
+    let mut a_open = true; // a → b still flowing
+    let mut b_open = true; // b → a still flowing
+
+    let timer = tokio::time::sleep(idle);
+    tokio::pin!(timer);
+
+    while a_open || b_open {
+        tokio::select! {
+            r = a.read(&mut buf_a), if a_open => match r? {
+                0 => {
+                    a_open = false;
+                    let _ = b.shutdown().await; // propagate EOF (half-close)
+                }
+                n => {
+                    b.write_all(&buf_a[..n]).await?;
+                    timer.as_mut().reset(tokio::time::Instant::now() + idle);
+                }
+            },
+            r = b.read(&mut buf_b), if b_open => match r? {
+                0 => {
+                    b_open = false;
+                    let _ = a.shutdown().await;
+                }
+                n => {
+                    a.write_all(&buf_b[..n]).await?;
+                    timer.as_mut().reset(tokio::time::Instant::now() + idle);
+                }
+            },
+            _ = &mut timer => return Ok(()), // idle too long → reap
+        }
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod splice_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+    /// Bytes flow both ways and the splice returns cleanly once both ends EOF.
+    #[tokio::test]
+    async fn forwards_both_directions_then_closes_on_eof() {
+        let (mut client, mut a) = duplex(1024);
+        let (mut server, mut b) = duplex(1024);
+        let task =
+            tokio::spawn(
+                async move { copy_bidirectional_idle(&mut a, &mut b, IDLE_TIMEOUT).await },
+            );
+
+        // client → server
+        client.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        server.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+
+        // server → client
+        server.write_all(b"pong").await.unwrap();
+        let mut buf = [0u8; 4];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"pong");
+
+        // Both peers gone → both directions EOF → splice returns Ok.
+        drop(client);
+        drop(server);
+        let r = timeout(Duration::from_secs(2), task).await;
+        assert!(matches!(r, Ok(Ok(Ok(())))), "clean close should return Ok");
+    }
+
+    /// An idle connection (peers held open, no bytes) is reaped after the idle
+    /// window instead of being pinned forever — the leak this fix addresses.
+    #[tokio::test]
+    async fn reaps_idle_connection() {
+        // `_client`/`_server` are held (not dropped) so the streams never EOF;
+        // only the idle timer can end the splice.
+        let (_client, mut a) = duplex(1024);
+        let (_server, mut b) = duplex(1024);
+        let idle = Duration::from_millis(100);
+        let task = tokio::spawn(async move { copy_bidirectional_idle(&mut a, &mut b, idle).await });
+
+        let r = timeout(Duration::from_secs(2), task).await;
+        assert!(
+            matches!(r, Ok(Ok(Ok(())))),
+            "idle splice should reap and return Ok"
+        );
+    }
 }
