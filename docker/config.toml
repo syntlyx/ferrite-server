@@ -15,5 +15,4 @@ enabled = true
 domain = "fe.te"
 
 [storage]
-backend = "sqlite"
 path = "/var/lib/ferrite/ferrite.db"

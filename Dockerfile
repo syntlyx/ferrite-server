@@ -5,7 +5,7 @@ ARG ALPINE_VERSION=3
 FROM alpine:${ALPINE_VERSION}
 
 LABEL org.opencontainers.image.title="ferrite" \
-      org.opencontainers.image.description="A Rust DNS sinkhole and filtering API server" \
+      org.opencontainers.image.description="Self-hosted DNS that blocks ads & trackers and routes chosen domains or devices through WireGuard, SOCKS5/Tor, or DPI evasion" \
       org.opencontainers.image.source="https://github.com/syntlyx/ferrite-server" \
       org.opencontainers.image.licenses="MIT"
 
@@ -27,7 +27,9 @@ ENV HOME=/var/lib/ferrite \
 
 VOLUME ["/var/lib/ferrite"]
 # Docker exposes protocols separately; Ferrite still binds one DNS address.
-EXPOSE 53/tcp 53/udp 80/tcp
+# 443 is the HTTPS (SNI) intercept for selective routing — only bound while
+# routing is enabled.
+EXPOSE 53/tcp 53/udp 80/tcp 443/tcp
 
 # Liveness probe against the always-public auth endpoint (returns 200 even when
 # no auth is configured). The container always binds the API on port 80

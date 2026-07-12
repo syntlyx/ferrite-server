@@ -457,7 +457,6 @@ url = "https://cloudflare-dns.com/dns-query"
 bootstrap_ip = "1.1.1.1"
 
 [storage]
-backend            = "sqlite"
 path               = "${DATA_DIR}/ferrite.db"
 log_retention_days = 30
 

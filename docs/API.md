@@ -749,7 +749,6 @@ Returns the full parsed config. Non-empty `api_key` and `password_hash` values a
   ],
   "zones": [{ "name": "1.168.192.in-addr.arpa", "upstream": "192.168.1.1:53" }],
   "storage": {
-    "backend": "sqlite",
     "path": "/path/to/ferrite.db",
     "log_retention_days": 30
   },

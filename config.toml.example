@@ -111,7 +111,6 @@ port    = 53
 # ── Storage ───────────────────────────────────────────────────────────────────
 
 [storage]
-backend = "sqlite"
 # Default: ~/.local/share/ferrite/ferrite.db
 # path = "/var/lib/ferrite/ferrite.db"
 
