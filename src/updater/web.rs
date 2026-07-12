@@ -255,10 +255,9 @@ fn version_satisfies_comparator(version: (u32, u32, u32), comparator: &str) -> O
         (">", raw)
     } else if let Some(raw) = comparator.strip_prefix('<') {
         ("<", raw)
-    } else if let Some(raw) = comparator.strip_prefix('=') {
-        ("=", raw)
     } else {
-        return None;
+        let raw = comparator.strip_prefix('=')?;
+        ("=", raw)
     };
 
     let target = parse_semver(raw);
