@@ -78,6 +78,59 @@ impl AsyncWrite for EgressConn {
     }
 }
 
+/// Why an egress connect failed — determines whether the circuit breaker counts
+/// it. Getting a reply from the proxy/tunnel proves the transport works, so a
+/// destination that is merely unreachable behind it must **not** trip the
+/// breaker; otherwise one dead site would fail-close the egress for every other
+/// destination for the whole cooldown.
+#[derive(Debug)]
+pub struct ConnectError {
+    kind: ConnectErrorKind,
+    err: FeriteError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectErrorKind {
+    /// The egress transport itself is broken (tunnel down, proxy unreachable,
+    /// auth rejected, connect to the proxy timed out). Counts toward the breaker.
+    Egress,
+    /// The egress works but the target is unreachable/refused/unresolvable. The
+    /// breaker ignores this.
+    Destination,
+}
+
+impl ConnectError {
+    pub fn egress(err: FeriteError) -> Self {
+        Self {
+            kind: ConnectErrorKind::Egress,
+            err,
+        }
+    }
+
+    pub fn destination(err: FeriteError) -> Self {
+        Self {
+            kind: ConnectErrorKind::Destination,
+            err,
+        }
+    }
+
+    pub fn kind(&self) -> ConnectErrorKind {
+        self.kind
+    }
+
+    /// The underlying error, for callers that don't care about the classification
+    /// (e.g. surfacing it to a diagnostic API).
+    pub fn into_inner(self) -> FeriteError {
+        self.err
+    }
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.err, f)
+    }
+}
+
 pub enum Egress {
     Direct(DirectEgress),
     Socks5(socks5::Socks5Egress),
@@ -135,12 +188,29 @@ impl Egress {
         }
     }
 
-    pub async fn connect(&self, host: &str, port: u16) -> Result<EgressConn> {
+    pub async fn connect(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> std::result::Result<EgressConn, ConnectError> {
         match self {
-            Self::Direct(d) => Ok(EgressConn::Tcp(d.connect(host, port).await?)),
-            Self::Socks5(s) => Ok(EgressConn::Tcp(s.connect(host, port).await?)),
-            Self::Wireguard(w) => Ok(EgressConn::Wg(w.connect(host, port).await?)),
-            Self::DirectEvasion(e) => Ok(EgressConn::Tcp(e.connect(host, port).await?)),
+            // Direct/Evasion have no separate transport hop, so any failure is a
+            // property of the destination (or its resolution), never a "the egress
+            // is down" signal — classify as Destination.
+            Self::Direct(d) => d
+                .connect(host, port)
+                .await
+                .map(EgressConn::Tcp)
+                .map_err(ConnectError::destination),
+            Self::DirectEvasion(e) => e
+                .connect(host, port)
+                .await
+                .map(EgressConn::Tcp)
+                .map_err(ConnectError::destination),
+            // SOCKS5 and WireGuard classify their own failures (proxy/tunnel
+            // transport vs. destination) at the point they know which it was.
+            Self::Socks5(s) => s.connect(host, port).await.map(EgressConn::Tcp),
+            Self::Wireguard(w) => w.connect(host, port).await.map(EgressConn::Wg),
         }
     }
 }

@@ -91,6 +91,10 @@ fn default_custom_ttl() -> u32 {
 pub struct DnsConfig {
     pub bind_addr: SocketAddr,
     pub cache_size: usize,
+    /// Byte budget for the DNS response cache, in MiB. `cache_size` bounds the
+    /// entry *count*, which alone can't bound memory — a DNSSEC answer with
+    /// RRSIGs is 10–20× the size of a plain one. `0` disables the byte bound.
+    pub cache_max_mb: usize,
     pub min_ttl: u64,
     pub max_ttl: u64,
     /// Domains to suppress from the query log entirely.
@@ -214,7 +218,9 @@ pub struct BlocklistConfig {
 }
 
 fn default_blocklist_decision_cache_size() -> usize {
-    50_000
+    // ~120 B/entry when full. A home network sees well under 20k unique
+    // domains a day, so this keeps the hit rate while capping RAM at ~2.5 MB.
+    20_000
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -318,11 +324,18 @@ pub struct EgressConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seg_position: Option<u16>,
     // ── wireguard tuning ──
-    /// Per-connection socket buffer in KiB for a WireGuard egress. Larger = higher
-    /// single-connection throughput (the TCP window scales with it) at more RAM.
-    /// `None` uses the default. Only used by the `wireguard` egress kind.
+    /// Per-connection *receive* socket buffer in KiB for a WireGuard egress.
+    /// Larger = higher single-connection download throughput (the TCP window
+    /// scales with it) at more RAM. `None` uses the default. Only used by the
+    /// `wireguard` egress kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buffer_kb: Option<u32>,
+    /// Per-connection *send* socket buffer in KiB. Bounds one connection's
+    /// upload window; tunnel traffic is download-dominant, so `None` defaults
+    /// to half of `buffer_kb` (both rings are allocated up-front per
+    /// connection). Raise it if a client uploads heavily through the tunnel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_buffer_kb: Option<u32>,
 }
 
 /// Maps a domain pattern to an egress. `pattern` is an exact domain (matches the
@@ -399,6 +412,7 @@ impl Default for DnsConfig {
         Self {
             bind_addr: "0.0.0.0:53".parse().unwrap(),
             cache_size: 10_000,
+            cache_max_mb: 8,
             min_ttl: 60,
             max_ttl: 3600,
             log_ignore: vec![

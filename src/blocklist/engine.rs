@@ -9,12 +9,13 @@ use parking_lot::RwLock;
 use regex::Regex;
 
 use crate::blocklist::cache::BlocklistCache;
+use crate::blocklist::loader::{self, FstMap};
 use crate::blocklist::{AdblockStats, refresh};
 use crate::clients::normalize_client_key;
 use crate::config::{BlocklistConfig, ListConfig};
 use crate::error::{FeriteError, Result};
 
-type FstBuildResult = (Map<Vec<u8>>, Vec<Regex>, usize);
+type FstBuildResult = (FstMap, Vec<Regex>, usize);
 const MAX_CONCURRENT_LIST_REFRESHES: usize = 2;
 
 /// A diagnostic explanation of why a domain is (or isn't) blocked — produced by
@@ -72,7 +73,7 @@ fn matched_key(domain: &str, contains: impl Fn(&str) -> bool) -> Option<String> 
 
 /// The hot-swappable core data (FST + wildcards).
 struct BlocklistData {
-    fst: Map<Vec<u8>>,
+    fst: FstMap,
     wildcards: Vec<Regex>,
 }
 
@@ -160,13 +161,13 @@ impl Blocklist {
         }
     }
 
-    /// Try to load a previously saved FST from disk.
+    /// Try to load a previously saved FST from disk. Serves it via mmap so the
+    /// (potentially tens-of-MB) map lives in the page cache, not anonymous RSS.
     pub fn load_from_disk(&self) -> bool {
-        let bytes = match std::fs::read(&self.fst_path) {
-            Ok(b) => b,
-            Err(_) => return false,
-        };
-        match Map::new(bytes) {
+        if !self.fst_path.exists() {
+            return false; // first boot — nothing cached yet
+        }
+        match loader::mmap_fst(&self.fst_path) {
             Ok(fst) => {
                 let count = fst.len();
                 let wildcards: Vec<Regex> = self
@@ -203,9 +204,7 @@ impl Blocklist {
         for list in &lists {
             let safe = refresh::sanitize_name(&list.name);
             // Count = entries in the per-list FST (exactly what a refresh records).
-            if let Ok(bytes) = std::fs::read(self.list_cache_dir.join(format!("{safe}.fst")))
-                && let Ok(map) = Map::new(bytes)
-            {
+            if let Ok(map) = loader::mmap_fst(&self.list_cache_dir.join(format!("{safe}.fst"))) {
                 counts.insert(list.name.clone(), map.len());
             }
             if let Ok(bytes) = std::fs::read(self.list_cache_dir.join(format!("{safe}.stats.json")))
@@ -432,10 +431,7 @@ impl Blocklist {
             let path = self
                 .list_cache_dir
                 .join(format!("{}.fst", refresh::sanitize_name(&list.name)));
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
-            };
-            let Ok(map) = Map::new(bytes) else {
+            let Ok(map) = loader::mmap_fst(&path) else {
                 continue;
             };
             if let Some(key) = matched_key(&domain, |k| map.contains_key(k.as_bytes())) {
@@ -656,7 +652,7 @@ impl Blocklist {
                     .join(format!("{}.stats.json", refresh::sanitize_name(&list.name)));
                 tokio::spawn(async move {
                     let Ok(_permit) = permits.acquire_owned().await else {
-                        return (String::new(), vec![], 0, None);
+                        return (String::new(), refresh::ListFst::Ram(Vec::new()), 0, None);
                     };
                     refresh::load_or_build_list_fst(
                         name,
@@ -671,21 +667,21 @@ impl Blocklist {
             })
             .collect();
 
-        let mut per_list_fsts: Vec<Vec<u8>> = Vec::with_capacity(lists.len());
+        let mut per_list_fsts: Vec<refresh::ListFst> = Vec::with_capacity(lists.len());
         let mut counts: HashMap<String, usize> = HashMap::new();
         let mut stats: HashMap<String, AdblockStats> = HashMap::new();
 
         for task in tasks {
-            let (name, fst_bytes, count, list_stats) = task.await.unwrap_or_else(|e| {
+            let (name, fst_src, count, list_stats) = task.await.unwrap_or_else(|e| {
                 tracing::error!("list task panicked: {}", e);
-                (String::new(), vec![], 0, None)
+                (String::new(), refresh::ListFst::Ram(Vec::new()), 0, None)
             });
             if !name.is_empty() {
                 if let Some(s) = list_stats {
                     stats.insert(name.clone(), s);
                 }
                 counts.insert(name, count);
-                per_list_fsts.push(fst_bytes);
+                per_list_fsts.push(fst_src);
             }
         }
 
@@ -700,8 +696,23 @@ impl Blocklist {
 
         let (fst, wildcards, unique_count) =
             tokio::task::spawn_blocking(move || -> Result<FstBuildResult> {
-                use crate::blocklist::loader;
-                let fst_bytes = loader::merge_fsts(&per_list_fsts)?;
+                // Open every input as a Map first — File sources mmap straight
+                // from the per-list cache, so the k-way union streams them out
+                // of the page cache instead of holding each list's bytes in RAM.
+                let mut maps: Vec<FstMap> = Vec::with_capacity(per_list_fsts.len());
+                for src in per_list_fsts {
+                    let map = match src {
+                        refresh::ListFst::File(p) => loader::mmap_fst(&p),
+                        refresh::ListFst::Ram(b) => loader::ram_fst(b),
+                    };
+                    match map {
+                        Ok(m) => maps.push(m),
+                        // A cache file that vanished between fetch and merge is
+                        // skipped this refresh, like any other per-list failure.
+                        Err(e) => tracing::warn!("skipping list FST in merge: {}", e),
+                    }
+                }
+                let fst_bytes = loader::merge_fsts(&maps)?;
                 let unique_count = Map::new(fst_bytes.as_slice())
                     .map_err(|e| FeriteError::Fst(e.to_string()))?
                     .len();
@@ -710,12 +721,16 @@ impl Blocklist {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 let tmp = fst_path.with_extension("fst.tmp");
-                if std::fs::write(&tmp, &fst_bytes).is_ok() {
-                    let _ = std::fs::rename(&tmp, &fst_path);
+                let persisted = std::fs::write(&tmp, &fst_bytes).is_ok()
+                    && std::fs::rename(&tmp, &fst_path).is_ok();
+                let fst = if persisted {
                     tracing::info!("blocklist FST saved to disk");
-                }
-
-                let fst = Map::new(fst_bytes).map_err(|e| FeriteError::Fst(e.to_string()))?;
+                    // Serve from the mmap'd file: the merged map then sits in
+                    // the page cache (evictable) instead of RSS-pinned RAM.
+                    loader::mmap_fst(&fst_path).or_else(|_| loader::ram_fst(fst_bytes))?
+                } else {
+                    loader::ram_fst(fst_bytes)?
+                };
                 Ok((fst, wildcards, unique_count))
             })
             .await
@@ -734,6 +749,11 @@ impl Blocklist {
 
     pub fn blocked_count(&self) -> u64 {
         self.data.load().fst.len() as u64
+    }
+
+    /// Decision-cache entry count (memory introspection).
+    pub fn decision_cache_entries(&self) -> usize {
+        self.cache.entries()
     }
 
     #[allow(dead_code)]
@@ -781,9 +801,9 @@ fn is_registrable_or_deeper(name: &str) -> bool {
     }
 }
 
-fn empty_fst() -> Map<Vec<u8>> {
+fn empty_fst() -> FstMap {
     let bytes = MapBuilder::memory().into_inner().expect("empty FST build");
-    Map::new(bytes).expect("empty FST map")
+    loader::ram_fst(bytes).expect("empty FST map")
 }
 
 fn compile_wildcards(patterns: &[String]) -> Vec<Regex> {

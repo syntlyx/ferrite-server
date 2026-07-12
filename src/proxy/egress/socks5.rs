@@ -14,7 +14,7 @@ use tokio::time::timeout;
 use crate::config::EgressConfig;
 use crate::error::{FeriteError, Result};
 
-use super::enable_keepalive;
+use super::{ConnectError, enable_keepalive};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -52,19 +52,86 @@ impl Socks5Egress {
         &self.id
     }
 
-    pub async fn connect(&self, host: &str, port: u16) -> Result<TcpStream> {
-        timeout(CONNECT_TIMEOUT, self.handshake(host, port))
-            .await
-            .map_err(|_| FeriteError::Dns(format!("socks5 {} timeout", self.proxy_addr)))?
+    pub async fn connect(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> std::result::Result<TcpStream, ConnectError> {
+        self.handshake(host, port).await
     }
 
-    async fn handshake(&self, host: &str, port: u16) -> Result<TcpStream> {
+    async fn handshake(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> std::result::Result<TcpStream, ConnectError> {
         if host.len() > 255 {
-            return Err(FeriteError::Dns(
+            // A caller-side limit, not a proxy fault → destination-class.
+            return Err(ConnectError::destination(FeriteError::Dns(
                 "socks5: hostname too long for ATYP=domain".into(),
-            ));
+            )));
         }
 
+        // Phase 1 — reach the proxy and negotiate auth + send CONNECT. A failure or
+        // timeout here means the proxy itself is unreachable/broken → egress-class,
+        // so it counts against the breaker.
+        let mut s = match timeout(CONNECT_TIMEOUT, self.negotiate(host, port)).await {
+            Ok(r) => r.map_err(ConnectError::egress)?,
+            Err(_) => {
+                return Err(ConnectError::egress(FeriteError::Dns(format!(
+                    "socks5 {}: proxy handshake timed out",
+                    self.proxy_addr
+                ))));
+            }
+        };
+
+        // Phase 2 — wait for the CONNECT reply. The proxy has already answered the
+        // greeting/auth, so it's alive; it only replies here once it has (tried to)
+        // reach the *destination*. A timeout is therefore the destination being
+        // slow/blackholed, NOT the egress — classifying it egress would let one dead
+        // site fail-close the whole egress. So this phase is destination-class.
+        let mut head = [0u8; 4];
+        match timeout(CONNECT_TIMEOUT, s.read_exact(&mut head)).await {
+            Ok(r) => r.map_err(|e| ConnectError::destination(io_err(e)))?,
+            Err(_) => {
+                return Err(ConnectError::destination(FeriteError::Dns(format!(
+                    "socks5: CONNECT to {host}:{port} timed out"
+                ))));
+            }
+        };
+        // Reply: VER REP RSV ATYP BND.ADDR BND.PORT.
+        if head[1] != 0x00 {
+            return Err(classify_reply(head[1], host, port));
+        }
+        // Drain the bound address/port so the stream starts at tunneled data.
+        let addr_len = match head[3] {
+            0x01 => 4,
+            0x04 => 16,
+            0x03 => {
+                let mut l = [0u8; 1];
+                s.read_exact(&mut l)
+                    .await
+                    .map_err(|e| ConnectError::egress(io_err(e)))?;
+                l[0] as usize
+            }
+            other => {
+                return Err(ConnectError::egress(FeriteError::Dns(format!(
+                    "socks5: bad reply ATYP {other}"
+                ))));
+            }
+        };
+        let mut bnd = vec![0u8; addr_len + 2];
+        s.read_exact(&mut bnd)
+            .await
+            .map_err(|e| ConnectError::egress(io_err(e)))?;
+
+        Ok(s)
+    }
+
+    /// Connect to the proxy, negotiate the auth method, and send the CONNECT
+    /// request. Every failure here is proxy-transport (egress-class); the caller
+    /// maps it accordingly. Returns the stream positioned to read the reply.
+    async fn negotiate(&self, host: &str, port: u16) -> Result<TcpStream> {
         let mut s = TcpStream::connect(&self.proxy_addr)
             .await
             .map_err(|e| FeriteError::Dns(format!("socks5 connect {}: {}", self.proxy_addr, e)))?;
@@ -103,30 +170,6 @@ impl Socks5Egress {
         req.extend_from_slice(host.as_bytes());
         req.extend_from_slice(&port.to_be_bytes());
         s.write_all(&req).await?;
-
-        // Reply: VER REP RSV ATYP BND.ADDR BND.PORT
-        let mut head = [0u8; 4];
-        s.read_exact(&mut head).await?;
-        if head[1] != 0x00 {
-            return Err(FeriteError::Dns(format!(
-                "socks5: CONNECT to {host}:{port} failed (reply code {})",
-                head[1]
-            )));
-        }
-        // Drain the bound address/port so the stream starts at tunneled data.
-        let addr_len = match head[3] {
-            0x01 => 4,
-            0x04 => 16,
-            0x03 => {
-                let mut l = [0u8; 1];
-                s.read_exact(&mut l).await?;
-                l[0] as usize
-            }
-            other => return Err(FeriteError::Dns(format!("socks5: bad reply ATYP {other}"))),
-        };
-        let mut bnd = vec![0u8; addr_len + 2];
-        s.read_exact(&mut bnd).await?;
-
         Ok(s)
     }
 
@@ -151,5 +194,50 @@ impl Socks5Egress {
             return Err(FeriteError::Dns("socks5: authentication failed".into()));
         }
         Ok(())
+    }
+}
+
+fn io_err(e: std::io::Error) -> FeriteError {
+    FeriteError::Dns(format!("socks5 io: {e}"))
+}
+
+/// Classify a non-zero SOCKS5 CONNECT reply code (RFC 1928 §6). Reachability
+/// results for the *destination* (network/host unreachable, refused, TTL expired,
+/// blocked by ruleset) are destination-class so one dead site can't fail-close the
+/// whole egress; codes that indicate the *proxy* itself failed or can't perform the
+/// request (general failure, command / address-type unsupported) are egress-class.
+fn classify_reply(code: u8, host: &str, port: u16) -> ConnectError {
+    let err = FeriteError::Dns(format!(
+        "socks5: CONNECT to {host}:{port} failed (reply code {code})"
+    ));
+    match code {
+        0x02..=0x06 => ConnectError::destination(err),
+        _ => ConnectError::egress(err), // 0x01 general failure, 0x07/0x08 capability, unknown
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proxy::egress::ConnectErrorKind;
+
+    #[test]
+    fn reply_codes_classify_destination_vs_egress() {
+        // Reachability failures for the destination must NOT trip the breaker.
+        for code in [0x02, 0x03, 0x04, 0x05, 0x06] {
+            assert_eq!(
+                classify_reply(code, "example.com", 443).kind(),
+                ConnectErrorKind::Destination,
+                "reply code {code:#x} should be destination-class"
+            );
+        }
+        // Proxy-side / capability failures should count against the egress breaker.
+        for code in [0x01, 0x07, 0x08, 0x7f] {
+            assert_eq!(
+                classify_reply(code, "example.com", 443).kind(),
+                ConnectErrorKind::Egress,
+                "reply code {code:#x} should be egress-class"
+            );
+        }
     }
 }

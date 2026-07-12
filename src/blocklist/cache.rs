@@ -29,6 +29,11 @@ impl BlocklistCache {
         }
     }
 
+    /// Current number of cached decisions (memory introspection).
+    pub fn entries(&self) -> usize {
+        self.inner.lock().len()
+    }
+
     /// Look up a domain in the cache.
     /// Returns `Some(true)` if blocked, `Some(false)` if allowed, `None` if not cached.
     pub fn get(&self, domain: &str) -> Option<bool> {

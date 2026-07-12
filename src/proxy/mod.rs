@@ -30,7 +30,7 @@ use hickory_proto::rr::{RData, Record};
 use hickory_proto::serialize::binary::BinEncodable;
 use tokio::sync::Notify;
 
-use crate::config::ProxyConfig;
+use crate::config::{EgressConfig, ProxyConfig};
 use crate::dns::types::{DnsResponse, qtype as qt};
 use crate::upstream::ZoneRouter;
 
@@ -97,6 +97,10 @@ struct Snapshot {
     advertise_ipv4: Option<Ipv4Addr>,
     advertise_ipv6: Option<Ipv6Addr>,
     egresses: Vec<Arc<Egress>>,
+    /// The config each `egresses[i]` was built from, in the same order. Kept so a
+    /// reload can reuse an unchanged egress instead of tearing its tunnel down
+    /// (see [`build_snapshot`]).
+    egress_configs: Vec<EgressConfig>,
     rules: Vec<CompiledRule>,
 }
 
@@ -115,7 +119,7 @@ impl Snapshot {
 
 impl ProxyState {
     pub fn from_config(cfg: &ProxyConfig, upstream: Arc<ZoneRouter>) -> Arc<Self> {
-        let snapshot = build_snapshot(cfg, cfg.enabled, &upstream);
+        let snapshot = build_snapshot(cfg, cfg.enabled, &upstream, None);
         Arc::new(Self {
             registry: ArcSwap::from_pointee(snapshot),
             breakers: DashMap::new(),
@@ -130,8 +134,15 @@ impl ProxyState {
     /// listener-affecting field changed (enabled / ports / connection cap) the
     /// supervisor is signalled to rebind the listeners — no process restart.
     pub fn reload(&self, cfg: &ProxyConfig) {
-        self.registry
-            .store(Arc::new(build_snapshot(cfg, cfg.enabled, &self.upstream)));
+        // Reuse egresses whose config is unchanged so a rule-only edit (or any
+        // change to an unrelated egress) doesn't tear down live tunnels.
+        let prev = self.registry.load();
+        self.registry.store(Arc::new(build_snapshot(
+            cfg,
+            cfg.enabled,
+            &self.upstream,
+            Some(&prev),
+        )));
         let next = ListenerCfg::from(cfg);
         let changed = next.differs(&self.listeners.load());
         self.listeners.store(Arc::new(next));
@@ -259,20 +270,41 @@ pub fn validate_wireguard_conf(text: &str) -> crate::error::Result<()> {
     egress::validate_wireguard_conf(text)
 }
 
-fn build_snapshot(cfg: &ProxyConfig, enabled: bool, upstream: &Arc<ZoneRouter>) -> Snapshot {
+fn build_snapshot(
+    cfg: &ProxyConfig,
+    enabled: bool,
+    upstream: &Arc<ZoneRouter>,
+    prev: Option<&Snapshot>,
+) -> Snapshot {
     let mut egresses = Vec::new();
+    let mut egress_configs = Vec::new();
     let mut by_id: HashMap<String, usize> = HashMap::new();
     for e in &cfg.egresses {
         if !e.enabled {
             continue;
         }
-        match Egress::from_config(e, Arc::clone(upstream)) {
-            Ok(eg) => {
-                by_id.insert(eg.id().to_string(), egresses.len());
-                egresses.push(Arc::new(eg));
-            }
-            Err(err) => tracing::warn!("proxy: skipping egress '{}': {}", e.id, err),
-        }
+        // Reuse the previous egress instance when its runtime config is byte-for-
+        // byte the same: rebuilding would restart a WireGuard tunnel (new handshake,
+        // dropped in-flight connections, lost per-egress DNS cache) for no reason.
+        let reused = prev.and_then(|p| {
+            p.egress_configs
+                .iter()
+                .position(|pc| pc.id == e.id && egress_runtime_eq(pc, e))
+                .map(|i| Arc::clone(&p.egresses[i]))
+        });
+        let egress = match reused {
+            Some(existing) => existing,
+            None => match Egress::from_config(e, Arc::clone(upstream)) {
+                Ok(eg) => Arc::new(eg),
+                Err(err) => {
+                    tracing::warn!("proxy: skipping egress '{}': {}", e.id, err);
+                    continue;
+                }
+            },
+        };
+        by_id.insert(egress.id().to_string(), egresses.len());
+        egresses.push(egress);
+        egress_configs.push(e.clone());
     }
     let rules = rules::compile(&cfg.rules, &by_id);
     Snapshot {
@@ -282,8 +314,44 @@ fn build_snapshot(cfg: &ProxyConfig, enabled: bool, upstream: &Arc<ZoneRouter>) 
             .or_else(crate::setup::local_ipv4_for_internet),
         advertise_ipv6: cfg.advertise_ipv6,
         egresses,
+        egress_configs,
         rules,
     }
+}
+
+/// Do two egress configs describe the same *running* backend? Compares every field
+/// that affects the built egress, ignoring the cosmetic display `name` (renaming
+/// must not restart a tunnel). `enabled` is handled by the caller (disabled
+/// egresses are skipped entirely), and a changed `id` is treated as a new egress.
+///
+/// `b` is destructured exhaustively (no `..`) on purpose: adding a field to
+/// `EgressConfig` then becomes a compile error here, forcing a decision about
+/// whether it affects the running backend — otherwise a new runtime field would be
+/// silently ignored and its edits wouldn't rebuild the tunnel.
+fn egress_runtime_eq(a: &EgressConfig, b: &EgressConfig) -> bool {
+    let EgressConfig {
+        id: _,      // matched separately by the caller
+        name: _,    // cosmetic — a rename must not restart the tunnel
+        enabled: _, // caller skips disabled egresses entirely
+        kind,
+        address,
+        port,
+        username,
+        password,
+        config,
+        seg_position,
+        buffer_kb,
+        tx_buffer_kb,
+    } = b;
+    a.kind == *kind
+        && a.address == *address
+        && a.port == *port
+        && a.username == *username
+        && a.password == *password
+        && a.config == *config
+        && a.seg_position == *seg_position
+        && a.buffer_kb == *buffer_kb
+        && a.tx_buffer_kb == *tx_buffer_kb
 }
 
 /// Build the synthetic DNS answer for a routed domain. A/AAAA get the advertise
@@ -372,6 +440,7 @@ mod tests {
                 config: None,
                 seg_position: None,
                 buffer_kb: None,
+                tx_buffer_kb: None,
             }],
             rules: vec![RuleConfig {
                 pattern: "*.example.com".to_string(),
@@ -442,6 +511,78 @@ mod tests {
         // NODATA: NoError with no answers, so the client falls back to IPv4.
         assert_eq!(msg.metadata.response_code, ResponseCode::NoError);
         assert!(msg.answers.is_empty());
+    }
+
+    fn cfg_with(egresses: Vec<EgressConfig>, rules: Vec<RuleConfig>) -> ProxyConfig {
+        let mut cfg = ProxyConfig {
+            enabled: true,
+            http_port: 8080,
+            https_port: 8443,
+            advertise_ipv4: Some(Ipv4Addr::new(192, 168, 1, 5)),
+            advertise_ipv6: None,
+            max_connections: 16,
+            egresses,
+            rules,
+        };
+        cfg.normalize();
+        cfg
+    }
+
+    fn direct_egress(id: &str) -> EgressConfig {
+        EgressConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            enabled: true,
+            kind: "direct".to_string(),
+            address: None,
+            port: None,
+            username: None,
+            password: None,
+            config: None,
+            seg_position: None,
+            buffer_kb: None,
+            tx_buffer_kb: None,
+        }
+    }
+
+    fn rule(pattern: &str, egress: &str) -> RuleConfig {
+        RuleConfig {
+            pattern: pattern.to_string(),
+            egress: egress.to_string(),
+            fail_closed: true,
+            clients: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn reload_reuses_unchanged_egress_but_rebuilds_changed_one() {
+        let proxy = ProxyState::from_config(
+            &cfg_with(vec![direct_egress("t")], vec![rule("*.example.com", "t")]),
+            upstream(),
+        );
+        let before = proxy.egress("t").expect("egress exists");
+
+        // A rule-only change must keep the very same egress instance (no tunnel
+        // restart): the Arc is pointer-identical across the reload.
+        proxy.reload(&cfg_with(
+            vec![direct_egress("t")],
+            vec![rule("*.other.test", "t")],
+        ));
+        let after_rule_change = proxy.egress("t").expect("egress still exists");
+        assert!(
+            Arc::ptr_eq(&before, &after_rule_change),
+            "unchanged egress should be reused across a rule-only reload"
+        );
+
+        // Changing an egress's runtime config rebuilds just that egress.
+        let mut changed = direct_egress("t");
+        changed.buffer_kb = Some(512);
+        proxy.reload(&cfg_with(vec![changed], vec![rule("*.other.test", "t")]));
+        let after_egress_change = proxy.egress("t").expect("egress still exists");
+        assert!(
+            !Arc::ptr_eq(&after_rule_change, &after_egress_change),
+            "a changed egress config should be rebuilt, not reused"
+        );
     }
 
     #[test]

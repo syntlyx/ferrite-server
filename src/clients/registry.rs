@@ -1,12 +1,16 @@
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use crate::error::Result;
 use crate::storage::Storage;
 use crate::upstream::ZoneRouter;
 
-use super::{ClientRegistry, DashMap, DashSet, format_mac, parse_ip, parse_mac, unmap_v4};
+use super::{
+    BINDING_RETENTION, BINDING_TOUCH_INTERVAL, ClientRegistry, DashMap, DashSet, format_mac,
+    parse_ip, parse_mac, unmap_v4,
+};
 
 impl ClientRegistry {
     pub async fn new(upstream: Arc<ZoneRouter>, storage: Arc<dyn Storage>) -> Arc<Self> {
@@ -17,6 +21,7 @@ impl ClientRegistry {
             mac_to_name: DashMap::new(),
             ip_to_mac: DashMap::new(),
             in_flight: DashSet::new(),
+            last_binding_touch: std::sync::atomic::AtomicI64::new(0),
             upstream,
             storage,
         });
@@ -84,6 +89,11 @@ impl ClientRegistry {
     }
 
     // ── Name lookup ───────────────────────────────────────────────────────────
+
+    /// `(ptr_cache entries, ip_to_mac entries)` — memory introspection.
+    pub fn cache_sizes(&self) -> (usize, usize) {
+        (self.ptr_cache.len(), self.ip_to_mac.len())
+    }
 
     /// Return the best available name for `ip`. Never blocks.
     pub fn get_name(&self, ip: IpAddr) -> Option<String> {
@@ -226,6 +236,22 @@ impl ClientRegistry {
         false
     }
 
+    /// Forget all auto-learned, IP-keyed state: the PTR cache and the IP → MAC
+    /// bindings (in memory and in storage). Manual IP/MAC aliases and learned
+    /// device names (`mac_to_name`) are intentionally preserved — they are
+    /// configuration / device identity, not query-log data. Live devices
+    /// repopulate `ip_to_mac` on the next neighbor scan; old, absent IPs stay
+    /// forgotten. Called when the query log is cleared.
+    pub async fn clear_learned_ips(&self) -> Result<()> {
+        // Delete from storage first, then clear memory only on success: if the DB
+        // write fails, both stay populated (consistent) rather than memory going
+        // empty while the rows survive to reload on the next restart.
+        self.storage.delete_all_ip_bindings().await?;
+        self.ptr_cache.clear();
+        self.ip_to_mac.clear();
+        Ok(())
+    }
+
     // ── Device-token helpers (MAC or IP fallback) ───────────────────────────────
 
     /// All IPs currently mapped to this device (for MAC tokens, every IP whose
@@ -292,8 +318,10 @@ impl ClientRegistry {
     pub async fn refresh_neighbor_table(&self) {
         let pairs = super::mac::scan_neighbors().await;
         let mut learned = 0usize;
+        let mut present: Vec<IpAddr> = Vec::with_capacity(pairs.len());
         for (ip, mac) in pairs {
             let ip = unmap_v4(ip);
+            present.push(ip);
             // Read-and-copy in one expression so no DashMap guard is held across
             // the `.await` below (parking_lot is not reentrant — see freeze notes).
             let changed = self.ip_to_mac.get(&ip).map(|e| *e) != Some(mac);
@@ -306,5 +334,57 @@ impl ClientRegistry {
         if learned > 0 {
             tracing::debug!("neighbor mirror: {} new/changed bindings", learned);
         }
+        // Keep `last_seen` fresh for still-present devices so age-based pruning only
+        // reaps long-absent bindings — a binding that never changes would otherwise
+        // never be re-persisted. Throttled: the scan runs every few seconds, and the
+        // prune window is measured in days, so touching once an hour is plenty.
+        self.touch_present_bindings(&present).await;
+    }
+
+    /// Bump `last_seen` for the currently-present IPs, at most once per
+    /// [`BINDING_TOUCH_INTERVAL`]. The only caller is the single sequential
+    /// neighbor-scan loop, so no cross-task synchronization is needed; the last-touch
+    /// time is advanced only *after* a successful write, so a failed write (e.g. a
+    /// busy DB) simply retries on the next scan instead of skipping a whole interval.
+    async fn touch_present_bindings(&self, present: &[IpAddr]) {
+        if present.is_empty() {
+            return;
+        }
+        let now = chrono::Utc::now().timestamp();
+        let last = self.last_binding_touch.load(Ordering::Relaxed);
+        if now - last < BINDING_TOUCH_INTERVAL.as_secs() as i64 {
+            return; // touched recently — nothing to do (no allocation on the common path)
+        }
+        let ips: Vec<String> = present.iter().map(|ip| ip.to_string()).collect();
+        match self.storage.touch_ip_bindings(&ips).await {
+            Ok(()) => self.last_binding_touch.store(now, Ordering::Relaxed),
+            Err(e) => tracing::debug!("failed to touch IP bindings: {}", e),
+        }
+    }
+
+    /// Prune learned, IP-keyed state that has aged out: IP→MAC bindings not seen
+    /// for [`BINDING_RETENTION`] (dropped from the DB and the in-memory map) and
+    /// any expired PTR-cache entries. Manual aliases and learned device names are
+    /// never touched. Called periodically from the retention loop so the maps
+    /// (and the `ip_bindings` table) can't grow without bound as addresses churn.
+    pub async fn prune_learned_ips(&self) {
+        let cutoff = chrono::Utc::now().timestamp() - BINDING_RETENTION.as_secs() as i64;
+        match self.storage.delete_ip_bindings_older_than(cutoff).await {
+            Ok(deleted) => {
+                for ip_s in &deleted {
+                    if let Some(ip) = parse_ip(ip_s) {
+                        self.ip_to_mac.remove(&unmap_v4(ip));
+                    }
+                }
+                if !deleted.is_empty() {
+                    tracing::info!("pruned {} stale IP bindings", deleted.len());
+                }
+            }
+            Err(e) => tracing::warn!("failed to prune IP bindings: {}", e),
+        }
+        // Drop expired PTR-cache entries (keyed by IP, no persistence, so purely
+        // an in-memory prune independent of the binding table above).
+        let now = Instant::now();
+        self.ptr_cache.retain(|_, e| e.expires_at > now);
     }
 }

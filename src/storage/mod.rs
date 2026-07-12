@@ -126,6 +126,19 @@ pub trait Storage: Send + Sync {
     /// Load all IP → MAC bindings: returns (ip, mac) pairs.
     async fn load_ip_bindings(&self) -> Result<Vec<(String, String)>>;
 
+    /// Drop every learned IP → MAC binding. Leaves `devices` (MAC → hostname)
+    /// and manual aliases intact; used when the query log is cleared.
+    async fn delete_all_ip_bindings(&self) -> Result<()>;
+
+    /// Refresh `last_seen = now` for the given IPs (currently-present devices), so
+    /// age-based pruning keeps live bindings and only expires long-absent ones.
+    /// No-op on an empty slice.
+    async fn touch_ip_bindings(&self, ips: &[String]) -> Result<()>;
+
+    /// Delete IP → MAC bindings not seen since `cutoff_ts` (unix seconds), and
+    /// return the deleted IPs so the caller can drop them from its in-memory maps.
+    async fn delete_ip_bindings_older_than(&self, cutoff_ts: i64) -> Result<Vec<String>>;
+
     // ── Custom DNS records ────────────────────────────────────────────────────
 
     async fn upsert_custom_record(

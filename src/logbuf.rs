@@ -58,7 +58,7 @@ pub struct LogEntry {
     /// Monotonic id within this process (cursor for delta polling).
     pub id: u64,
     pub timestamp: DateTime<Utc>,
-    pub level: String,
+    pub level: &'static str,
     pub target: String,
     pub message: String,
 }
@@ -81,7 +81,7 @@ impl LogBuffer {
         let entry = LogEntry {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
             timestamp: Utc::now(),
-            level: level.as_str().to_string(),
+            level: level.as_str(),
             target,
             message,
         };
@@ -99,7 +99,7 @@ impl LogBuffer {
         let q = self.entries.lock();
         let mut out: Vec<LogEntry> = q
             .iter()
-            .filter(|e| e.id > after_id && rank_of(&e.level) >= min_rank)
+            .filter(|e| e.id > after_id && rank_of(e.level) >= min_rank)
             .cloned()
             .collect();
         if out.len() > limit {

@@ -1,4 +1,5 @@
 use std::net::{IpAddr, Ipv6Addr};
+use std::path::Path;
 
 use fst::map::OpBuilder;
 use fst::{Map, MapBuilder, Streamer};
@@ -212,26 +213,64 @@ pub fn parse_content(content: &str) -> (Vec<String>, Option<AdblockStats>) {
     (vec![], None)
 }
 
+/// Backing bytes for an [`fst::Map`]: an anonymous RAM buffer or a memory-mapped
+/// file. Mmap is the serving default — the FST then lives in the OS page cache,
+/// where the kernel can evict it under memory pressure, instead of pinning RSS.
+/// `Ram` covers the empty startup map and the fallback when persisting fails
+/// (e.g. read-only disk).
+pub enum FstBytes {
+    Ram(Vec<u8>),
+    Mmap(memmap2::Mmap),
+}
+
+impl AsRef<[u8]> for FstBytes {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            FstBytes::Ram(b) => b,
+            FstBytes::Mmap(m) => m,
+        }
+    }
+}
+
+/// The one map type the engine holds, regardless of backing store.
+pub type FstMap = Map<FstBytes>;
+
+/// Wrap in-RAM FST bytes as an [`FstMap`].
+pub fn ram_fst(bytes: Vec<u8>) -> Result<FstMap> {
+    Map::new(FstBytes::Ram(bytes)).map_err(|e| FeriteError::Fst(e.to_string()))
+}
+
+/// Open an on-disk FST as a memory-mapped [`FstMap`].
+///
+/// Mapping a file is only sound while its inode's bytes never change. Every
+/// writer of ferrite FST files must therefore replace them atomically (write a
+/// tmp path, then rename) — never write in place. Rename keeps the old inode
+/// alive for existing mappings.
+pub fn mmap_fst(path: &Path) -> Result<FstMap> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| FeriteError::Fst(format!("open {}: {e}", path.display())))?;
+    // SAFETY: see above — FST files are immutable once renamed into place.
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| FeriteError::Fst(format!("mmap {}: {e}", path.display())))?;
+    Map::new(FstBytes::Mmap(mmap)).map_err(|e| FeriteError::Fst(e.to_string()))
+}
+
 /// Merge multiple per-list FSTs into one via k-way union.
 ///
 /// Uses `fst::map::OpBuilder::union()` which streams already-sorted keys in
 /// O(n log k) time — far cheaper than collecting all domains and re-sorting.
-/// Each input slice must be valid FST bytes; if only one slice is provided,
-/// it is returned as-is without any copy.
-pub fn merge_fsts(fst_slices: &[Vec<u8>]) -> Result<Vec<u8>> {
-    match fst_slices.len() {
+/// Inputs are read through whatever backs each map (typically mmap'd cache
+/// files, so the merge peak is the output, not the sum of every input); a
+/// single input is copied out as-is.
+pub fn merge_fsts<D: AsRef<[u8]>>(maps: &[Map<D>]) -> Result<Vec<u8>> {
+    match maps.len() {
         0 => MapBuilder::memory()
             .into_inner()
             .map_err(|e| FeriteError::Fst(e.to_string())),
-        1 => Ok(fst_slices[0].clone()),
+        1 => Ok(maps[0].as_fst().as_bytes().to_vec()),
         _ => {
-            let maps: Vec<Map<&[u8]>> = fst_slices
-                .iter()
-                .map(|b| Map::new(b.as_slice()).map_err(|e| FeriteError::Fst(e.to_string())))
-                .collect::<Result<_>>()?;
-
             let mut op = OpBuilder::new();
-            for m in &maps {
+            for m in maps {
                 op = op.add(m);
             }
             let mut stream = op.union();

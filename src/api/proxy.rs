@@ -322,6 +322,7 @@ mod tests {
             config: None,
             seg_position: None,
             buffer_kb: None,
+            tx_buffer_kb: None,
         }
     }
 
@@ -395,6 +396,7 @@ mod tests {
             config: config.map(str::to_string),
             seg_position: None,
             buffer_kb: None,
+            tx_buffer_kb: None,
         }
     }
 

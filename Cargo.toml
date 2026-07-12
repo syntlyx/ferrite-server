@@ -1,6 +1,6 @@
 [package]
 name = "ferrite"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.96"
 
@@ -35,12 +35,21 @@ reqwest = { version = "0.13.4", features = ["rustls", "json", "http2"], default-
 
 # ── Blocklist engine ──────────────────────────────────────────────────────────
 fst = "0.4"        # finite-state-transducer set — fast exact-domain blocklist lookups
+memmap2 = "0.9"    # serve FSTs from mmap'd files (page cache) instead of anonymous RSS
 psl = "2"          # public suffix list (eTLD+1 boundaries)
 regex = "1"        # wildcard / adblock-style rule matching (blocklist/engine)
 
 # ── Storage (SQLite) ──────────────────────────────────────────────────────────
 rusqlite = { version = "0.37", features = ["bundled"] }  # embedded SQLite — query log, rollups, settings
 tokio-rusqlite = "0.7"                                   # async wrapper around rusqlite
+
+# ── Allocator ─────────────────────────────────────────────────────────────────
+# musl's malloc retains freed pages and fragments badly under threads (the old
+# "RSS grows to 500 MB and never comes back"); mimalloc returns memory to the OS.
+mimalloc = "0.1"
+# extended: mi_process_info — mimalloc's own committed-memory figure, exposed in
+# /api/stats/system so allocator retention is distinguishable from other RSS.
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
 
 # ── Caching & concurrent state ────────────────────────────────────────────────
 dashmap = "6"        # concurrent maps — client registry, sessions, in-flight resolves

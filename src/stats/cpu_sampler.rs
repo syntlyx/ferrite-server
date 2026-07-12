@@ -34,6 +34,11 @@ pub struct CpuSampler {
 
 impl CpuSampler {
     pub fn new() -> Self {
+        // sysinfo keeps an open /proc/<pid>/stat handle per refreshed process
+        // to speed up re-reads. With `ProcessesToUpdate::All` on a long-lived
+        // `System` that pins one fd per process on the machine (hundreds).
+        // 0 disables the cache; re-opening per refresh is noise at our tick rate.
+        sysinfo::set_open_files_limit(0);
         let mut sys = System::new();
         let pid = sysinfo::get_current_pid().ok();
         // Baseline refresh: the first tick() computes deltas against this.
@@ -85,9 +90,12 @@ impl CpuSampler {
 }
 
 fn refresh_process_cpu(sys: &mut System) {
+    // `true`: drop dead processes from the map. With `false` the map grows
+    // monotonically with pid churn — entries (and their cached /proc handles,
+    // when the open-files cache is enabled) are never reclaimed.
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,
-        false,
+        true,
         ProcessRefreshKind::nothing().with_cpu(),
     );
 }

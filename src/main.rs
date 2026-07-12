@@ -6,6 +6,7 @@ mod config;
 mod dns;
 mod error;
 mod logbuf;
+mod memstats;
 mod proxy;
 mod setup;
 mod snapshot;
@@ -18,6 +19,14 @@ mod upstream;
 mod web;
 
 use std::{sync::Arc, time::Duration};
+
+/// mimalloc instead of the platform malloc: musl's allocator retains freed
+/// pages and fragments badly under threads, which read as an unbounded "leak"
+/// in RSS. Wrapped in [`memstats::CountingAlloc`] so live heap bytes are
+/// observable at runtime (`/api/stats/system` → `ferrite.heap_live_bytes`).
+#[global_allocator]
+static ALLOC: memstats::CountingAlloc<mimalloc::MiMalloc> =
+    memstats::CountingAlloc(mimalloc::MiMalloc);
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -302,6 +311,11 @@ async fn log_retention_loop(state: app::AppState) {
                 Err(e) => tracing::warn!("log retention failed: {}", e),
             }
         }
+        // Prune learned IP→MAC bindings (and expired PTR-cache entries) on the same
+        // cadence, so the client registry and its `ip_bindings` table can't grow
+        // unbounded as addresses churn (rotating IPv6 privacy addresses in
+        // particular). Uses its own fixed age window, independent of log retention.
+        state.inner.client_registry.prune_learned_ips().await;
         tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
     }
 }

@@ -281,7 +281,11 @@ async fn open_stream(
                 state.inner.proxy.egress(id).ok_or_else(|| {
                     ApiError(FeriteError::Config(format!("unknown egress '{id}'")))
                 })?;
-            DiagStream::Egress(eg.connect(host, port).await.map_err(ApiError)?)
+            DiagStream::Egress(
+                eg.connect(host, port)
+                    .await
+                    .map_err(|e| ApiError(e.into_inner()))?,
+            )
         }
         None => DiagStream::Direct(
             direct_connect(&state.inner.upstream_pool, host, port)

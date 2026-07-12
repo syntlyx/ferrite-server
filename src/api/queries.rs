@@ -144,6 +144,14 @@ pub async fn delete_queries(
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     state.inner.storage.delete_all_queries().await?;
     state.inner.live_stats.reset_all();
+    // Drop auto-learned IP state (PTR cache + IP→MAC bindings) so old addresses
+    // with no remaining queries are forgotten. Aliases and learned device names
+    // are preserved; live devices re-learn on the next neighbor scan. Best-effort:
+    // the query log is already cleared (the primary action), so a failure here is
+    // logged rather than turned into a 500 for an operation that mostly succeeded.
+    if let Err(e) = state.inner.client_registry.clear_learned_ips().await {
+        tracing::warn!("query log cleared, but clearing learned IP state failed: {e}");
+    }
     tracing::info!("query log cleared");
     Ok((
         StatusCode::OK,

@@ -28,17 +28,74 @@ impl CacheEntry {
     }
 }
 
-/// Thread-safe DNS response cache backed by an LRU eviction policy.
+/// Approximate fixed per-entry overhead beyond the key and response bytes:
+/// String/Bytes headers, the expiry Instant, LRU node links and the hash slot.
+const ENTRY_OVERHEAD: usize = 128;
+
+/// Cost of one entry against the byte budget.
+fn entry_cost(key: &str, entry: &CacheEntry) -> usize {
+    key.len() + entry.response.bytes.len() + ENTRY_OVERHEAD
+}
+
+/// The LRU map plus its byte accounting — one lock, so they can't drift apart.
+struct Inner {
+    lru: LruCache<String, CacheEntry>,
+    total_bytes: usize,
+}
+
+impl Inner {
+    /// Remove `key`, keeping the byte accounting in step.
+    fn pop(&mut self, key: &str) {
+        if let Some(v) = self.lru.pop(key) {
+            self.total_bytes -= entry_cost(key, &v);
+        }
+    }
+
+    /// Insert, then shrink back under the byte budget.
+    fn put(&mut self, key: String, entry: CacheEntry, max_bytes: usize) {
+        self.total_bytes += entry_cost(&key, &entry);
+        // `push`, not `put`: it returns the pair displaced by a same-key
+        // replace AND the one evicted by the count bound — both must be
+        // subtracted or the accounting drifts upward forever.
+        if let Some((k, v)) = self.lru.push(key, entry) {
+            self.total_bytes -= entry_cost(&k, &v);
+        }
+        // Byte budget: entry count alone can't bound memory (a DNSSEC answer
+        // with RRSIGs is 10–20× a plain one), so evict coldest-first by bytes
+        // too. `len() > 1` retains a single over-budget entry instead of
+        // looping the cache down to empty.
+        while self.total_bytes > max_bytes && self.lru.len() > 1 {
+            match self.lru.pop_lru() {
+                Some((k, v)) => self.total_bytes -= entry_cost(&k, &v),
+                None => break,
+            }
+        }
+    }
+}
+
+/// Thread-safe DNS response cache, bounded by entry count (LRU capacity) and
+/// by total bytes.
 pub struct DnsCache {
-    inner: RwLock<LruCache<String, CacheEntry>>,
+    inner: RwLock<Inner>,
+    /// Byte budget across all entries; `usize::MAX` = unbounded.
+    max_bytes: usize,
     ttl_bounds: RwLock<TtlBounds>,
 }
 
 impl DnsCache {
-    pub fn new(capacity: usize, min_ttl: u64, max_ttl: u64) -> Self {
+    /// `max_bytes == 0` disables the byte bound (count bound still applies).
+    pub fn new(capacity: usize, max_bytes: usize, min_ttl: u64, max_ttl: u64) -> Self {
         let cap = NonZeroUsize::new(capacity.max(1)).unwrap();
         Self {
-            inner: RwLock::new(LruCache::new(cap)),
+            inner: RwLock::new(Inner {
+                lru: LruCache::new(cap),
+                total_bytes: 0,
+            }),
+            max_bytes: if max_bytes == 0 {
+                usize::MAX
+            } else {
+                max_bytes
+            },
             ttl_bounds: RwLock::new(normalize_ttl_bounds(min_ttl, max_ttl)),
         }
     }
@@ -68,7 +125,7 @@ impl DnsCache {
     pub fn get(&self, name: &str, qtype: u16, dnssec: bool) -> Option<DnsResponse> {
         let key = Self::cache_key(name, qtype, dnssec);
         let guard = self.inner.read();
-        match guard.peek(&key) {
+        match guard.lru.peek(&key) {
             Some(entry) if !entry.is_expired() => Some(entry.response.clone()),
             _ => None,
         }
@@ -85,7 +142,7 @@ impl DnsCache {
     ) -> Option<(DnsResponse, u32)> {
         let key = Self::cache_key(name, qtype, dnssec);
         let guard = self.inner.read();
-        match guard.peek(&key) {
+        match guard.lru.peek(&key) {
             Some(entry) if !entry.is_expired() => {
                 let remaining = entry
                     .expires_at
@@ -108,7 +165,7 @@ impl DnsCache {
             response,
             expires_at: Instant::now() + Duration::from_secs(clamped),
         };
-        self.inner.write().put(key, entry);
+        self.inner.write().put(key, entry, self.max_bytes);
     }
 
     /// Update the TTL clamp used for future cache inserts.
@@ -133,6 +190,11 @@ impl DnsCache {
         self.inner.write().pop(&key);
     }
 
+    /// Total bytes currently accounted to cache entries.
+    pub fn bytes(&self) -> usize {
+        self.inner.read().total_bytes
+    }
+
     /// Evict every cached entry for `name`, across all qtypes. Cache keys are
     /// `name/qtype`, so this pops all keys with the `name/` prefix — covering
     /// qtypes (ANY, MX, …) that a hardcoded qtype list would miss.
@@ -140,9 +202,10 @@ impl DnsCache {
         let prefix = format!("{}/", name.to_ascii_lowercase());
         let mut guard = self.inner.write();
         let keys: Vec<String> = guard
+            .lru
             .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
             .map(|(k, _)| k.clone())
-            .filter(|k| k.starts_with(&prefix))
             .collect();
         for k in keys {
             guard.pop(&k);
@@ -155,6 +218,7 @@ impl DnsCache {
         let mut guard = self.inner.write();
         // LruCache doesn't expose drain_filter, so collect expired keys first.
         let expired: Vec<String> = guard
+            .lru
             .iter()
             .filter(|(_, v)| now >= v.expires_at)
             .map(|(k, _)| k.clone())
@@ -166,7 +230,7 @@ impl DnsCache {
 
     /// Current number of entries.
     pub fn len(&self) -> usize {
-        self.inner.read().len()
+        self.inner.read().lru.len()
     }
 
     #[allow(dead_code)]
@@ -177,7 +241,9 @@ impl DnsCache {
     /// Flush the entire cache.
     #[allow(dead_code)]
     pub fn clear(&self) {
-        self.inner.write().clear();
+        let mut guard = self.inner.write();
+        guard.lru.clear();
+        guard.total_bytes = 0;
     }
 
     /// Export all non-expired entries for snapshotting.
@@ -185,6 +251,7 @@ impl DnsCache {
         let now = std::time::Instant::now();
         self.inner
             .read()
+            .lru
             .iter()
             .filter(|(_, e)| e.expires_at > now)
             .map(|(k, e)| (k.clone(), e.response.clone(), e.expires_at))
@@ -210,7 +277,7 @@ impl DnsCache {
                 },
                 expires_at,
             };
-            guard.put(key.clone(), entry);
+            guard.put(key.clone(), entry, self.max_bytes);
         }
     }
 }
@@ -233,7 +300,11 @@ pub async fn janitor(cache: std::sync::Arc<DnsCache>) {
         tokio::task::spawn_blocking(move || c.evict_expired())
             .await
             .ok();
-        tracing::debug!("dns cache janitor: {} entries remaining", cache.len());
+        tracing::debug!(
+            "dns cache janitor: {} entries, {} KiB remaining",
+            cache.len(),
+            cache.bytes() / 1024
+        );
     }
 }
 
@@ -250,7 +321,7 @@ mod tests {
 
     #[test]
     fn hot_ttl_bounds_apply_to_future_inserts() {
-        let cache = DnsCache::new(8, 60, 300);
+        let cache = DnsCache::new(8, 0, 60, 300);
         cache.set_ttl_bounds(120, 120);
         cache.insert("example.com", 1, false, response(30));
 
@@ -261,13 +332,13 @@ mod tests {
 
     #[test]
     fn ttl_bounds_are_normalized() {
-        let cache = DnsCache::new(8, 7200, 30);
+        let cache = DnsCache::new(8, 0, 7200, 30);
         assert_eq!(cache.min_ttl_secs(), MAX_TTL);
     }
 
     #[test]
     fn evict_domain_removes_all_qtypes_for_that_name_only() {
-        let cache = DnsCache::new(16, 60, 300);
+        let cache = DnsCache::new(16, 0, 60, 300);
         cache.insert("router.lan", 1, false, response(120)); // A
         cache.insert("router.lan", 28, false, response(120)); // AAAA
         cache.insert("router.lan", 255, false, response(120)); // ANY
@@ -293,7 +364,7 @@ mod tests {
 
     #[test]
     fn dnssec_and_plain_entries_do_not_collide() {
-        let cache = DnsCache::new(8, 60, 300);
+        let cache = DnsCache::new(8, 0, 60, 300);
         // A signed (DO) entry must never be visible to a non-DO lookup — that's
         // what bloated non-DO clients and what served unsigned answers to DO
         // clients before the cache learned the DO dimension.
@@ -308,5 +379,47 @@ mod tests {
         cache.insert("example.com", 1, false, response(120));
         assert!(cache.get("example.com", 1, false).is_some());
         assert!(cache.get("example.com", 1, true).is_some());
+    }
+
+    #[test]
+    fn byte_budget_evicts_coldest_entries() {
+        // Each entry costs key("x.test/1"=8) + body(8) + ENTRY_OVERHEAD(128) =
+        // 144 bytes; a 400-byte budget fits two entries but not three.
+        let cache = DnsCache::new(100, 400, 60, 300);
+        cache.insert("a.test", 1, false, response(120));
+        cache.insert("b.test", 1, false, response(120));
+        cache.insert("c.test", 1, false, response(120));
+
+        assert!(
+            cache.get("a.test", 1, false).is_none(),
+            "coldest entry must be evicted to fit the byte budget"
+        );
+        assert!(cache.get("b.test", 1, false).is_some());
+        assert!(cache.get("c.test", 1, false).is_some());
+        assert!(cache.bytes() <= 400);
+    }
+
+    #[test]
+    fn byte_accounting_tracks_replaces_and_evictions() {
+        // Count-capped at 2, no byte cap: exercises same-key replace and
+        // capacity eviction, the two paths where `push` returns a displaced
+        // entry that must be subtracted.
+        let cache = DnsCache::new(2, 0, 60, 300);
+        cache.insert("a.test", 1, false, response(120));
+        let after_one = cache.bytes();
+        cache.insert("a.test", 1, false, response(120)); // same-key replace
+        assert_eq!(cache.bytes(), after_one, "replace must not double-count");
+
+        cache.insert("b.test", 1, false, response(120));
+        cache.insert("c.test", 1, false, response(120)); // capacity-evicts a.test
+
+        cache.evict("b.test", 1, false);
+        cache.evict_domain("c.test");
+        assert_eq!(cache.len(), 0);
+        assert_eq!(
+            cache.bytes(),
+            0,
+            "all entries gone — accounting must return to zero"
+        );
     }
 }

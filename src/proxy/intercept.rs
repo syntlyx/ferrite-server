@@ -16,7 +16,9 @@ use tokio::time::timeout;
 
 use crate::app::AppState;
 
-use super::egress::{EgressConn, EvasionParams, direct_connect, enable_keepalive, write_split};
+use super::egress::{
+    ConnectErrorKind, EgressConn, EvasionParams, direct_connect, enable_keepalive, write_split,
+};
 use super::http_host::{HostResult, parse_http_host};
 use super::sni::{SniResult, parse_sni};
 
@@ -176,6 +178,7 @@ async fn accept_loop(
 }
 
 async fn handle(mut client: TcpStream, state: AppState, proto: Protocol) -> std::io::Result<()> {
+    let _live = crate::memstats::PROXY_CONNS.guard();
     enable_keepalive(&client);
 
     // Peek the destination host from the first bytes.
@@ -267,7 +270,15 @@ async fn splice_through(
                     c
                 }
                 Err(e) => {
-                    state.inner.proxy.note_failure(&id);
+                    // Only an egress-transport failure counts against the breaker.
+                    // A destination that's unreachable behind a healthy tunnel/proxy
+                    // proves the transport works, so tripping the breaker on it would
+                    // fail-close every *other* site for the cooldown (one dead domain
+                    // taking the whole egress down). Leave the breaker untouched then.
+                    match e.kind() {
+                        ConnectErrorKind::Egress => state.inner.proxy.note_failure(&id),
+                        ConnectErrorKind::Destination => {}
+                    }
                     if fail_closed {
                         tracing::debug!(
                             "proxy: egress '{id}' failed ({e}) → fail-closed drop of {host}"
@@ -313,14 +324,21 @@ async fn splice_through(
 ///
 /// This is `tokio::io::copy_bidirectional` plus an idle timeout — the timeout is
 /// the whole point. Without it an idle keep-alive or half-closed connection pins
-/// its egress connection (and, for a WireGuard tunnel, a ~`2 × buffer_kb` socket
-/// buffer) open indefinitely, which is what made proxy memory grow without bound.
+/// its egress connection (and, for a WireGuard tunnel, its rx+tx socket rings)
+/// open indefinitely, which is what made proxy memory grow without bound.
 /// The timer is reset on every transfer, so an active-but-slow stream (e.g. a long
 /// download) is never cut off — only genuinely quiet connections are reaped.
 ///
 /// A one-way EOF half-closes that direction (the peer can still send the other
 /// way), matching `copy_bidirectional`; a returned idle timeout is reported as a
 /// clean close (`Ok`), not an error.
+///
+/// The writes track *progress*, not total duration: each chunk is written via
+/// [`write_all_progressing`], which reaps only if a single write makes no headway
+/// for `idle`. So a peer that stops reading entirely (zero TCP window, frozen app)
+/// is reaped, but a slow-but-steady transfer that takes longer than `idle` overall
+/// is carried to completion — the exact leak fix without cutting live-but-slow
+/// streams.
 async fn copy_bidirectional_idle<A, B>(a: &mut A, b: &mut B, idle: Duration) -> std::io::Result<()>
 where
     A: AsyncRead + AsyncWrite + Unpin,
@@ -339,20 +357,26 @@ where
             r = a.read(&mut buf_a), if a_open => match r? {
                 0 => {
                     a_open = false;
-                    let _ = b.shutdown().await; // propagate EOF (half-close)
+                    buf_a = Vec::new(); // direction closed for good — release its 16 KiB now
+                    let _ = timeout(idle, b.shutdown()).await; // propagate EOF (half-close)
                 }
                 n => {
-                    b.write_all(&buf_a[..n]).await?;
+                    if !write_all_progressing(b, &buf_a[..n], idle).await? {
+                        return Ok(()); // write stalled (no progress for idle) → reap
+                    }
                     timer.as_mut().reset(tokio::time::Instant::now() + idle);
                 }
             },
             r = b.read(&mut buf_b), if b_open => match r? {
                 0 => {
                     b_open = false;
-                    let _ = a.shutdown().await;
+                    buf_b = Vec::new();
+                    let _ = timeout(idle, a.shutdown()).await;
                 }
                 n => {
-                    a.write_all(&buf_b[..n]).await?;
+                    if !write_all_progressing(a, &buf_b[..n], idle).await? {
+                        return Ok(());
+                    }
                     timer.as_mut().reset(tokio::time::Instant::now() + idle);
                 }
             },
@@ -360,6 +384,28 @@ where
         }
     }
     Ok(())
+}
+
+/// Write all of `data`, bounding each individual `write` by `idle` so a peer that
+/// stops accepting bytes is reaped — but resetting that bound on every byte of
+/// progress, so a slow-but-advancing writer is never cut off no matter the total
+/// time. Returns `Ok(true)` when fully written, `Ok(false)` when a single write
+/// made no progress within `idle` (the peer's receive window is stuck → the caller
+/// reaps the splice), and propagates real I/O errors.
+async fn write_all_progressing<W>(w: &mut W, data: &[u8], idle: Duration) -> std::io::Result<bool>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut rest = data;
+    while !rest.is_empty() {
+        match timeout(idle, w.write(rest)).await {
+            Ok(Ok(0)) => return Ok(false), // writer won't accept more
+            Ok(Ok(n)) => rest = &rest[n..],
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Ok(false), // no progress within idle → stall
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -394,6 +440,72 @@ mod splice_tests {
         drop(server);
         let r = timeout(Duration::from_secs(2), task).await;
         assert!(matches!(r, Ok(Ok(Ok(())))), "clean close should return Ok");
+    }
+
+    /// A peer that stops reading (zero window) stalls `write_all` mid-transfer;
+    /// the idle window must reap that too, not just silent connections.
+    #[tokio::test]
+    async fn reaps_stalled_write() {
+        let (mut client, mut a) = duplex(64 * 1024);
+        // Tiny pipe on the far side, and its peer never reads: the first sizeable
+        // write into `b` fills the pipe and stalls forever.
+        let (_server, mut b) = duplex(16);
+        let idle = Duration::from_millis(100);
+        let task = tokio::spawn(async move { copy_bidirectional_idle(&mut a, &mut b, idle).await });
+
+        client.write_all(&[0u8; 8 * 1024]).await.unwrap();
+
+        let r = timeout(Duration::from_secs(2), task).await;
+        assert!(
+            matches!(r, Ok(Ok(Ok(())))),
+            "stalled write should reap and return Ok"
+        );
+    }
+
+    /// A writer that keeps making progress, even if the whole transfer takes far
+    /// longer than the idle window, is carried to completion (not cut off).
+    #[tokio::test]
+    async fn slow_but_progressing_write_completes() {
+        let idle = Duration::from_millis(50);
+        // Reader drains slowly (16 bytes per 10ms) — total time to move 4KB far
+        // exceeds `idle`, but each write makes progress so it must not be reaped.
+        let (mut rx, mut w) = duplex(64);
+        let reader = tokio::spawn(async move {
+            let mut got = Vec::new();
+            let mut buf = [0u8; 16];
+            loop {
+                match rx.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        got.extend_from_slice(&buf[..n]);
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(_) => break,
+                }
+            }
+            got.len()
+        });
+
+        let data = vec![7u8; 4096];
+        let ok = write_all_progressing(&mut w, &data, idle).await.unwrap();
+        assert!(ok, "a steadily-draining reader must not be reaped");
+        drop(w);
+        assert_eq!(reader.await.unwrap(), 4096, "all bytes should arrive");
+    }
+
+    /// A writer whose peer stops reading entirely stalls with no progress and is
+    /// reported as a reap (`Ok(false)`), not carried forever.
+    #[tokio::test]
+    async fn stalled_write_reports_no_progress() {
+        let (_rx, mut w) = duplex(16); // peer never reads → fills, then stalls
+        let idle = Duration::from_millis(50);
+        let stalled = write_all_progressing(&mut w, &[0u8; 8192], idle)
+            .await
+            .unwrap();
+        assert!(
+            !stalled,
+            "a peer that stops reading should report no progress"
+        );
     }
 
     /// An idle connection (peers held open, no bytes) is reaped after the idle

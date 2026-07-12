@@ -35,13 +35,53 @@ pub async fn get_system_stats(State(state): State<AppState>) -> Result<Json<Valu
     let global_cpu = state.cpu_sampler.global_cpu_percent();
     let process_cpu = state.cpu_sampler.process_cpu_percent();
 
-    let stats = tokio::task::spawn_blocking(move || system_snapshot(global_cpu, process_cpu))
+    let mut stats = tokio::task::spawn_blocking(move || system_snapshot(global_cpu, process_cpu))
         .await
         .map_err(|e| ApiError(FeriteError::Internal(e.to_string())))?;
+
+    stats["ferrite"] = ferrite_internals(&state);
 
     *state.system_stats_cache.lock() = Some((Instant::now(), stats.clone()));
 
     Ok(Json(stats))
+}
+
+/// ferrite's own memory accounting — every structure that could conceivably
+/// grow, so an RSS increase can be attributed (or ruled out) from the panel.
+/// The attribution chain, top down:
+///   `rss - rss_anonymous`         = file-backed (mmap'd FSTs, binary text) —
+///                                   kernel-reclaimable, not a leak;
+///   `rss_anonymous - heap_live`   = allocator retention/fragmentation plus
+///                                   the small non-Rust remainder (bundled
+///                                   SQLite on libc malloc, thread stacks);
+///   `heap_live_bytes` growing     = the code holds it — find the counter
+///                                   below that grew with it.
+/// `mimalloc_commit_bytes` is mimalloc's internal committed-slices counter,
+/// NOT residency: on overcommit Linux it can sit far above `rss_anonymous`
+/// (observed 98 MB vs 16 MB resident) and behaves as a high-water mark of
+/// arena slice usage. Watch its trend, never subtract it from RSS.
+fn ferrite_internals(state: &AppState) -> Value {
+    let (ptr_cache, ip_to_mac) = state.inner.client_registry.cache_sizes();
+    let rss = crate::memstats::smaps_rollup();
+    let alloc = crate::memstats::mimalloc_commit();
+    serde_json::json!({
+        "heap_live_bytes": crate::memstats::heap_live_bytes(),
+        "heap_peak_bytes": crate::memstats::heap_peak_bytes(),
+        "mimalloc_commit_bytes": alloc.commit_bytes,
+        "mimalloc_commit_peak_bytes": alloc.commit_peak_bytes,
+        "rss_bytes": rss.as_ref().map(|r| r.rss_bytes),
+        "rss_anonymous_bytes": rss.as_ref().map(|r| r.anonymous_bytes),
+        "fd_count": crate::memstats::fd_count(),
+        "dns_cache": {
+            "entries": state.inner.dns_cache.len(),
+            "bytes":   state.inner.dns_cache.bytes(),
+        },
+        "blocklist_decision_cache_entries": state.inner.blocklist.decision_cache_entries(),
+        "client_registry": { "ptr_cache": ptr_cache, "ip_to_mac": ip_to_mac },
+        "proxy_active_connections": crate::memstats::PROXY_CONNS.get(),
+        "wg_virtual_connections":   crate::memstats::WG_CONNS.get(),
+        "sessions": state.sessions.len(),
+    })
 }
 
 fn system_snapshot(global_cpu: f32, process_cpu: f32) -> Value {

@@ -645,6 +645,59 @@ impl Storage for SqliteStorage {
             .map_err(FeriteError::TokioDatabase)
     }
 
+    async fn delete_all_ip_bindings(&self) -> Result<()> {
+        self.conn
+            .call(|c| {
+                c.execute("DELETE FROM ip_bindings", [])?;
+                Ok(())
+            })
+            .await
+            .map_err(FeriteError::TokioDatabase)
+    }
+
+    async fn touch_ip_bindings(&self, ips: &[String]) -> Result<()> {
+        if ips.is_empty() {
+            return Ok(());
+        }
+        let ips = ips.to_vec();
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .call(move |c| {
+                let tx = c.unchecked_transaction()?;
+                {
+                    let mut stmt =
+                        tx.prepare("UPDATE ip_bindings SET last_seen = ?1 WHERE ip = ?2")?;
+                    for ip in &ips {
+                        stmt.execute(rusqlite::params![now, ip])?;
+                    }
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .map_err(FeriteError::TokioDatabase)
+    }
+
+    async fn delete_ip_bindings_older_than(&self, cutoff_ts: i64) -> Result<Vec<String>> {
+        self.conn
+            .call(move |c| {
+                let tx = c.unchecked_transaction()?;
+                let deleted: Vec<String> = {
+                    let mut stmt = tx.prepare("SELECT ip FROM ip_bindings WHERE last_seen < ?1")?;
+                    stmt.query_map(rusqlite::params![cutoff_ts], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                tx.execute(
+                    "DELETE FROM ip_bindings WHERE last_seen < ?1",
+                    rusqlite::params![cutoff_ts],
+                )?;
+                tx.commit()?;
+                Ok(deleted)
+            })
+            .await
+            .map_err(FeriteError::TokioDatabase)
+    }
+
     async fn load_devices(&self) -> Result<Vec<(String, Option<String>)>> {
         self.conn
             .call(|c| {
@@ -1313,6 +1366,68 @@ mod tests {
                 ("192.168.1.77".to_string(), "aa:bb:cc:dd:ee:ff".to_string()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn delete_all_ip_bindings_clears_bindings_but_keeps_devices() {
+        let storage = SqliteStorage::open(&temp_db_path("ferrite-clear-bindings"))
+            .await
+            .unwrap();
+
+        storage
+            .upsert_device("aa:bb:cc:dd:ee:ff", Some("laptop"))
+            .await
+            .unwrap();
+        storage
+            .upsert_ip_binding("192.168.1.50", "aa:bb:cc:dd:ee:ff")
+            .await
+            .unwrap();
+
+        storage.delete_all_ip_bindings().await.unwrap();
+
+        // IP bindings are gone; the learned device name survives so a returning
+        // device still resolves to its hostname.
+        assert!(storage.load_ip_bindings().await.unwrap().is_empty());
+        let devices = storage.load_devices().await.unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].1.as_deref(), Some("laptop"));
+    }
+
+    #[tokio::test]
+    async fn prune_deletes_stale_bindings_and_touch_keeps_fresh() {
+        let storage = SqliteStorage::open(&temp_db_path("ferrite-prune-bindings"))
+            .await
+            .unwrap();
+
+        storage
+            .upsert_ip_binding("192.168.1.50", "aa:bb:cc:dd:ee:ff")
+            .await
+            .unwrap();
+        storage
+            .upsert_ip_binding("192.168.1.51", "11:22:33:44:55:66")
+            .await
+            .unwrap();
+
+        // A cutoff far in the past keeps every just-written binding (last_seen=now).
+        let kept = storage.delete_ip_bindings_older_than(0).await.unwrap();
+        assert!(kept.is_empty(), "nothing should be older than the epoch");
+        assert_eq!(storage.load_ip_bindings().await.unwrap().len(), 2);
+
+        // A cutoff in the future treats both as stale → deleted, and returned so
+        // the caller can drop them from memory.
+        let future = chrono::Utc::now().timestamp() + 3600;
+        let mut deleted = storage.delete_ip_bindings_older_than(future).await.unwrap();
+        deleted.sort();
+        assert_eq!(deleted, vec!["192.168.1.50", "192.168.1.51"]);
+        assert!(storage.load_ip_bindings().await.unwrap().is_empty());
+
+        // Touch is a no-op on unknown/empty input (no panic, nothing created).
+        storage.touch_ip_bindings(&[]).await.unwrap();
+        storage
+            .touch_ip_bindings(&["10.0.0.9".to_string()])
+            .await
+            .unwrap();
+        assert!(storage.load_ip_bindings().await.unwrap().is_empty());
     }
 
     #[tokio::test]

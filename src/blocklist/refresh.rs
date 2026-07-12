@@ -8,6 +8,14 @@ use crate::blocklist::{AdblockStats, loader};
 /// Per-list domain cache is considered fresh for 12 hours.
 pub(super) const LIST_CACHE_TTL: Duration = Duration::from_secs(12 * 3600);
 
+/// Where a resolved per-list FST lives. `File` is the normal case — the merge
+/// step mmaps it, so the k-way union never holds every list's bytes in RAM at
+/// once. `Ram` carries the bytes directly when the cache write failed.
+pub(super) enum ListFst {
+    File(PathBuf),
+    Ram(Vec<u8>),
+}
+
 /// Resolve a single list to a per-list FST binary.
 ///
 /// Cache layers (fastest first):
@@ -20,8 +28,8 @@ pub(super) const LIST_CACHE_TTL: Duration = Duration::from_secs(12 * 3600);
 /// list is always re-fetched and re-parsed; the stale-cache fallbacks still
 /// apply if the network fetch fails. Use it for operator-triggered refreshes.
 ///
-/// Returns `(name, fst_bytes, unique_domain_count)`. On unrecoverable failure
-/// name is returned as an empty string so the caller can skip the entry.
+/// Returns `(name, fst_source, unique_domain_count, stats)`. On unrecoverable
+/// failure name is returned as an empty string so the caller can skip the entry.
 pub(super) async fn load_or_build_list_fst(
     name: String,
     url: String,
@@ -29,48 +37,60 @@ pub(super) async fn load_or_build_list_fst(
     domains_cache: PathBuf,
     stats_cache: PathBuf,
     force: bool,
-) -> (String, Vec<u8>, usize, Option<AdblockStats>) {
+) -> (String, ListFst, usize, Option<AdblockStats>) {
     // Fast path: fresh per-list FST on disk. The parse stats can't be recovered
     // from the binary FST, so they ride along in a sidecar written at parse time.
-    if !force && let Some(bytes) = load_fresh_bytes(&fst_cache).await {
-        let count = Map::new(bytes.as_slice()).map(|m| m.len()).unwrap_or(0);
+    if !force
+        && is_fresh(&fst_cache).await
+        && let Ok(map) = loader::mmap_fst(&fst_cache)
+    {
+        let count = map.len();
         let stats = load_stats_cache(&stats_cache).await;
         tracing::info!("list '{}': {} domains from FST cache", name, count);
-        return (name, bytes, count, stats);
+        return (name, ListFst::File(fst_cache), count, stats);
     }
 
     // Slow path: load/fetch domain text, then build FST.
     let (domains, stats) = fetch_domains(&name, &url, &domains_cache, &stats_cache, force).await;
 
     if domains.is_empty() {
-        if let Ok(bytes) = tokio::fs::read(&fst_cache).await
-            && let Ok(m) = Map::new(bytes.as_slice())
-        {
-            let count = m.len();
+        if let Ok(map) = loader::mmap_fst(&fst_cache) {
+            let count = map.len();
             let stats = load_stats_cache(&stats_cache).await;
             tracing::warn!("list '{}': using stale FST ({} domains)", name, count);
-            return (name, bytes, count, stats);
+            return (name, ListFst::File(fst_cache), count, stats);
         }
         tracing::error!("list '{}': no domains available, skipping", name);
-        return (String::new(), vec![], 0, None);
+        return (String::new(), ListFst::Ram(Vec::new()), 0, None);
     }
 
     let fst_cache2 = fst_cache.clone();
     match tokio::task::spawn_blocking(move || loader::build_fst(domains)).await {
         Ok(Ok(bytes)) => {
             let count = Map::new(bytes.as_slice()).map(|m| m.len()).unwrap_or(0);
-            if let Err(e) = tokio::fs::write(&fst_cache2, &bytes).await {
-                tracing::warn!("list '{}': could not save FST cache: {}", name, e);
+            // tmp + rename: FST files are mmap'd (at merge time and by the
+            // explain scan), so they must only ever be replaced atomically,
+            // never written in place.
+            let tmp = fst_cache2.with_extension("fst.tmp");
+            let saved = match tokio::fs::write(&tmp, &bytes).await {
+                Ok(()) => tokio::fs::rename(&tmp, &fst_cache2).await,
+                Err(e) => Err(e),
+            };
+            match saved {
+                Ok(()) => (name, ListFst::File(fst_cache2), count, stats),
+                Err(e) => {
+                    tracing::warn!("list '{}': could not save FST cache: {}", name, e);
+                    (name, ListFst::Ram(bytes), count, stats)
+                }
             }
-            (name, bytes, count, stats)
         }
         Ok(Err(e)) => {
             tracing::error!("list '{}': FST build failed: {}", name, e);
-            (String::new(), vec![], 0, None)
+            (String::new(), ListFst::Ram(Vec::new()), 0, None)
         }
         Err(e) => {
             tracing::error!("list '{}': FST build task panicked: {}", name, e);
-            (String::new(), vec![], 0, None)
+            (String::new(), ListFst::Ram(Vec::new()), 0, None)
         }
     }
 }
@@ -130,13 +150,20 @@ async fn fetch_domains(
 
 // ── Disk cache helpers ────────────────────────────────────────────────────────
 
+/// `true` if the file exists and was modified within `LIST_CACHE_TTL`.
+pub(super) async fn is_fresh(path: &Path) -> bool {
+    let Ok(meta) = tokio::fs::metadata(path).await else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    matches!(SystemTime::now().duration_since(modified), Ok(age) if age <= LIST_CACHE_TTL)
+}
+
 /// Read a file only if it was modified within `LIST_CACHE_TTL`.
 pub(super) async fn load_fresh_bytes(path: &Path) -> Option<Vec<u8>> {
-    let meta = tokio::fs::metadata(path).await.ok()?;
-    let age = SystemTime::now()
-        .duration_since(meta.modified().ok()?)
-        .ok()?;
-    if age > LIST_CACHE_TTL {
+    if !is_fresh(path).await {
         return None;
     }
     tokio::fs::read(path).await.ok()

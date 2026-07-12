@@ -5,6 +5,7 @@ mod resolver;
 
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
+use std::sync::atomic::AtomicI64;
 use std::time::{Duration, Instant};
 
 use dashmap::{DashMap, DashSet};
@@ -19,6 +20,14 @@ use crate::upstream::ZoneRouter;
 const RESOLVE_TTL: Duration = Duration::from_secs(1800);
 /// Retry delay after a complete pipeline miss.
 const MISS_TTL: Duration = Duration::from_secs(30);
+/// Minimum gap between `last_seen` touches of present IP bindings. The neighbor
+/// scan runs far more often (~10 s); touching every scan would churn the DB for
+/// no benefit, so we only refresh once an hour — well inside the prune window.
+const BINDING_TOUCH_INTERVAL: Duration = Duration::from_secs(3600);
+/// Learned IP→MAC bindings not seen for this long are pruned (DB + memory). Long
+/// enough that a device keeps its identity across a holiday away from the network,
+/// short enough that churned addresses (rotating IPv6 privacy) don't accumulate.
+const BINDING_RETENTION: Duration = Duration::from_secs(30 * 24 * 3600);
 /// Local suffixes stripped from PTR/mDNS hostnames in the UI.
 const LOCAL_SUFFIXES: &[&str] = &[
     ".localdomain",
@@ -65,6 +74,9 @@ pub struct ClientRegistry {
     mac_to_name: DashMap<[u8; 6], (String, Instant)>,
     ip_to_mac: DashMap<IpAddr, [u8; 6]>,
     in_flight: DashSet<IpAddr>,
+    /// Unix seconds of the last `last_seen` touch of present bindings; throttles
+    /// the neighbor-scan touch to [`BINDING_TOUCH_INTERVAL`] (see registry).
+    last_binding_touch: AtomicI64,
     upstream: Arc<ZoneRouter>,
     storage: Arc<dyn Storage>,
 }

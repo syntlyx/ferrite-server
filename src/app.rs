@@ -88,6 +88,7 @@ impl AppState {
         // DNS cache
         let dns_cache = Arc::new(DnsCache::new(
             config.dns.cache_size,
+            config.dns.cache_max_mb.saturating_mul(1024 * 1024),
             config.dns.min_ttl,
             config.dns.max_ttl,
         ));
