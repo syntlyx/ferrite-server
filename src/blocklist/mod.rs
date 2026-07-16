@@ -4,5 +4,5 @@ pub mod loader;
 pub mod parser;
 mod refresh;
 
-pub use engine::{Blocklist, normalise_domain};
+pub use engine::{Blocklist, CompiledProfile, normalise_domain};
 pub use parser::AdblockStats;

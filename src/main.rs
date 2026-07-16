@@ -240,6 +240,11 @@ async fn run() -> anyhow::Result<()> {
     // tick, so it needs no restart on proxy changes.
     tokio::spawn(proxy::watch(state.clone()));
 
+    // ── Active egress probe ───────────────────────────────────────────────────
+    // Periodically connects through each egress to measure latency/reachability,
+    // catching an idle path that silently died (which the breaker can't see).
+    tokio::spawn(proxy::probe(state.clone()));
+
     // ── CPU sampling ────────────────────────────────────────────────────────
     let sampler = state.cpu_sampler.clone();
     tokio::spawn(async move {

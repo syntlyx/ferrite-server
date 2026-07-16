@@ -77,6 +77,90 @@ struct BlocklistData {
     wildcards: Vec<Regex>,
 }
 
+/// Decision-cache size for a per-device profile. Smaller than the global cache
+/// (there are usually only a handful of profiles, each seeing one device's
+/// traffic) so N profiles don't multiply the global figure.
+const PROFILE_DECISION_CACHE: usize = 8_192;
+
+/// A compiled per-device blocking profile: its own merged FST (a subset of the
+/// subscription lists) plus a private decision cache. The manual black/whitelist
+/// and `wildcard_block` are shared from the parent [`Blocklist`], so a profile
+/// only changes *which subscription lists* apply to its clients.
+pub struct CompiledProfile {
+    /// Normalised client keys (IP/MAC) this profile applies to.
+    clients: HashSet<String>,
+    fst: FstMap,
+    cache: BlocklistCache,
+    /// Per-profile manual overrides (exact + wildcard), applied *before* the
+    /// global rules for this profile's clients: `allow` beats everything
+    /// (including a global block), `block` beats the global whitelist.
+    allow_exact: HashSet<String>,
+    allow_wild: Vec<Regex>,
+    block_exact: HashSet<String>,
+    block_wild: Vec<Regex>,
+}
+
+impl CompiledProfile {
+    /// Does this profile apply to the querying client? Assumes the client keys
+    /// are already normalised (the DNS hot path).
+    fn matches_client(&self, client_ip: &str, mac: Option<&str>) -> bool {
+        self.clients.contains(client_ip) || mac.is_some_and(|m| self.clients.contains(m))
+    }
+
+    /// Is `domain` explicitly allowed for this profile (exact/hierarchy or
+    /// wildcard)? An allow overrides the global block and the profile's lists.
+    fn allows(&self, domain: &str) -> bool {
+        domain_in_set(domain, &self.allow_exact)
+            || self.allow_wild.iter().any(|re| re.is_match(domain))
+    }
+
+    /// Is `domain` explicitly blocked for this profile (exact/hierarchy or
+    /// wildcard)? A profile block overrides the global whitelist.
+    fn blocks(&self, domain: &str) -> bool {
+        domain_in_set(domain, &self.block_exact)
+            || self.block_wild.iter().any(|re| re.is_match(domain))
+    }
+}
+
+/// Exact match on `domain`, else a parent in the hierarchy (stopping at the
+/// registrable boundary) — the shared walk used by the blacklist, whitelist, and
+/// profile overrides so a rule for `evil.com` also matches `www.evil.com`.
+fn domain_in_set(domain: &str, set: &HashSet<String>) -> bool {
+    if set.contains(domain) {
+        return true;
+    }
+    let mut rest = domain;
+    while let Some(dot) = rest.find('.') {
+        rest = &rest[dot + 1..];
+        if is_registrable_or_deeper(rest) && set.contains(rest) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Split configured domain patterns into an exact set (matched with the
+/// hierarchy walk) and compiled wildcard regexes, normalising each. Shared by
+/// the profile allow/block compilation.
+fn split_patterns(patterns: &[String]) -> (HashSet<String>, Vec<Regex>) {
+    let mut exact = HashSet::new();
+    let mut wild = Vec::new();
+    for p in patterns {
+        let norm = normalise(p);
+        if norm.is_empty() {
+            continue;
+        }
+        if norm.contains('*') {
+            if let Ok(re) = wildcard_to_regex(&norm) {
+                wild.push(re);
+            }
+        } else {
+            exact.insert(norm);
+        }
+    }
+    (exact, wild)
+}
+
 /// Thread-safe blocklist engine.
 ///
 /// - FST map: atomically swappable, built from all enabled remote lists.
@@ -86,7 +170,15 @@ struct BlocklistData {
 pub struct Blocklist {
     enabled: AtomicBool,
     has_client_bypass: AtomicBool,
+    has_profiles: AtomicBool,
     data: ArcSwap<BlocklistData>,
+    /// Per-device profiles (each a subset-of-lists FST + private cache), compiled
+    /// from `profiles_config` and the on-disk per-list FSTs. Rebuilt on refresh,
+    /// on startup load, and when the profile set changes via the API.
+    profiles: ArcSwap<Vec<Arc<CompiledProfile>>>,
+    /// Source of truth for [`Self::rebuild_profiles`]; the compiled `profiles`
+    /// above are derived from this plus the per-list disk caches.
+    profiles_config: RwLock<Vec<crate::config::BlocklistProfileConfig>>,
     client_bypass: ArcSwap<HashSet<String>>,
     whitelist: RwLock<HashSet<String>>,
     /// Wildcard entries for the whitelist, e.g. `*.safe.example.com`.
@@ -142,10 +234,13 @@ impl Blocklist {
         Self {
             enabled: AtomicBool::new(config.enabled),
             has_client_bypass: AtomicBool::new(!client_bypass.is_empty()),
+            has_profiles: AtomicBool::new(!config.profiles.is_empty()),
             data: ArcSwap::from_pointee(BlocklistData {
                 fst: empty_fst,
                 wildcards,
             }),
+            profiles: ArcSwap::from_pointee(Vec::new()),
+            profiles_config: RwLock::new(config.profiles),
             client_bypass: ArcSwap::from_pointee(client_bypass),
             whitelist: RwLock::new(whitelist),
             whitelist_wildcards: RwLock::new(whitelist_wildcards),
@@ -180,6 +275,10 @@ impl Blocklist {
                 self.data.store(Arc::new(BlocklistData { fst, wildcards }));
                 self.cache.clear();
                 self.restore_list_stats_from_cache();
+                // Per-list FSTs are on disk too, so profiles can compile now
+                // (before any network refresh) — a restart keeps device profiles
+                // working immediately, like the global list.
+                self.rebuild_profiles();
                 tracing::info!("blocklist loaded from disk: {} domains", count);
                 true
             }
@@ -281,12 +380,83 @@ impl Blocklist {
         if let Some(cached) = self.cache.get(domain) {
             return cached;
         }
-        let result = self.check_blocked(domain);
+        let data = self.data.load();
+        let result = self.check_blocked_in(domain, &data.fst, &data.wildcards);
         self.cache.insert(domain, result);
         result
     }
 
-    fn check_blocked(&self, domain: &str) -> bool {
+    /// Profile-aware block check for the DNS hot path. With `profile == None`
+    /// this is exactly [`Self::is_blocked_normalized`] (the default, all-lists
+    /// FST). With a profile it uses that profile's subset FST + private cache;
+    /// the manual blacklist and `wildcard_block` still apply (they're global).
+    pub fn is_blocked_for_normalized(
+        &self,
+        domain: &str,
+        profile: Option<&CompiledProfile>,
+    ) -> bool {
+        let Some(profile) = profile else {
+            return self.is_blocked_normalized(domain);
+        };
+        if let Some(cached) = profile.cache.get(domain) {
+            return cached;
+        }
+        // Profiles share the global compiled wildcards (config.wildcard_block);
+        // only the subscription FST differs.
+        let wildcards = self.data.load().wildcards.clone();
+        let result = self.check_blocked_in(domain, &profile.fst, &wildcards);
+        profile.cache.insert(domain, result);
+        result
+    }
+
+    /// Is `domain` *explicitly* allowed for this client — a global whitelist
+    /// entry or a profile allow? (Not the same as "not blocked": an ordinary
+    /// unlisted domain is neither blocked nor explicitly allowed.) Used to decide
+    /// whether to trust a CNAME chain wholesale.
+    pub fn is_allowed_for(&self, domain: &str, profile: Option<&CompiledProfile>) -> bool {
+        if let Some(p) = profile
+            && p.allows(domain)
+        {
+            return true;
+        }
+        self.is_whitelisted_normalized(domain)
+    }
+
+    /// The full block decision for the DNS hot path, including the global
+    /// whitelist and any per-device profile overrides. Precedence, most-specific
+    /// first:
+    ///   1. profile `allow`  → allowed (overrides the global block AND the
+    ///      profile's own lists — "let this device reach it no matter what"),
+    ///   2. profile `block`  → blocked (overrides the global whitelist),
+    ///   3. global whitelist → allowed,
+    ///   4. global blacklist + the profile's (or global) subscription FST +
+    ///      wildcards → blocked,
+    ///   5. otherwise allowed.
+    ///
+    /// The FST layer (step 4) is the cached part ([`Self::is_blocked_for_normalized`]);
+    /// the override and whitelist checks around it are cheap set/regex lookups, so
+    /// they run uncached on top.
+    pub fn should_block_for(&self, domain: &str, profile: Option<&CompiledProfile>) -> bool {
+        if let Some(p) = profile {
+            if p.allows(domain) {
+                return false;
+            }
+            if p.blocks(domain) {
+                return true;
+            }
+        }
+        if self.is_whitelisted_normalized(domain) {
+            return false;
+        }
+        self.is_blocked_for_normalized(domain, profile)
+    }
+
+    /// The core block decision against a specific FST + wildcard set. The manual
+    /// blacklist (exact + wildcard) is always consulted first — it is global and
+    /// overrides every profile — then the given FST/wildcards with the hierarchy
+    /// walk. Shared by the default path and every profile so their semantics
+    /// can't drift.
+    fn check_blocked_in(&self, domain: &str, fst: &FstMap, wildcards: &[Regex]) -> bool {
         {
             // Manual blacklist: exact match, then walk up the hierarchy so a
             // blacklist entry for `evil.com` also blocks `www.evil.com` —
@@ -312,12 +482,10 @@ impl Blocklist {
             return true;
         }
 
-        let data = self.data.load();
-
-        if data.fst.contains_key(domain.as_bytes()) {
+        if fst.contains_key(domain.as_bytes()) {
             return true;
         }
-        for re in &data.wildcards {
+        for re in wildcards {
             if re.is_match(domain) {
                 return true;
             }
@@ -330,11 +498,119 @@ impl Blocklist {
         let mut rest = domain;
         while let Some(dot) = rest.find('.') {
             rest = &rest[dot + 1..];
-            if is_registrable_or_deeper(rest) && data.fst.contains_key(rest.as_bytes()) {
+            if is_registrable_or_deeper(rest) && fst.contains_key(rest.as_bytes()) {
                 return true;
             }
         }
         false
+    }
+
+    // ── Per-device profiles ────────────────────────────────────────────────
+
+    pub fn has_profiles(&self) -> bool {
+        self.has_profiles.load(Ordering::Relaxed)
+    }
+
+    /// The profile that applies to this client, if any. Assumes `client_ip`/`mac`
+    /// are already normalised (DNS hot path). First match wins (config order).
+    pub fn profile_for(&self, client_ip: &str, mac: Option<&str>) -> Option<Arc<CompiledProfile>> {
+        if !self.has_profiles() {
+            return None;
+        }
+        self.profiles
+            .load()
+            .iter()
+            .find(|p| p.matches_client(client_ip, mac))
+            .cloned()
+    }
+
+    /// Replace the profile set and rebuild their FSTs from the on-disk per-list
+    /// caches. Used by the API after a config change; persists nothing itself.
+    pub fn set_profiles(&self, profiles: Vec<crate::config::BlocklistProfileConfig>) {
+        self.has_profiles
+            .store(!profiles.is_empty(), Ordering::Relaxed);
+        *self.profiles_config.write() = profiles;
+        self.rebuild_profiles();
+    }
+
+    /// Current profile configs (for the API to echo back / persist).
+    pub fn get_profiles(&self) -> Vec<crate::config::BlocklistProfileConfig> {
+        self.profiles_config.read().clone()
+    }
+
+    /// (Re)compile every profile's merged FST from the per-list `.fst` files the
+    /// last refresh wrote. Each profile merges only the subset of lists it names;
+    /// lists with no cached FST (never refreshed / failed) are skipped. Cheap:
+    /// the per-list FSTs are mmap'd, so the merge streams from the page cache and
+    /// the compiled profile FST is itself mmap'd from a `profile_<id>.fst` file
+    /// (kept off anonymous RSS, like the global FST).
+    pub fn rebuild_profiles(&self) {
+        let configs = self.profiles_config.read().clone();
+        if configs.is_empty() {
+            self.profiles.store(Arc::new(Vec::new()));
+            return;
+        }
+        let mut compiled: Vec<Arc<CompiledProfile>> = Vec::with_capacity(configs.len());
+        for cfg in &configs {
+            let mut maps: Vec<FstMap> = Vec::new();
+            for list_name in &cfg.lists {
+                let path = self
+                    .list_cache_dir
+                    .join(format!("{}.fst", refresh::sanitize_name(list_name)));
+                match loader::mmap_fst(&path) {
+                    Ok(m) => maps.push(m),
+                    Err(_) => tracing::debug!(
+                        "profile '{}': list '{}' has no cached FST yet, skipping",
+                        cfg.id,
+                        list_name
+                    ),
+                }
+            }
+            let fst = match self.build_profile_fst(&cfg.id, &maps) {
+                Some(fst) => fst,
+                None => empty_fst(),
+            };
+            let clients: HashSet<String> =
+                normalize_client_keys(&cfg.clients).into_iter().collect();
+            let (allow_exact, allow_wild) = split_patterns(&cfg.allow);
+            let (block_exact, block_wild) = split_patterns(&cfg.block);
+            compiled.push(Arc::new(CompiledProfile {
+                clients,
+                fst,
+                cache: BlocklistCache::new(PROFILE_DECISION_CACHE),
+                allow_exact,
+                allow_wild,
+                block_exact,
+                block_wild,
+            }));
+        }
+        self.profiles.store(Arc::new(compiled));
+        tracing::info!("blocklist: rebuilt {} profile(s)", configs.len());
+    }
+
+    /// Merge a profile's per-list FSTs and mmap the result from a
+    /// `profile_<id>.fst` cache file (falling back to a RAM FST if the write
+    /// fails). Returns `None` when there's nothing to merge.
+    fn build_profile_fst(&self, id: &str, maps: &[FstMap]) -> Option<FstMap> {
+        if maps.is_empty() {
+            return None;
+        }
+        let bytes = loader::merge_fsts(maps)
+            .map_err(|e| tracing::warn!("profile '{}': FST merge failed: {}", id, e))
+            .ok()?;
+        let path = self
+            .list_cache_dir
+            .join(format!("profile_{}.fst", refresh::sanitize_name(id)));
+        let tmp = path.with_extension("fst.tmp");
+        let persisted =
+            std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, &path).is_ok();
+        if persisted {
+            loader::mmap_fst(&path)
+                .or_else(|_| loader::ram_fst(bytes))
+                .ok()
+        } else {
+            loader::ram_fst(bytes).ok()
+        }
     }
 
     /// Returns `true` if `domain` is explicitly whitelisted (exact or wildcard
@@ -742,6 +1018,9 @@ impl Blocklist {
         *self.domain_counts.write() = counts;
         *self.adblock_stats.write() = stats;
         self.cache.clear();
+        // The per-list FSTs just refreshed — recompile profiles off the fresh
+        // subset caches so device profiles track list updates.
+        self.rebuild_profiles();
 
         tracing::info!("blocklist refreshed: {} unique domains", unique_count);
         Ok(unique_count)
@@ -859,6 +1138,7 @@ mod tests {
                 wildcard_block: vec!["*.ads.test".to_string()],
                 whitelist: vec![],
                 client_bypass: vec![],
+                profiles: vec![],
             },
             temp_fst_path("ferrite-blocklist-wildcard"),
         );
@@ -912,6 +1192,7 @@ mod tests {
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
+                profiles: vec![],
             },
             fst_path,
         );
@@ -922,6 +1203,179 @@ mod tests {
         let restored = blocklist.parse_stats("My List").expect("stats restored");
         assert_eq!(restored.kept, 2);
         assert_eq!(restored.exceptions, 1);
+    }
+
+    #[test]
+    fn per_device_profile_applies_a_list_subset_to_matched_clients() {
+        use crate::config::BlocklistProfileConfig;
+
+        let fst_path = temp_fst_path("ferrite-blocklist-profiles");
+        let cache_dir = fst_path.parent().unwrap().join("lists");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        // Two per-list FSTs on disk, as a refresh would have written them.
+        let ads = refresh::sanitize_name("Ads");
+        std::fs::write(
+            cache_dir.join(format!("{ads}.fst")),
+            loader::build_fst(vec!["ads.test".to_string()]).unwrap(),
+        )
+        .unwrap();
+        let porn = refresh::sanitize_name("Adult");
+        std::fs::write(
+            cache_dir.join(format!("{porn}.fst")),
+            loader::build_fst(vec!["adult.test".to_string()]).unwrap(),
+        )
+        .unwrap();
+        // The global merged FST contains both (default = everything).
+        std::fs::write(
+            &fst_path,
+            loader::build_fst(vec!["ads.test".to_string(), "adult.test".to_string()]).unwrap(),
+        )
+        .unwrap();
+
+        // "kids" profile applies BOTH lists to 10.0.0.5; everyone else gets the
+        // default all-lists FST.
+        let blocklist = Blocklist::new(
+            BlocklistConfig {
+                enabled: true,
+                decision_cache_size: 1000,
+                lists: vec![
+                    ListConfig {
+                        name: "Ads".into(),
+                        url: "https://x.test/ads".into(),
+                        enabled: true,
+                    },
+                    ListConfig {
+                        name: "Adult".into(),
+                        url: "https://x.test/adult".into(),
+                        enabled: true,
+                    },
+                ],
+                wildcard_block: vec![],
+                whitelist: vec![],
+                client_bypass: vec![],
+                profiles: vec![BlocklistProfileConfig {
+                    id: "kids".into(),
+                    name: "Kids".into(),
+                    lists: vec!["Ads".into(), "Adult".into()],
+                    clients: vec!["10.0.0.5".into()],
+                    block: Vec::new(),
+                    allow: Vec::new(),
+                }],
+            },
+            fst_path,
+        );
+        assert!(blocklist.load_from_disk());
+
+        let kids = blocklist.profile_for("10.0.0.5", None);
+        assert!(kids.is_some(), "profile must match its listed client");
+        // The kids device: both categories blocked via its own subset FST.
+        assert!(blocklist.is_blocked_for_normalized("ads.test", kids.as_deref()));
+        assert!(blocklist.is_blocked_for_normalized("adult.test", kids.as_deref()));
+
+        // An unmatched client gets no profile → the default FST (also both, here).
+        assert!(blocklist.profile_for("10.0.0.9", None).is_none());
+
+        // A profile with only the Ads list blocks ads but NOT adult content.
+        blocklist.set_profiles(vec![BlocklistProfileConfig {
+            id: "lite".into(),
+            name: "Lite".into(),
+            lists: vec!["Ads".into()],
+            clients: vec!["aa:bb:cc:dd:ee:ff".into()],
+            block: Vec::new(),
+            allow: Vec::new(),
+        }]);
+        let lite = blocklist.profile_for("10.0.0.9", Some("aa:bb:cc:dd:ee:ff"));
+        assert!(lite.is_some(), "profile must match by MAC");
+        assert!(blocklist.is_blocked_for_normalized("ads.test", lite.as_deref()));
+        assert!(
+            !blocklist.is_blocked_for_normalized("adult.test", lite.as_deref()),
+            "a list the profile excludes must not block"
+        );
+
+        // Subdomains of a profile-blocked domain are caught by the hierarchy walk.
+        assert!(blocklist.is_blocked_for_normalized("track.ads.test", lite.as_deref()));
+    }
+
+    #[test]
+    fn per_profile_manual_rules_override_global() {
+        use crate::config::BlocklistProfileConfig;
+
+        let fst_path = temp_fst_path("ferrite-blocklist-profile-overrides");
+        let cache_dir = fst_path.parent().unwrap().join("lists");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        // A single "Ads" list containing social.example so it's globally blocked.
+        let ads = refresh::sanitize_name("Ads");
+        std::fs::write(
+            cache_dir.join(format!("{ads}.fst")),
+            loader::build_fst(vec!["social.example".to_string()]).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &fst_path,
+            loader::build_fst(vec!["social.example".to_string()]).unwrap(),
+        )
+        .unwrap();
+
+        let blocklist = Blocklist::new(
+            BlocklistConfig {
+                enabled: true,
+                decision_cache_size: 1000,
+                lists: vec![ListConfig {
+                    name: "Ads".into(),
+                    url: "https://x.test/ads".into(),
+                    enabled: true,
+                }],
+                // Globally whitelist news.example (allowed for everyone by default).
+                whitelist: vec!["news.example".into()],
+                wildcard_block: vec![],
+                client_bypass: vec![],
+                profiles: vec![
+                    // "me": allow social.example (override the global block) for one device.
+                    BlocklistProfileConfig {
+                        id: "me".into(),
+                        name: "Me".into(),
+                        lists: vec!["Ads".into()],
+                        clients: vec!["10.0.0.1".into()],
+                        block: vec![],
+                        allow: vec!["social.example".into()],
+                    },
+                    // "kids": block news.example (override the global whitelist) + games.
+                    BlocklistProfileConfig {
+                        id: "kids".into(),
+                        name: "Kids".into(),
+                        lists: vec!["Ads".into()],
+                        clients: vec!["10.0.0.2".into()],
+                        block: vec!["news.example".into(), "*.games.example".into()],
+                        allow: vec![],
+                    },
+                ],
+            },
+            fst_path,
+        );
+        assert!(blocklist.load_from_disk());
+
+        let me = blocklist.profile_for("10.0.0.1", None);
+        let kids = blocklist.profile_for("10.0.0.2", None);
+        assert!(me.is_some() && kids.is_some());
+
+        // "me": profile allow beats the global block on social.example…
+        assert!(!blocklist.should_block_for("social.example", me.as_deref()));
+        // …and a subdomain of the allowed domain is freed too (hierarchy walk).
+        assert!(!blocklist.should_block_for("cdn.social.example", me.as_deref()));
+
+        // "kids": profile block beats the global whitelist on news.example…
+        assert!(blocklist.should_block_for("news.example", kids.as_deref()));
+        // …wildcard profile block works…
+        assert!(blocklist.should_block_for("play.games.example", kids.as_deref()));
+        // …and the global block still applies to kids (social is on its list).
+        assert!(blocklist.should_block_for("social.example", kids.as_deref()));
+
+        // No profile (some other device): global rules only — social blocked,
+        // news whitelisted, games untouched.
+        assert!(blocklist.should_block_for("social.example", None));
+        assert!(!blocklist.should_block_for("news.example", None));
+        assert!(!blocklist.should_block_for("play.games.example", None));
     }
 
     #[tokio::test]
@@ -944,6 +1398,7 @@ mod tests {
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
+                profiles: vec![],
             },
             fst_path.clone(),
         );
@@ -974,6 +1429,7 @@ mod tests {
                 wildcard_block: vec!["*.Ads.Test.".to_string()],
                 whitelist: vec!["Safe.Test.".to_string(), "*.Trusted.Test.".to_string()],
                 client_bypass: vec![],
+                profiles: vec![],
             },
             temp_fst_path("ferrite-blocklist-normalized"),
         );
@@ -994,6 +1450,7 @@ mod tests {
                 wildcard_block: vec!["*.ads.test".to_string()],
                 whitelist: vec!["safe.test".to_string()],
                 client_bypass: vec![],
+                profiles: vec![],
             },
             temp_fst_path("ferrite-blocklist-explain"),
         );
@@ -1038,6 +1495,7 @@ mod tests {
                 wildcard_block: vec![],
                 whitelist: vec!["google.com".to_string()],
                 client_bypass: vec![],
+                profiles: vec![],
             },
             temp_fst_path("ferrite-blocklist-wl-hierarchy"),
         );
@@ -1061,6 +1519,7 @@ mod tests {
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
+                profiles: vec![],
             },
             temp_fst_path("ferrite-blocklist-bl-hierarchy"),
         );
@@ -1088,6 +1547,7 @@ mod tests {
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
+                profiles: vec![],
             },
             temp_fst_path("ferrite-blocklist-stale-allow"),
         );
@@ -1111,6 +1571,7 @@ mod tests {
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
+                profiles: vec![],
             },
             temp_fst_path("ferrite-blocklist-psl"),
         );
@@ -1144,6 +1605,7 @@ mod tests {
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
+                profiles: vec![],
             },
             fst_path,
         );

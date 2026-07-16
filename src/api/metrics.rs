@@ -248,6 +248,44 @@ pub async fn get_metrics(State(state): State<AppState>) -> impl IntoResponse {
         }
     }
 
+    // Active-probe latency + reachability. Emitted only for egresses probed at
+    // least once (each family stays contiguous — see the note below).
+    let probes: Vec<_> = proxy_cfg
+        .egresses
+        .iter()
+        .filter_map(|e| stats.probe_snapshot(&e.id).map(|p| (e.id.as_str(), p)))
+        .collect();
+    family(
+        &mut out,
+        "ferrite_egress_probe_up",
+        "1 if the last active probe through the egress succeeded, else 0.",
+        "gauge",
+    );
+    for (id, p) in &probes {
+        sample(
+            &mut out,
+            "ferrite_egress_probe_up",
+            &[("egress", id)],
+            u8::from(p.ok),
+        );
+    }
+    family(
+        &mut out,
+        "ferrite_egress_probe_rtt_ms",
+        "Round-trip of the last successful active probe through the egress (ms).",
+        "gauge",
+    );
+    for (id, p) in &probes {
+        if let Some(rtt) = p.rtt_ms {
+            sample(
+                &mut out,
+                "ferrite_egress_probe_rtt_ms",
+                &[("egress", id)],
+                rtt,
+            );
+        }
+    }
+
     // All samples of a family must form one contiguous block right after its
     // HELP/TYPE header (exposition-format rule), so snapshot every egress once
     // and emit family by family — never interleaved per egress.

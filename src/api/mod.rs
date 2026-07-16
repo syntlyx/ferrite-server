@@ -8,6 +8,7 @@ pub mod lists;
 pub mod logs;
 pub mod metrics;
 pub mod middleware;
+pub mod profiles;
 pub mod proxy;
 pub mod queries;
 pub mod settings;
@@ -66,6 +67,9 @@ pub fn build_router(state: AppState) -> Router {
             delete(blocklist::del_whitelist),
         )
         .route("/blocklist/check/{domain}", get(blocklist::check_domain))
+        // Per-device blocking profiles (replace-whole-set, like /api/proxy)
+        .route("/blocklist/profiles", get(profiles::get_profiles))
+        .route("/blocklist/profiles", put(profiles::put_profiles))
         // Remote list subscriptions
         .route("/lists", get(lists::list_lists))
         .route("/lists", post(lists::add_list))

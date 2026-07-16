@@ -85,6 +85,9 @@ pub async fn get_proxy_stats(State(state): State<AppState>) -> Json<Value> {
                     "alerting".to_string(),
                     json!(down.map(|(_, alerted)| alerted).unwrap_or(false)),
                 );
+                // Active-probe result (latency + reachability); null until the
+                // first probe runs for this egress.
+                obj.insert("probe".to_string(), json!(stats.probe_snapshot(&e.id)));
             }
             (e.id.clone(), v)
         })
@@ -470,7 +473,19 @@ mod tests {
         // No downtime observed by the alert watcher → null / not alerting.
         assert!(v["egresses"]["work"]["down_since_secs"].is_null());
         assert_eq!(v["egresses"]["work"]["alerting"], json!(false));
+        // Never probed yet → probe is null.
+        assert!(v["egresses"]["work"]["probe"].is_null());
         assert_eq!(v["rules"].as_array().unwrap().len(), 0);
+
+        // After a probe result it surfaces (latency + reachability).
+        state
+            .inner
+            .proxy
+            .stats()
+            .record_probe("work", Some(std::time::Duration::from_millis(33)));
+        let Json(v) = get_proxy_stats(State(state.clone())).await;
+        assert_eq!(v["egresses"]["work"]["probe"]["rtt_ms"], json!(33));
+        assert_eq!(v["egresses"]["work"]["probe"]["ok"], json!(true));
 
         // Simulate the intercept path recording traffic.
         let stats = state.inner.proxy.stats();

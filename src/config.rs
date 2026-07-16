@@ -215,6 +215,37 @@ pub struct BlocklistConfig {
     pub wildcard_block: Vec<String>,
     pub whitelist: Vec<String>,
     pub client_bypass: Vec<String>,
+    /// Per-device blocking profiles. A profile applies a *subset* of the
+    /// subscription lists to specific clients; devices that match no profile use
+    /// all enabled lists (the default behaviour). Manual black/whitelist and
+    /// `wildcard_block` are global and apply to every profile.
+    #[serde(default)]
+    pub profiles: Vec<BlocklistProfileConfig>,
+}
+
+/// A named per-device blocking profile: which subscription lists (by name) apply,
+/// for which clients (IP or MAC).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct BlocklistProfileConfig {
+    /// Stable machine id (slug); rules/UI reference this.
+    pub id: String,
+    /// Human-readable display name.
+    pub name: String,
+    /// Subscription list names this profile includes (subset of `lists`).
+    #[serde(default)]
+    pub lists: Vec<String>,
+    /// Client IPs/MACs this profile applies to.
+    #[serde(default)]
+    pub clients: Vec<String>,
+    /// Domains blocked for this profile's clients on top of the global rules
+    /// (exact domain or `*.wildcard`). Applied even if the domain is globally
+    /// whitelisted — the per-device block wins.
+    #[serde(default)]
+    pub block: Vec<String>,
+    /// Domains allowed for this profile's clients, overriding the global block
+    /// AND this profile's own subscription lists (exact or `*.wildcard`).
+    #[serde(default)]
+    pub allow: Vec<String>,
 }
 
 fn default_blocklist_decision_cache_size() -> usize {
@@ -276,9 +307,19 @@ pub struct ProxyConfig {
     /// ntfy, a Slack/Telegram shim, or anything that accepts a JSON POST.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alert_webhook: Option<String>,
+    /// `host:port` the active probe TCP-connects to *through* each egress to
+    /// measure latency and reachability. Defaults to [`DEFAULT_PROBE_TARGET`]
+    /// when unset; override it if a tunnel blocks the default (the probe result
+    /// gates fail-closed rules, so it must be reachable through every egress).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_target: Option<String>,
     pub egresses: Vec<EgressConfig>,
     pub rules: Vec<RuleConfig>,
 }
+
+/// Default active-probe target: Cloudflare's resolver on the HTTPS port, which is
+/// reachable from essentially anywhere a tunnel can carry traffic.
+pub const DEFAULT_PROBE_TARGET: &str = "1.1.1.1:443";
 
 impl Default for ProxyConfig {
     fn default() -> Self {
@@ -290,6 +331,7 @@ impl Default for ProxyConfig {
             advertise_ipv6: None,
             max_connections: default_max_connections(),
             alert_webhook: None,
+            probe_target: None,
             egresses: Vec::new(),
             rules: Vec::new(),
         }
@@ -365,6 +407,12 @@ impl ProxyConfig {
         // An all-whitespace webhook means "no webhook".
         self.alert_webhook = self
             .alert_webhook
+            .take()
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty());
+        // Blank probe target → fall back to the built-in default.
+        self.probe_target = self
+            .probe_target
             .take()
             .map(|u| u.trim().to_string())
             .filter(|u| !u.is_empty());
@@ -483,6 +531,7 @@ impl Default for BlocklistConfig {
             wildcard_block: vec![],
             whitelist: vec![],
             client_bypass: vec![],
+            profiles: vec![],
         }
     }
 }

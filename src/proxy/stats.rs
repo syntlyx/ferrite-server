@@ -30,6 +30,11 @@ use crate::config::ProxyConfig;
 /// carrying *now* while staying bounded regardless of how many hosts pass through.
 const DOMAIN_CAP: usize = 48;
 
+/// Consecutive failed probes before the active probe marks an egress unhealthy.
+/// A single miss (probe target briefly unreachable) must not flip a working
+/// egress; a sustained run means the path is genuinely dead.
+const PROBE_FAIL_THRESHOLD: u32 = 3;
+
 /// All proxy traffic counters, shared across snapshot reloads.
 #[derive(Default)]
 pub struct ProxyStats {
@@ -39,6 +44,21 @@ pub struct ProxyStats {
     /// SNI/Host), so a hit means "a connection actually chose this rule" — not
     /// merely that DNS answered with the advertise IP.
     rule_hits: DashMap<(String, String), AtomicU64>,
+    /// Latest active-probe result per egress id (RTT + reachability), written by
+    /// the probe loop and read by the stats API, metrics, and the health gate.
+    probes: DashMap<String, ProbeState>,
+}
+
+/// The last active-probe outcome for one egress.
+struct ProbeState {
+    /// Round-trip of the last successful probe (ms); `None` if it failed.
+    rtt_ms: Option<u32>,
+    /// Did the last probe succeed?
+    ok: bool,
+    /// Consecutive failures ending at the last probe (0 right after a success).
+    consecutive_fails: u32,
+    /// Unix seconds of the last probe.
+    last_probe_secs: u64,
 }
 
 impl ProxyStats {
@@ -66,6 +86,8 @@ impl ProxyStats {
                 .iter()
                 .any(|r| r.pattern == *pattern && r.egress == *egress)
         });
+        self.probes
+            .retain(|id, _| cfg.egresses.iter().any(|e| e.id == *id));
     }
 
     /// Counters for egress `id` as a serializable snapshot — zeros when the
@@ -88,6 +110,49 @@ impl ProxyStats {
                 hits: e.value().load(Ordering::Relaxed),
             })
             .collect()
+    }
+
+    /// Record an active-probe outcome for egress `id`: `Some(rtt)` on a
+    /// successful connect through the egress, `None` on failure/timeout.
+    pub fn record_probe(&self, id: &str, rtt: Option<std::time::Duration>) {
+        let mut e = self.probes.entry(id.to_string()).or_insert(ProbeState {
+            rtt_ms: None,
+            ok: false,
+            consecutive_fails: 0,
+            last_probe_secs: 0,
+        });
+        e.last_probe_secs = now_secs();
+        match rtt {
+            Some(d) => {
+                e.rtt_ms = Some(d.as_millis().min(u32::MAX as u128) as u32);
+                e.ok = true;
+                e.consecutive_fails = 0;
+            }
+            None => {
+                e.rtt_ms = None;
+                e.ok = false;
+                e.consecutive_fails = e.consecutive_fails.saturating_add(1);
+            }
+        }
+    }
+
+    /// The last probe result for egress `id` as a serializable snapshot, or
+    /// `None` if it has never been probed.
+    pub fn probe_snapshot(&self, id: &str) -> Option<ProbeSnapshot> {
+        self.probes.get(id).map(|e| ProbeSnapshot {
+            rtt_ms: e.rtt_ms,
+            ok: e.ok,
+            last_probe_secs_ago: now_secs().saturating_sub(e.last_probe_secs),
+        })
+    }
+
+    /// Has the active probe declared this egress dead? True only after a
+    /// sustained run of failures ([`PROBE_FAIL_THRESHOLD`]); a never-probed or
+    /// briefly-flapping egress is *not* forced unhealthy (fail open until sure).
+    pub fn probe_unhealthy(&self, id: &str) -> bool {
+        self.probes
+            .get(id)
+            .is_some_and(|e| e.consecutive_fails >= PROBE_FAIL_THRESHOLD)
     }
 }
 
@@ -250,6 +315,17 @@ pub struct RuleHits {
     pub hits: u64,
 }
 
+/// The last active-probe result for one egress, for the stats API / metrics.
+#[derive(Serialize)]
+pub struct ProbeSnapshot {
+    /// Round-trip of the last successful probe (ms); `None` if it failed.
+    pub rtt_ms: Option<u32>,
+    /// Did the last probe succeed?
+    pub ok: bool,
+    /// Seconds since the last probe ran.
+    pub last_probe_secs_ago: u64,
+}
+
 /// Byte-counting wrapper around an egress connection: every successful write
 /// counts as up-traffic, every successful read as down-traffic, both into the
 /// shared per-egress counters (live, so rates are visible mid-transfer) and into
@@ -352,6 +428,39 @@ mod tests {
         assert_eq!(conn.transferred(), (5, 7));
         assert_eq!(stats.bytes_up.load(Ordering::Relaxed), 5);
         assert_eq!(stats.bytes_down.load(Ordering::Relaxed), 7);
+    }
+
+    #[test]
+    fn probe_marks_unhealthy_only_after_sustained_failures() {
+        let stats = ProxyStats::default();
+
+        // Never probed → not unhealthy, no snapshot (fail open).
+        assert!(!stats.probe_unhealthy("wg"));
+        assert!(stats.probe_snapshot("wg").is_none());
+
+        // A success records RTT and clears any failure run.
+        stats.record_probe("wg", Some(std::time::Duration::from_millis(42)));
+        let snap = stats.probe_snapshot("wg").expect("probed");
+        assert_eq!(snap.rtt_ms, Some(42));
+        assert!(snap.ok);
+        assert!(!stats.probe_unhealthy("wg"));
+
+        // Failures below the threshold don't flip health (absorbs a blip).
+        stats.record_probe("wg", None);
+        stats.record_probe("wg", None);
+        assert!(
+            !stats.probe_unhealthy("wg"),
+            "two failures is under the threshold"
+        );
+
+        // The third consecutive failure trips it.
+        stats.record_probe("wg", None);
+        assert!(stats.probe_unhealthy("wg"));
+        assert_eq!(stats.probe_snapshot("wg").unwrap().rtt_ms, None);
+
+        // A single success recovers immediately.
+        stats.record_probe("wg", Some(std::time::Duration::from_millis(10)));
+        assert!(!stats.probe_unhealthy("wg"));
     }
 
     #[test]

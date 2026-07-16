@@ -12,11 +12,13 @@ mod egress;
 mod health;
 pub(crate) mod http_host;
 mod intercept;
+mod probe;
 mod rules;
 mod sni;
 mod stats;
 
 pub use alerts::watch;
+pub use probe::run as probe;
 
 pub(crate) use intercept::forward_http;
 pub use intercept::run;
@@ -306,9 +308,14 @@ impl ProxyState {
     }
 
     pub fn is_egress_healthy(&self, id: &str) -> bool {
-        // Both the connect circuit-breaker AND the egress's intrinsic readiness
-        // (e.g. a WireGuard tunnel only counts as healthy once its handshake has
-        // completed) must be green.
+        // Three independent signals must all be green:
+        //  - the connect circuit-breaker (trips on real-traffic connect failures),
+        //  - the egress's intrinsic readiness (e.g. a WireGuard tunnel is healthy
+        //    only once its handshake completes),
+        //  - the active probe (catches an *idle* egress that silently died, which
+        //    the breaker can't see because no traffic has hit it). The probe only
+        //    forces unhealthy after a sustained failure run, so a brief blip or an
+        //    egress that has never been probed never trips this.
         let breaker_ok = self
             .breakers
             .get(id)
@@ -322,7 +329,7 @@ impl ProxyState {
             .find(|e| e.id() == id)
             .map(|e| e.is_healthy())
             .unwrap_or(true);
-        breaker_ok && intrinsic_ok
+        breaker_ok && intrinsic_ok && !self.stats.probe_unhealthy(id)
     }
 
     fn note_success(&self, id: &str) {
@@ -504,6 +511,7 @@ mod tests {
             advertise_ipv6: None,
             max_connections: 16,
             alert_webhook: None,
+            probe_target: None,
             egresses: vec![EgressConfig {
                 id: "t".to_string(),
                 name: "t".to_string(),
@@ -598,6 +606,7 @@ mod tests {
             advertise_ipv6: None,
             max_connections: 16,
             alert_webhook: None,
+            probe_target: None,
             egresses,
             rules,
         };

@@ -67,8 +67,10 @@ pub async fn handle_query(
     let client_ip = client_addr.to_string();
     let blocking_enabled = state.blocklist.blocking_enabled();
     // Resolve the client MAC when something keys on it: blocklist client-bypass,
-    // or a proxy rule scoped to specific clients. Both are cheap in-memory lookups.
-    let client_mac = if (blocking_enabled && state.blocklist.has_client_bypass())
+    // a per-device blocking profile, or a proxy rule scoped to specific clients.
+    // All are cheap in-memory lookups.
+    let client_mac = if (blocking_enabled
+        && (state.blocklist.has_client_bypass() || state.blocklist.has_profiles()))
         || state.proxy.has_client_rules()
     {
         state.client_registry.get_mac(client_addr)
@@ -79,6 +81,15 @@ pub async fn handle_query(
         && !state
             .blocklist
             .client_bypasses_blocking_normalized(&client_ip, client_mac.as_deref());
+    // The per-device profile (subset of lists) for this client, if any. When
+    // present it replaces the default all-lists FST for every block check below.
+    let profile = if filtering_enabled {
+        state
+            .blocklist
+            .profile_for(&client_ip, client_mac.as_deref())
+    } else {
+        None
+    };
     let qtype: u16 = question.query_type().into();
     // DNSSEC is honored per-client. We only request signatures upstream — and
     // cache/serve them — when this client set the DO bit AND the feature is on.
@@ -147,10 +158,7 @@ pub async fn handle_query(
     }
 
     // ── Step 3: Blocklist (skipped when globally disabled or client bypasses filtering) ──
-    if filtering_enabled
-        && !state.blocklist.is_whitelisted_normalized(&name)
-        && state.blocklist.is_blocked_normalized(&name)
-    {
+    if filtering_enabled && state.blocklist.should_block_for(&name, profile.as_deref()) {
         tracing::debug!("blocked: {}", name);
         if !log_ignored {
             let elapsed = start.elapsed().as_millis() as u32;
@@ -179,7 +187,7 @@ pub async fn handle_query(
     {
         if filtering_enabled
             && let Some(blocked_cname) =
-                cname_blocked_target(&cached.bytes, &name, &state.blocklist)
+                cname_blocked_target(&cached.bytes, &name, &state.blocklist, profile.as_deref())
         {
             tracing::debug!("CNAME-blocked from cache: {} → {}", name, blocked_cname);
             if !log_ignored {
@@ -252,7 +260,8 @@ pub async fn handle_query(
     // name is not whitelisted), return NXDOMAIN without caching.
     if rcode == 0
         && filtering_enabled
-        && let Some(blocked_cname) = cname_blocked_target(&response_bytes, &name, &state.blocklist)
+        && let Some(blocked_cname) =
+            cname_blocked_target(&response_bytes, &name, &state.blocklist, profile.as_deref())
     {
         tracing::debug!("CNAME-blocked: {} → {}", name, blocked_cname);
         if !log_ignored {
@@ -394,15 +403,22 @@ fn build_servfail(query: &Message) -> Vec<u8> {
 
 /// Walk the CNAME chain in a DNS response and return the first blocked target.
 ///
-/// If the original queried name is whitelisted, the entire chain is trusted
-/// (the user explicitly allowed that domain and its resolution path).
+/// The decision runs through [`Blocklist::should_block_for`], so the global
+/// whitelist and any per-device profile overrides (allow/block) apply to CNAME
+/// targets exactly as they do to the queried name. If the queried name itself is
+/// allowed for this client, the whole chain is trusted.
 /// Returns `None` if the chain is clean or the response has no CNAMEs.
 fn cname_blocked_target(
     response_bytes: &[u8],
     queried_name: &str,
     blocklist: &crate::blocklist::Blocklist,
+    profile: Option<&crate::blocklist::CompiledProfile>,
 ) -> Option<String> {
-    if blocklist.is_whitelisted_normalized(queried_name) {
+    // If the queried name is *explicitly* allowed for this client (global
+    // whitelist or a profile allow), trust its whole resolution path. Note this
+    // is not "not blocked" — an ordinary unlisted name still has its CNAME chain
+    // inspected, which is the entire point of this check.
+    if blocklist.is_allowed_for(queried_name, profile) {
         return None;
     }
     let msg = Message::from_bytes(response_bytes).ok()?;
@@ -410,9 +426,7 @@ fn cname_blocked_target(
         if let RData::CNAME(cname) = &record.data {
             let target = cname.0.to_utf8().to_lowercase();
             let target = target.trim_end_matches('.');
-            if !blocklist.is_whitelisted_normalized(target)
-                && blocklist.is_blocked_normalized(target)
-            {
+            if blocklist.should_block_for(target, profile) {
                 return Some(target.to_string());
             }
         }
@@ -702,6 +716,7 @@ mod tests {
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
+                profiles: vec![],
             },
             temp_fst_path("ferrite-dns-handler"),
         )
@@ -909,6 +924,7 @@ mod tests {
                 &cname_response("cdn.example.test", "blocked.test"),
                 "cdn.example.test",
                 &blocklist,
+                None,
             ),
             Some("blocked.test".to_string())
         );
@@ -925,6 +941,7 @@ mod tests {
                 &cname_response("cdn.example.test", "blocked.test"),
                 "cdn.example.test",
                 &blocklist,
+                None,
             ),
             None
         );
