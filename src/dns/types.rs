@@ -31,6 +31,9 @@ pub enum QueryStatus {
     Blocked,
     /// Explicitly allowed (whitelist / whitelist cache).
     Allowed,
+    /// Matched a routing rule: answered with the proxy's advertise IP so the
+    /// connection goes through the chosen egress (`upstream` = `proxy:<egress>`).
+    Routed,
 }
 
 impl QueryStatus {
@@ -40,6 +43,7 @@ impl QueryStatus {
             QueryStatus::Cached => "cached",
             QueryStatus::Blocked => "blocked",
             QueryStatus::Allowed => "allowed",
+            QueryStatus::Routed => "routed",
         }
     }
 }

@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS queries (
     domain      TEXT    NOT NULL,
     query_type  INTEGER NOT NULL,   -- u16, full RFC DNS QTYPE (A=1, AAAA=28, CAA=257, …)
     client_ip   TEXT    NOT NULL,
-    status      TEXT    NOT NULL,   -- 'upstream' | 'cached' | 'blocked' | 'allowed'
+    status      TEXT    NOT NULL,   -- 'upstream' | 'cached' | 'blocked' | 'allowed' | 'routed'
     latency_ms  INTEGER NOT NULL DEFAULT 0,
     upstream    TEXT,               -- NULL if not forwarded
     rcode       INTEGER NOT NULL DEFAULT 0

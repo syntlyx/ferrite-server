@@ -21,6 +21,9 @@ pub enum Matcher {
 
 pub struct CompiledRule {
     pub matcher: Matcher,
+    /// The original config pattern — the stable identity hit counters are
+    /// keyed by (the matcher itself isn't comparable once compiled to a regex).
+    pub pattern: String,
     pub egress_idx: usize,
     pub fail_closed: bool,
     /// Restrict to these clients (lowercased MAC or IP strings). Empty = all.
@@ -85,6 +88,7 @@ pub fn compile(rules: &[RuleConfig], egress_idx: &HashMap<String, usize>) -> Vec
         };
         out.push(CompiledRule {
             matcher,
+            pattern: r.pattern.clone(),
             egress_idx: idx,
             fail_closed: r.fail_closed,
             clients: r
@@ -134,6 +138,7 @@ mod tests {
         let m = Matcher::Exact("google.com".to_string());
         let r = CompiledRule {
             matcher: m,
+            pattern: "google.com".to_string(),
             egress_idx: 0,
             fail_closed: true,
             clients: Vec::new(),
@@ -150,6 +155,7 @@ mod tests {
     fn client_scoping_restricts_to_listed_devices() {
         let scoped = CompiledRule {
             matcher: Matcher::Exact("x.test".to_string()),
+            pattern: "x.test".to_string(),
             egress_idx: 0,
             fail_closed: true,
             clients: vec!["aa:bb:cc:dd:ee:ff".to_string(), "10.0.0.5".to_string()],
@@ -161,6 +167,7 @@ mod tests {
 
         let all = CompiledRule {
             matcher: Matcher::Exact("x.test".to_string()),
+            pattern: "x.test".to_string(),
             egress_idx: 0,
             fail_closed: true,
             clients: Vec::new(),

@@ -43,6 +43,63 @@ pub async fn get_proxy(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+/// GET /api/proxy/stats — live traffic counters for the Tunnels page: per-egress
+/// health + bytes/connections/failures + the recent routed domains, and per-rule
+/// hit counts. Counters are cumulative since process start (an egress edited in
+/// place keeps its history; deleting it resets). Rates are derived client-side
+/// from deltas between polls, so the server keeps no sampling window.
+pub async fn get_proxy_stats(State(state): State<AppState>) -> Json<Value> {
+    let cfg = state.live_config.read().proxy.clone();
+    let stats = state.inner.proxy.stats();
+
+    let egresses: serde_json::Map<String, Value> = cfg
+        .egresses
+        .iter()
+        .map(|e| {
+            let mut v = serde_json::to_value(stats.egress_snapshot(&e.id)).unwrap_or_default();
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "healthy".to_string(),
+                    json!(state.inner.proxy.is_egress_healthy(&e.id)),
+                );
+                // Only a live (enabled, built) WireGuard egress reports one.
+                obj.insert(
+                    "handshake_age_secs".to_string(),
+                    json!(
+                        state
+                            .inner
+                            .proxy
+                            .egress(&e.id)
+                            .and_then(|eg| eg.handshake_age_secs())
+                    ),
+                );
+                // Downtime as observed by the alert watcher: how long the
+                // egress has been down, and whether that outage has lasted past
+                // the alert grace (what the UI badges on).
+                let down = state.inner.proxy.down_info(&e.id);
+                obj.insert(
+                    "down_since_secs".to_string(),
+                    json!(down.map(|(secs, _)| secs)),
+                );
+                obj.insert(
+                    "alerting".to_string(),
+                    json!(down.map(|(_, alerted)| alerted).unwrap_or(false)),
+                );
+            }
+            (e.id.clone(), v)
+        })
+        .collect();
+
+    Json(json!({
+        "egresses": egresses,
+        "rules": stats.rule_hits_snapshot(),
+        // Kept alongside the stats so the UI's poll also refreshes the kernel
+        // buffer ceiling (a live sysctl change clears the warning without a
+        // page reload).
+        "max_buffer_kb": kernel_udp_recv_kb(),
+    }))
+}
+
 /// Probe the effective UDP receive-buffer ceiling the kernel grants (KiB) by
 /// requesting an oversized `SO_RCVBUF` on a throwaway socket and reading it back.
 /// The kernel clamps the request to `net.core.rmem_max`, so the read-back reveals
@@ -118,6 +175,12 @@ pub async fn put_proxy(
 /// Reject obviously-broken configs with a 400 so the UI can show a clear error
 /// (rather than silently dropping egresses/rules at snapshot-build time).
 fn validate(cfg: &ProxyConfig) -> Result<(), ApiError> {
+    if let Some(url) = cfg.alert_webhook.as_deref() {
+        let url = url.trim();
+        if !url.is_empty() && !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(bad("alert webhook must be an http(s) URL"));
+        }
+    }
     let mut ids: HashSet<String> = HashSet::new();
     for e in &cfg.egresses {
         let id = e.id.trim().to_ascii_lowercase();
@@ -379,6 +442,62 @@ mod tests {
         assert_eq!(live.egresses.len(), 1);
         assert_eq!(live.rules.len(), 1);
         assert_eq!(live.egresses[0].id, "work");
+        drop(state);
+        test_support::cleanup_sqlite(&db);
+    }
+
+    #[tokio::test]
+    async fn stats_report_configured_egresses_and_rule_hits() {
+        let (state, db) = test_support::app_state("proxy-stats").await;
+        let cfg = ProxyConfig {
+            enabled: true,
+            egresses: vec![egress("work", "socks5")],
+            rules: vec![RuleConfig {
+                pattern: "*.example.com".to_string(),
+                egress: "work".to_string(),
+                fail_closed: true,
+                clients: Vec::new(),
+            }],
+            ..ProxyConfig::default()
+        };
+        let _ = put_proxy(State(state.clone()), Json(cfg)).await.unwrap();
+
+        // A configured egress always appears, zeroed before any traffic.
+        let Json(v) = get_proxy_stats(State(state.clone())).await;
+        assert_eq!(v["egresses"]["work"]["total_conns"], json!(0));
+        assert_eq!(v["egresses"]["work"]["bytes_up"], json!(0));
+        assert!(v["egresses"]["work"]["handshake_age_secs"].is_null());
+        // No downtime observed by the alert watcher → null / not alerting.
+        assert!(v["egresses"]["work"]["down_since_secs"].is_null());
+        assert_eq!(v["egresses"]["work"]["alerting"], json!(false));
+        assert_eq!(v["rules"].as_array().unwrap().len(), 0);
+
+        // Simulate the intercept path recording traffic.
+        let stats = state.inner.proxy.stats();
+        stats.record_rule_hit("*.example.com", "work");
+        let es = stats.egress("work");
+        {
+            let _conn = es.begin_conn("www.example.com");
+            es.add_domain_bytes("www.example.com", 10, 200);
+        }
+
+        let Json(v) = get_proxy_stats(State(state.clone())).await;
+        let work = &v["egresses"]["work"];
+        assert_eq!(work["active"], json!(0), "guard dropped");
+        assert_eq!(work["total_conns"], json!(1));
+        assert_eq!(work["domains"][0]["host"], json!("www.example.com"));
+        assert_eq!(work["domains"][0]["bytes_down"], json!(200));
+        assert_eq!(v["rules"][0]["pattern"], json!("*.example.com"));
+        assert_eq!(v["rules"][0]["hits"], json!(1));
+
+        // Removing the rule and egress from the config prunes their counters.
+        let _ = put_proxy(State(state.clone()), Json(ProxyConfig::default()))
+            .await
+            .unwrap();
+        let Json(v) = get_proxy_stats(State(state.clone())).await;
+        assert!(v["egresses"].as_object().unwrap().is_empty());
+        assert_eq!(v["rules"].as_array().unwrap().len(), 0);
+
         drop(state);
         test_support::cleanup_sqlite(&db);
     }

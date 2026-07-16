@@ -21,6 +21,7 @@ use super::egress::{
 };
 use super::http_host::{HostResult, parse_http_host};
 use super::sni::{SniResult, parse_sni};
+use super::stats::{Counted, EgressStats};
 
 const PEEK_TIMEOUT: Duration = Duration::from_secs(5);
 const PEEK_CAP: usize = 16 * 1024;
@@ -250,16 +251,29 @@ async fn splice_through(
     let decision = {
         let snap = state.inner.proxy.registry.load();
         snap.route(&host, &client_ip, client_mac.as_deref())
-            .map(|r| (Arc::clone(&snap.egresses[r.egress_idx]), r.fail_closed))
+            .map(|r| {
+                (
+                    Arc::clone(&snap.egresses[r.egress_idx]),
+                    r.fail_closed,
+                    r.pattern.clone(),
+                )
+            })
     };
 
     // ClientHello-fragmentation params, set only when the chosen egress is a
     // DirectEvasion egress and the connect succeeds (not on the direct fallback).
     let mut frag: Option<EvasionParams> = None;
-    let mut conn: EgressConn = match decision {
-        Some((egress, fail_closed)) => {
+    // Per-egress traffic counters, set only when the connection actually goes
+    // through the egress — a fail-open fallback to direct and the unrouted plain
+    // forward below are not tunnel traffic.
+    let mut stats: Option<Arc<EgressStats>> = None;
+    let conn: EgressConn = match decision {
+        Some((egress, fail_closed, pattern)) => {
             let id = egress.id().to_string();
+            state.inner.proxy.stats.record_rule_hit(&pattern, &id);
+            let egress_stats = state.inner.proxy.stats.egress(&id);
             if fail_closed && !state.inner.proxy.is_egress_healthy(&id) {
+                egress_stats.record_fail_closed_drop();
                 tracing::debug!("proxy: egress '{id}' unhealthy → fail-closed drop of {host}");
                 return Ok(());
             }
@@ -267,9 +281,11 @@ async fn splice_through(
                 Ok(c) => {
                     state.inner.proxy.note_success(&id);
                     frag = egress.evasion_params();
+                    stats = Some(egress_stats);
                     c
                 }
                 Err(e) => {
+                    egress_stats.record_connect_fail();
                     // Only an egress-transport failure counts against the breaker.
                     // A destination that's unreachable behind a healthy tunnel/proxy
                     // proves the transport works, so tripping the breaker on it would
@@ -280,6 +296,7 @@ async fn splice_through(
                         ConnectErrorKind::Destination => {}
                     }
                     if fail_closed {
+                        egress_stats.record_fail_closed_drop();
                         tracing::debug!(
                             "proxy: egress '{id}' failed ({e}) → fail-closed drop of {host}"
                         );
@@ -308,15 +325,32 @@ async fn splice_through(
         }
     };
 
+    // Count bytes through the (counting) wrapper and hold the active-connection
+    // gauge for the splice's whole lifetime; both are no-ops for untracked
+    // (non-egress) traffic.
+    let mut conn = Counted::new(conn, stats.clone());
+    let _active = stats.as_ref().map(|s| s.begin_conn(&host));
+
     // Replay the bytes we already consumed, then splice both directions. For an
     // evasion egress on a TLS connection the ClientHello replay is fragmented so
     // the SNI is split across TCP segments (DPI bypass); everything else is a
     // single write.
-    match frag {
-        Some(p) if matches!(proto, Protocol::Tls) => write_split(&mut conn, &buf, &p).await?,
-        _ => conn.write_all(&buf).await?,
+    let result = async {
+        match frag {
+            Some(p) if matches!(proto, Protocol::Tls) => write_split(&mut conn, &buf, &p).await?,
+            _ => conn.write_all(&buf).await?,
+        }
+        copy_bidirectional_idle(&mut client, &mut conn, IDLE_TIMEOUT).await
     }
-    copy_bidirectional_idle(&mut client, &mut conn, IDLE_TIMEOUT).await
+    .await;
+
+    // Attribute the connection's totals to its domain even when the splice ends
+    // with an error — those bytes still crossed the tunnel.
+    if let Some(s) = &stats {
+        let (up, down) = conn.transferred();
+        s.add_domain_bytes(&host, up, down);
+    }
+    result
 }
 
 /// Splice bytes both ways between `a` and `b` until both directions close, an I/O

@@ -202,19 +202,26 @@ mod tests {
 
     #[test]
     fn heap_counter_tracks_a_real_allocation() {
-        // The exact value is shared with the whole test process, so assert on
-        // the delta staying sane around a known allocation.
-        let before = heap_live_bytes();
-        let v = vec![0u8; 1 << 20];
-        let during = heap_live_bytes();
-        assert!(
-            during >= before + (1 << 20),
-            "1 MiB allocation must be visible in the live counter"
-        );
-        drop(v);
-        assert!(
-            heap_peak_bytes() >= during,
-            "peak must cover the high-water mark"
-        );
+        // The counter is global and other tests allocate/free on it
+        // concurrently, so a single sample can see net-negative interference
+        // (someone else freeing >0 bytes inside our window). Retry: real
+        // breakage (the allocator wrapper not counting) fails every attempt.
+        for attempt in 1.. {
+            let before = heap_live_bytes();
+            let v = vec![0u8; 1 << 20];
+            let during = heap_live_bytes();
+            drop(v);
+            if during >= before + (1 << 20) {
+                assert!(
+                    heap_peak_bytes() >= during,
+                    "peak must cover the high-water mark"
+                );
+                return;
+            }
+            assert!(
+                attempt < 20,
+                "1 MiB allocation never became visible in the live counter"
+            );
+        }
     }
 }

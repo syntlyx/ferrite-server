@@ -56,7 +56,7 @@ impl InMemoryTimeseries {
             QueryStatus::Blocked => b.blocked += 1,
             QueryStatus::Cached => b.cached += 1,
             QueryStatus::Upstream => b.upstream += 1,
-            QueryStatus::Allowed => {}
+            QueryStatus::Allowed | QueryStatus::Routed => {}
         }
         if is_new {
             let cutoff = bucket_ts.saturating_sub(WINDOW_SECS);

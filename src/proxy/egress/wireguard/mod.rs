@@ -27,8 +27,8 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
@@ -97,9 +97,16 @@ const TIMER_TICK: Duration = Duration::from_millis(250);
 /// stream can't starve ctrl/timer handling.
 const UDP_DRAIN_BURST: usize = 1024;
 /// WireGuard's REJECT_AFTER_TIME: a session older than this is dead. We treat the
-/// tunnel as healthy only while the last handshake is still inside this window;
-/// boringtun keeps it fresh via rekey/keepalive as long as the peer is alive.
+/// tunnel as healthy only while the last handshake is still inside this window.
 const SESSION_MAX_AGE: Duration = Duration::from_secs(180);
+/// Proactively initiate a fresh handshake once the session is this old. WireGuard
+/// only rekeys when real data flows — keepalives keep the NAT binding alive but
+/// do NOT renew the session — so an *idle* tunnel's session would age past
+/// [`SESSION_MAX_AGE`], flip health down, and fail-closed rules would then drop
+/// the very traffic that could revive it. Renewing early keeps an idle tunnel
+/// permanently warm; the 30s margin absorbs several REKEY_TIMEOUT (5s) retries
+/// before the old session actually expires.
+const REHANDSHAKE_AFTER: Duration = Duration::from_secs(150);
 /// Keepalive (seconds) applied when the `.conf` omits `PersistentKeepalive`, so an
 /// idle always-on tunnel never silently expires. Explicit `0` (off) is respected.
 const DEFAULT_KEEPALIVE: u16 = 25;
@@ -120,6 +127,9 @@ pub struct WgEgress {
     /// Fallback resolver used only when the `.conf` configured no DNS server.
     upstream: Arc<ZoneRouter>,
     healthy: Arc<AtomicBool>,
+    /// Unix seconds of the last successful handshake (0 = never), refreshed by
+    /// the tunnel loop alongside `healthy`. Diagnostic only.
+    last_handshake: Arc<AtomicU64>,
     /// DNS servers from the `.conf`, queried *through* the tunnel.
     dns: Vec<IpAddr>,
     /// Per-egress resolution cache (host → IP), expired by DNS TTL.
@@ -254,9 +264,11 @@ impl WgEgress {
 
         let (ctrl_tx, ctrl_rx) = mpsc::channel(64);
         let healthy = Arc::new(AtomicBool::new(false));
+        let last_handshake = Arc::new(AtomicU64::new(0));
         let id = cfg.id.clone();
 
         let loop_healthy = Arc::clone(&healthy);
+        let loop_handshake = Arc::clone(&last_handshake);
         let loop_id = id.clone();
         // NB: the supervisor holds ONLY the receiver. When this WgEgress is dropped
         // (config reload / shutdown) `ctrl_tx` goes away, the receiver closes, and
@@ -268,6 +280,7 @@ impl WgEgress {
             buffers,
             ctrl_rx,
             loop_healthy,
+            loop_handshake,
         ));
 
         Ok(Self {
@@ -275,6 +288,7 @@ impl WgEgress {
             ctrl: ctrl_tx,
             upstream,
             healthy,
+            last_handshake,
             dns,
             cache: DnsCache::default(),
         })
@@ -286,6 +300,14 @@ impl WgEgress {
 
     pub fn is_healthy(&self) -> bool {
         self.healthy.load(Ordering::Relaxed)
+    }
+
+    /// Seconds since the last successful handshake, `None` before the first one.
+    pub fn handshake_age_secs(&self) -> Option<u64> {
+        match self.last_handshake.load(Ordering::Relaxed) {
+            0 => None,
+            at => Some(unix_now_secs().saturating_sub(at)),
+        }
     }
 
     /// Open a tunneled TCP connection to `host:port`. Hostnames are resolved
@@ -536,11 +558,12 @@ async fn supervise_tunnel(
     buffers: SockBuffers,
     mut ctrl_rx: mpsc::Receiver<Ctrl>,
     healthy: Arc<AtomicBool>,
+    last_handshake: Arc<AtomicU64>,
 ) {
     let mut backoff = INITIAL_BACKOFF;
     loop {
         let started = Instant::now();
-        match run_tunnel(&id, &conf, buffers, &mut ctrl_rx, &healthy).await {
+        match run_tunnel(&id, &conf, buffers, &mut ctrl_rx, &healthy, &last_handshake).await {
             RunOutcome::Shutdown => {
                 tracing::debug!("wg '{}': egress dropped, tunnel stopped", id);
                 return;
@@ -600,6 +623,7 @@ async fn run_tunnel(
     buffers: SockBuffers,
     ctrl_rx: &mut mpsc::Receiver<Ctrl>,
     healthy: &Arc<AtomicBool>,
+    last_handshake: &AtomicU64,
 ) -> RunOutcome {
     // ── UDP socket to the peer endpoint (resolved via the system resolver —
     //    bootstrap, must not depend on the tunnel). Re-resolved every run so a
@@ -766,6 +790,19 @@ async fn run_tunnel(
                     TunnResult::Err(e) => tracing::debug!("wg '{}' timer: {:?}", id, e),
                     _ => {}
                 }
+                // Keep an idle session from expiring (see REHANDSHAKE_AFTER):
+                // `force=false` makes this a no-op while an initiation is already
+                // in flight, so ticking every 250ms cannot spam the peer.
+                if matches!(tunn.time_since_last_handshake(), Some(age) if age >= REHANDSHAKE_AFTER) {
+                    match tunn.format_handshake_initiation(&mut crypt, false) {
+                        TunnResult::WriteToNetwork(p) => {
+                            tracing::debug!("wg '{}': proactive re-handshake (idle session renewal)", id);
+                            let _ = udp.send(p).await;
+                        }
+                        TunnResult::Err(e) => tracing::debug!("wg '{}' re-handshake: {:?}", id, e),
+                        _ => {}
+                    }
+                }
                 timer.as_mut().reset(tokio::time::Instant::now() + TIMER_TICK);
             }
 
@@ -781,7 +818,7 @@ async fn run_tunnel(
         // Health tracks the live handshake, not data flow: it must be true the
         // moment the session is up so the proxy's fail-closed gate lets the FIRST
         // connection through (otherwise no data ever flows and it never recovers).
-        refresh_health(&tunn, healthy);
+        refresh_health(&tunn, healthy, last_handshake);
 
         // Restart a tunnel whose handshake has been down too long, so the
         // supervisor re-resolves the endpoint (DDNS / network-came-up-late). A
@@ -797,10 +834,25 @@ async fn run_tunnel(
 }
 
 /// Set `healthy` from boringtun's session state: up while the last successful
-/// handshake is still within [`SESSION_MAX_AGE`], down otherwise.
-fn refresh_health(tunn: &Tunn, healthy: &AtomicBool) {
-    let up = matches!(tunn.time_since_last_handshake(), Some(age) if age < SESSION_MAX_AGE);
+/// handshake is still within [`SESSION_MAX_AGE`], down otherwise. Also records
+/// when that handshake happened (unix seconds) for the stats API.
+fn refresh_health(tunn: &Tunn, healthy: &AtomicBool, last_handshake: &AtomicU64) {
+    let since = tunn.time_since_last_handshake();
+    let up = matches!(since, Some(age) if age < SESSION_MAX_AGE);
     healthy.store(up, Ordering::Relaxed);
+    if let Some(age) = since {
+        last_handshake.store(
+            unix_now_secs().saturating_sub(age.as_secs()),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Allocate a virtual TCP socket, start connecting, and spawn its bridge task. The
@@ -1294,6 +1346,66 @@ mod smoke {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The proactive renewal must fire comfortably before the session expires:
+    /// the margin absorbs several REKEY_TIMEOUT (5s) handshake retries.
+    #[test]
+    fn rehandshake_fires_well_before_session_expiry() {
+        assert!(REHANDSHAKE_AFTER + Duration::from_secs(20) <= SESSION_MAX_AGE);
+    }
+
+    /// Regression for "tunnels flap when idle": keepalives keep the NAT open but
+    /// don't renew the WireGuard session, so without the proactive re-handshake
+    /// in the timer branch an idle tunnel's handshake age crosses
+    /// [`SESSION_MAX_AGE`] and health flips down (fail-closed rules then drop
+    /// the very traffic that would revive it). This idles well past that age,
+    /// asserting health never dips, then proves the data path is still live.
+    /// Takes ~4 minutes of wall clock — run explicitly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs network + WG_SMOKE_CONF; idles ~4 minutes"]
+    async fn idle_tunnel_stays_healthy_past_session_age() {
+        let path =
+            std::env::var("WG_SMOKE_CONF").expect("set WG_SMOKE_CONF=/path/to/wireguard.conf");
+        let text = std::fs::read_to_string(&path).expect("read conf file");
+        let eg = WgEgress::from_config(&egress(text), upstream()).expect("bring up egress");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !eg.is_healthy() {
+            assert!(
+                Instant::now() < deadline,
+                "handshake did not complete within 15s"
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
+        let started = Instant::now();
+        let idle_for = SESSION_MAX_AGE + Duration::from_secs(45);
+        println!("[smoke] handshake up — idling for {idle_for:?} (no traffic)…");
+
+        while started.elapsed() < idle_for {
+            assert!(
+                eg.is_healthy(),
+                "tunnel went unhealthy after {:?} idle — proactive re-handshake failed",
+                started.elapsed()
+            );
+            sleep(Duration::from_secs(2)).await;
+        }
+        println!(
+            "[smoke] ✅ stayed healthy for {:?} (past SESSION_MAX_AGE {SESSION_MAX_AGE:?})",
+            started.elapsed()
+        );
+
+        // And the session is genuinely usable, not just reported healthy.
+        let mut s = timeout(
+            WG_CONNECT_TIMEOUT + Duration::from_secs(5),
+            eg.connect("1.1.1.1", 53),
+        )
+        .await
+        .expect("tunnel connect timed out")
+        .expect("tunnel connect failed");
+        let ips = dns_over_tcp(&mut s, "cloudflare.com.").await;
+        assert!(!ips.is_empty(), "no A records after the idle stretch");
+        println!("[smoke] ✅ data path live after idle: cloudflare.com -> {ips:?}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

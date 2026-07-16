@@ -234,6 +234,12 @@ async fn run() -> anyhow::Result<()> {
     // of taking down DNS/API. No-op when proxy is disabled.
     tokio::spawn(proxy::run(state.clone()));
 
+    // ── Egress-down alert watcher ─────────────────────────────────────────────
+    // Turns sustained egress outages into WARN logs + optional webhook events,
+    // and feeds down_since/alerting to /api/proxy/stats. Reads live config each
+    // tick, so it needs no restart on proxy changes.
+    tokio::spawn(proxy::watch(state.clone()));
+
     // ── CPU sampling ────────────────────────────────────────────────────────
     let sampler = state.cpu_sampler.clone();
     tokio::spawn(async move {

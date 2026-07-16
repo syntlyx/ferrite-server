@@ -7,12 +7,16 @@
 //! connection through the chosen [`Egress`] — without terminating TLS, so the
 //! client validates the real server's certificate end-to-end.
 
+mod alerts;
 mod egress;
 mod health;
 pub(crate) mod http_host;
 mod intercept;
 mod rules;
 mod sni;
+mod stats;
+
+pub use alerts::watch;
 
 pub(crate) use intercept::forward_http;
 pub use intercept::run;
@@ -20,6 +24,7 @@ pub use intercept::run;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
+use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -39,6 +44,7 @@ pub(crate) use egress::usable_rcvbuf_bytes;
 pub use egress::{Egress, EgressConn};
 use health::Breaker;
 use rules::CompiledRule;
+pub use stats::ProxyStats;
 
 /// TTL for synthesized routing answers. Short so disabling a rule recovers
 /// within a minute instead of being pinned by downstream caches.
@@ -62,6 +68,26 @@ pub struct ProxyState {
     /// (`intercept::run`) wakes, tears down the old listeners, and rebinds.
     listener_reload: Arc<Notify>,
     upstream: Arc<ZoneRouter>,
+    /// Traffic counters, keyed by egress id / rule so they survive snapshot
+    /// reloads (see [`stats::ProxyStats`]).
+    stats: ProxyStats,
+    /// Egresses currently observed unhealthy by the alert watcher, with when
+    /// each went down and whether its down alert already fired.
+    down: DashMap<String, DownState>,
+}
+
+/// Per-egress downtime bookkeeping for the alert watcher.
+struct DownState {
+    since: Instant,
+    alerted: bool,
+}
+
+/// A health transition worth reporting (see [`ProxyState::note_health`]).
+pub enum AlertEvent {
+    /// Unhealthy past the grace period — fired once per outage.
+    Down { down_for: std::time::Duration },
+    /// Healthy again after an alerted outage.
+    Up { down_for: std::time::Duration },
 }
 
 /// Listener-affecting settings, swapped live. The supervisor reads a fresh copy
@@ -126,6 +152,8 @@ impl ProxyState {
             listeners: ArcSwap::from_pointee(ListenerCfg::from(cfg)),
             listener_reload: Arc::new(Notify::new()),
             upstream,
+            stats: ProxyStats::default(),
+            down: DashMap::new(),
         })
     }
 
@@ -149,6 +177,53 @@ impl ProxyState {
         if changed {
             self.listener_reload.notify_one();
         }
+        self.stats.prune(cfg);
+    }
+
+    /// Live traffic counters (per-egress bytes/connections, rule hits).
+    pub fn stats(&self) -> &ProxyStats {
+        &self.stats
+    }
+
+    /// Feed one health sample for `id` into the downtime state machine and
+    /// return the transition to report, if any. `now` is injected so the grace
+    /// logic is unit-testable. Called only by the alert watcher (one sequential
+    /// task), so per-id samples never race each other.
+    fn note_health(&self, id: &str, healthy: bool, now: Instant) -> Option<AlertEvent> {
+        if healthy {
+            let (_, d) = self.down.remove(id)?;
+            return d.alerted.then_some(AlertEvent::Up {
+                down_for: now.duration_since(d.since),
+            });
+        }
+        let mut d = self.down.entry(id.to_string()).or_insert(DownState {
+            since: now,
+            alerted: false,
+        });
+        let down_for = now.duration_since(d.since);
+        if !d.alerted && down_for >= alerts::ALERT_GRACE {
+            d.alerted = true;
+            return Some(AlertEvent::Down { down_for });
+        }
+        None
+    }
+
+    /// Downtime info for the stats API: `(seconds down so far, past the alert
+    /// grace)`, or `None` while healthy.
+    pub fn down_info(&self, id: &str) -> Option<(u64, bool)> {
+        self.down
+            .get(id)
+            .map(|d| (d.since.elapsed().as_secs(), d.alerted))
+    }
+
+    /// Forget all downtime state (proxy disabled — tunnels are idle on purpose).
+    fn clear_health_watch(&self) {
+        self.down.clear();
+    }
+
+    /// Drop downtime state for egresses removed from the config.
+    fn retain_health_watch(&self, keep: impl Fn(&str) -> bool) {
+        self.down.retain(|id, _| keep(id));
     }
 
     /// Handle the supervisor waits on; pinged by [`Self::reload`] when listener
@@ -428,6 +503,7 @@ mod tests {
             advertise_ipv4: Some(Ipv4Addr::new(192, 168, 1, 5)),
             advertise_ipv6: None,
             max_connections: 16,
+            alert_webhook: None,
             egresses: vec![EgressConfig {
                 id: "t".to_string(),
                 name: "t".to_string(),
@@ -521,6 +597,7 @@ mod tests {
             advertise_ipv4: Some(Ipv4Addr::new(192, 168, 1, 5)),
             advertise_ipv6: None,
             max_connections: 16,
+            alert_webhook: None,
             egresses,
             rules,
         };
@@ -583,6 +660,55 @@ mod tests {
             !Arc::ptr_eq(&after_rule_change, &after_egress_change),
             "a changed egress config should be rebuilt, not reused"
         );
+    }
+
+    #[test]
+    fn health_transitions_fire_alerts_only_past_grace() {
+        let proxy = state(true);
+        let t0 = Instant::now();
+
+        // Healthy from the start: no state, no event.
+        assert!(proxy.note_health("t", true, t0).is_none());
+        assert!(proxy.down_info("t").is_none());
+
+        // Goes down: tracked immediately, but no alert inside the grace window.
+        assert!(proxy.note_health("t", false, t0).is_none());
+        assert!(proxy.down_info("t").is_some());
+        assert!(
+            proxy
+                .note_health("t", false, t0 + alerts::ALERT_GRACE / 2)
+                .is_none()
+        );
+
+        // A short blip that recovers before the grace: silent removal.
+        assert!(
+            proxy
+                .note_health("t", true, t0 + alerts::ALERT_GRACE / 2)
+                .is_none()
+        );
+        assert!(proxy.down_info("t").is_none());
+
+        // Down past the grace: exactly one Down event, then silence.
+        assert!(proxy.note_health("t", false, t0).is_none());
+        let ev = proxy.note_health("t", false, t0 + alerts::ALERT_GRACE);
+        assert!(
+            matches!(ev, Some(AlertEvent::Down { down_for }) if down_for >= alerts::ALERT_GRACE)
+        );
+        assert!(
+            proxy
+                .note_health("t", false, t0 + alerts::ALERT_GRACE * 2)
+                .is_none(),
+            "a down alert must fire once per outage"
+        );
+        let (_, alerted) = proxy.down_info("t").unwrap();
+        assert!(alerted, "stats API must see the alerting flag");
+
+        // Recovery after an alerted outage: one Up event with the total downtime.
+        let ev = proxy.note_health("t", true, t0 + alerts::ALERT_GRACE * 3);
+        assert!(
+            matches!(ev, Some(AlertEvent::Up { down_for }) if down_for == alerts::ALERT_GRACE * 3)
+        );
+        assert!(proxy.down_info("t").is_none());
     }
 
     #[test]

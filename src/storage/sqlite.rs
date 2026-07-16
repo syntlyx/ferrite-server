@@ -280,6 +280,7 @@ impl Storage for SqliteStorage {
                         "blocked" => QueryStatus::Blocked,
                         "cached" => QueryStatus::Cached,
                         "allowed" => QueryStatus::Allowed,
+                        "routed" => QueryStatus::Routed,
                         _ => QueryStatus::Upstream,
                     };
                     let device = device.unwrap_or_else(|| client_ip.clone());
@@ -821,7 +822,7 @@ fn collect_rollup_aggregates(
         QueryStatus::Blocked => query_agg.blocked += 1,
         QueryStatus::Cached => query_agg.cached += 1,
         QueryStatus::Upstream => query_agg.upstream += 1,
-        QueryStatus::Allowed => {}
+        QueryStatus::Allowed | QueryStatus::Routed => {}
     }
 
     let domain_agg = domain_buckets

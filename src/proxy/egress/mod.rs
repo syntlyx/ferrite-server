@@ -188,6 +188,15 @@ impl Egress {
         }
     }
 
+    /// Seconds since the WireGuard handshake (stats/diagnostics); `None` for
+    /// other kinds and for a tunnel that has never completed one.
+    pub fn handshake_age_secs(&self) -> Option<u64> {
+        match self {
+            Self::Wireguard(w) => w.handshake_age_secs(),
+            _ => None,
+        }
+    }
+
     pub async fn connect(
         &self,
         host: &str,

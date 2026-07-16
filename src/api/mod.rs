@@ -6,6 +6,7 @@ pub mod error;
 mod ingress;
 pub mod lists;
 pub mod logs;
+pub mod metrics;
 pub mod middleware;
 pub mod proxy;
 pub mod queries;
@@ -85,8 +86,13 @@ pub fn build_router(state: AppState) -> Router {
         // Selective routing / proxy
         .route("/proxy", get(proxy::get_proxy))
         .route("/proxy", put(proxy::put_proxy))
+        .route("/proxy/stats", get(proxy::get_proxy_stats))
         // Live server logs (in-memory ring)
         .route("/logs", get(logs::get_logs))
+        // Prometheus exposition (scrape with metrics_path: /api/metrics; when an
+        // API key is set, authenticate via bearer_token — same middleware as the
+        // rest of the API)
+        .route("/metrics", get(metrics::get_metrics))
         // Diagnostic tools (DNS lookup, WHOIS, egress/cert/reachability probes)
         .route("/tools/resolve", get(tools::resolve))
         .route("/tools/whois", get(tools::whois))

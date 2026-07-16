@@ -136,7 +136,7 @@ pub async fn handle_query(
                     &name,
                     qtype,
                     &client_ip,
-                    QueryStatus::Allowed,
+                    QueryStatus::Routed,
                     elapsed,
                     Some(format!("proxy:{}", intercept.egress_id)),
                     0,
@@ -993,6 +993,65 @@ mod tests {
         assert_eq!(entry.status, QueryStatus::Blocked);
         assert_eq!(entry.rcode, 3);
         assert_eq!(state.inner.live_stats.blocked(), 1);
+
+        drop(rx);
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
+    }
+
+    #[tokio::test]
+    async fn routed_domain_is_logged_with_routed_status_and_egress() {
+        use crate::config::{EgressConfig, ProxyConfig, RuleConfig};
+
+        let (state, db_path) = test_support::app_state("dns-routed").await;
+        let mut proxy_cfg = ProxyConfig {
+            enabled: true,
+            advertise_ipv4: Some(Ipv4Addr::new(192, 0, 2, 77)),
+            egresses: vec![EgressConfig {
+                id: "t".to_string(),
+                name: "t".to_string(),
+                enabled: true,
+                kind: "direct".to_string(),
+                address: None,
+                port: None,
+                username: None,
+                password: None,
+                config: None,
+                seg_position: None,
+                buffer_kb: None,
+                tx_buffer_kb: None,
+            }],
+            rules: vec![RuleConfig {
+                pattern: "routed.test".to_string(),
+                egress: "t".to_string(),
+                fail_closed: true,
+                clients: Vec::new(),
+            }],
+            ..ProxyConfig::default()
+        };
+        proxy_cfg.normalize();
+        state.inner.proxy.reload(&proxy_cfg);
+        let mut rx = state.query_rx.lock().take().unwrap();
+
+        let response = handle_query(
+            query("routed.test", RecordType::A).to_bytes().unwrap(),
+            SocketAddr::from(([192, 0, 2, 10], 53_000)),
+            Arc::clone(&state.inner),
+            state.query_tx.clone(),
+        )
+        .await
+        .unwrap();
+        let msg = Message::from_bytes(&response).unwrap();
+        let entry = rx.try_recv().unwrap();
+
+        // The synthetic answer points at the advertise IP…
+        assert!(matches!(
+            msg.answers[0].data,
+            RData::A(A(ip)) if ip == Ipv4Addr::new(192, 0, 2, 77)
+        ));
+        // …and the log entry carries the routed status + which egress will serve it.
+        assert_eq!(entry.status, QueryStatus::Routed);
+        assert_eq!(entry.upstream.as_deref(), Some("proxy:t"));
 
         drop(rx);
         drop(state);

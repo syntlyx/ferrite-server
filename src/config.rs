@@ -271,6 +271,11 @@ pub struct ProxyConfig {
     pub advertise_ipv6: Option<Ipv6Addr>,
     /// Hard cap on simultaneous proxied connections (bounds memory).
     pub max_connections: usize,
+    /// Optional URL POSTed a JSON event when an egress stays down past the
+    /// alert grace period (and again on recovery). Plain webhook — works with
+    /// ntfy, a Slack/Telegram shim, or anything that accepts a JSON POST.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alert_webhook: Option<String>,
     pub egresses: Vec<EgressConfig>,
     pub rules: Vec<RuleConfig>,
 }
@@ -284,6 +289,7 @@ impl Default for ProxyConfig {
             advertise_ipv4: None,
             advertise_ipv6: None,
             max_connections: default_max_connections(),
+            alert_webhook: None,
             egresses: Vec::new(),
             rules: Vec::new(),
         }
@@ -356,6 +362,13 @@ pub struct RuleConfig {
 
 impl ProxyConfig {
     pub fn normalize(&mut self) {
+        // An all-whitespace webhook means "no webhook".
+        self.alert_webhook = self
+            .alert_webhook
+            .take()
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty());
+
         // Normalize egress ids/names; drop empties and duplicate ids (last wins).
         let mut seen: HashSet<String> = HashSet::new();
         let mut kept: Vec<EgressConfig> = Vec::with_capacity(self.egresses.len());
