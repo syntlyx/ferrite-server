@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use fst::Map;
 
-use crate::blocklist::{AdblockStats, loader};
+use crate::blocklist::{AdblockStats, ListPolarity, loader};
 
 /// Per-list domain cache is considered fresh for 12 hours.
 pub(super) const LIST_CACHE_TTL: Duration = Duration::from_secs(12 * 3600);
@@ -37,6 +37,7 @@ pub(super) async fn load_or_build_list_fst(
     domains_cache: PathBuf,
     stats_cache: PathBuf,
     force: bool,
+    polarity: ListPolarity,
 ) -> (String, ListFst, usize, Option<AdblockStats>) {
     // Fast path: fresh per-list FST on disk. The parse stats can't be recovered
     // from the binary FST, so they ride along in a sidecar written at parse time.
@@ -51,7 +52,8 @@ pub(super) async fn load_or_build_list_fst(
     }
 
     // Slow path: load/fetch domain text, then build FST.
-    let (domains, stats) = fetch_domains(&name, &url, &domains_cache, &stats_cache, force).await;
+    let (domains, stats) =
+        fetch_domains(&name, &url, &domains_cache, &stats_cache, force, polarity).await;
 
     if domains.is_empty() {
         if let Ok(map) = loader::mmap_fst(&fst_cache) {
@@ -106,6 +108,7 @@ async fn fetch_domains(
     domains_cache: &Path,
     stats_cache: &Path,
     force: bool,
+    polarity: ListPolarity,
 ) -> (Vec<String>, Option<AdblockStats>) {
     if !force && let Some(domains) = load_fresh_text_cache(domains_cache).await {
         let stats = load_stats_cache(stats_cache).await;
@@ -117,7 +120,7 @@ async fn fetch_domains(
         return (domains, stats);
     }
 
-    match loader::load_list(url).await {
+    match loader::load_list(url, polarity).await {
         Ok((domains, stats)) => {
             tracing::info!("list '{}': fetched {} domains", name, domains.len());
             save_text_cache(domains_cache, &domains).await;

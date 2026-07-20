@@ -5,6 +5,7 @@ use fst::map::OpBuilder;
 use fst::{Map, MapBuilder, Streamer};
 use reqwest::{Client, Url};
 
+use crate::blocklist::ListPolarity;
 use crate::blocklist::parser::{self, AdblockStats};
 use crate::error::{FeriteError, Result};
 
@@ -141,24 +142,28 @@ static HTTP_CLIENT: std::sync::LazyLock<Client> = std::sync::LazyLock::new(|| {
         .expect("failed to build HTTP client")
 });
 
-/// Fetch a blocklist from `url` and return parsed domain names.
+/// Fetch a subscription list from `url` and return parsed domain names.
 ///
 /// Supports:
 /// - `file:///path` — read from local filesystem
 /// - `http://` / `https://` — HTTP GET
 ///
-/// Format is auto-detected from content (hosts vs. Adblock).
-pub async fn load_list(url: &str) -> Result<(Vec<String>, Option<AdblockStats>)> {
+/// Format is auto-detected from content (hosts vs. Adblock); `polarity` decides
+/// how Adblock-format content is read (block rules vs `@@` exception rules).
+pub async fn load_list(
+    url: &str,
+    polarity: ListPolarity,
+) -> Result<(Vec<String>, Option<AdblockStats>)> {
     let content = if let Some(path) = url.strip_prefix("file://") {
-        tracing::info!("reading blocklist from file {}", path);
+        tracing::info!("reading list from file {}", path);
         tokio::fs::read_to_string(path).await?
     } else {
-        tracing::info!("fetching blocklist from {}", url);
+        tracing::info!("fetching list from {}", url);
         let resp = HTTP_CLIENT.get(url).send().await?.error_for_status()?;
         resp.text().await?
     };
 
-    let (domains, stats) = parse_content(&content);
+    let (domains, stats) = parse_content(&content, polarity);
     tracing::info!("parsed {} domains from {}", domains.len(), url);
     Ok((domains, stats))
 }
@@ -175,7 +180,14 @@ pub async fn load_list(url: &str) -> Result<(Vec<String>, Option<AdblockStats>)>
 ///   - Adblock filter syntax (`||`, `@@`, `##`, `$…`, …) → adblock
 ///   - `0.0.0.0` / `127.0.0.1` / `::1`                    → hosts format
 ///   - Anything else                                      → plain domain list
-pub fn parse_content(content: &str) -> (Vec<String>, Option<AdblockStats>) {
+pub fn parse_content(content: &str, polarity: ListPolarity) -> (Vec<String>, Option<AdblockStats>) {
+    // Hosts and plain formats read the same under either polarity; only the
+    // Adblock parse differs (block rules vs `@@` exception rules).
+    let parse_adblock = |content: &str| match polarity {
+        ListPolarity::Block => parser::parse_adblock(content),
+        ListPolarity::Allow => parser::parse_adblock_exceptions(content),
+    };
+
     for line in content.lines() {
         let line = line.trim();
 
@@ -187,7 +199,7 @@ pub fn parse_content(content: &str) -> (Vec<String>, Option<AdblockStats>) {
         // EasyList file opens with e.g. `[Adblock Plus 2.0]`. Detect it before
         // the comment skip so the format is never mistaken for plain text.
         if line.starts_with("[Adblock") {
-            let (domains, stats) = parser::parse_adblock(content);
+            let (domains, stats) = parse_adblock(content);
             return (domains, Some(stats));
         }
 
@@ -204,7 +216,7 @@ pub fn parse_content(content: &str) -> (Vec<String>, Option<AdblockStats>) {
             return (parser::parse_hosts(content), None);
         }
         if parser::is_adblock_syntax(line) {
-            let (domains, stats) = parser::parse_adblock(content);
+            let (domains, stats) = parse_adblock(content);
             return (domains, Some(stats));
         }
         return (parser::parse_plain(content), None);
@@ -425,7 +437,7 @@ mod tests {
 ||doubleclick.net^\n\
 google.com##.GGQPGYLCD5\n\
 www.google.com##.GISRH3UDHB\n";
-        let (domains, stats) = parse_content(content);
+        let (domains, stats) = parse_content(content, ListPolarity::Block);
         assert!(stats.is_some(), "adblock list must report parse stats");
         assert!(
             domains.contains(&"doubleclick.net".to_string()),
@@ -443,7 +455,7 @@ www.google.com##.GISRH3UDHB\n";
         // Same defense without the `[Adblock]` header: the first data line uses
         // option syntax (`$third-party`), which is enough to route to adblock.
         let content = "&rb=&uuid=$third-party\n||tracker.example^\ngoogle.com##.cls\n";
-        let (domains, _) = parse_content(content);
+        let (domains, _) = parse_content(content, ListPolarity::Block);
         assert!(domains.contains(&"tracker.example".to_string()));
         assert!(!domains.contains(&"google.com".to_string()));
     }
@@ -453,10 +465,27 @@ www.google.com##.GISRH3UDHB\n";
         // Regression: a `$` in a hosts comment must not route the file to the
         // adblock parser (which would find no `||` rules and load nothing).
         let content = "0.0.0.0 casino.example # costs $$$\n0.0.0.0 ads.example\n";
-        let (domains, stats) = parse_content(content);
+        let (domains, stats) = parse_content(content, ListPolarity::Block);
         assert!(stats.is_none(), "hosts list has no adblock parse stats");
         assert!(domains.contains(&"casino.example".to_string()));
         assert!(domains.contains(&"ads.example".to_string()));
+    }
+
+    #[test]
+    fn allow_polarity_reads_adblock_exceptions_and_plain_lists() {
+        // Adblock format under Allow polarity: the `@@` exceptions are the
+        // entries, `||` block rules are not.
+        let adblock = "[Adblock Plus 2.0]\n||ads.example^\n@@||good.example^\n";
+        let (domains, stats) = parse_content(adblock, ListPolarity::Allow);
+        assert_eq!(domains, vec!["good.example".to_string()]);
+        assert!(stats.is_some());
+
+        // Plain and hosts formats parse identically under either polarity.
+        let plain = "safe.example\ncdn.example # comment\n";
+        let (allow, _) = parse_content(plain, ListPolarity::Allow);
+        let (block, _) = parse_content(plain, ListPolarity::Block);
+        assert_eq!(allow, block);
+        assert_eq!(allow, vec!["safe.example", "cdn.example"]);
     }
 
     #[test]

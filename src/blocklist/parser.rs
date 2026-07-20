@@ -244,6 +244,84 @@ pub fn parse_adblock(content: &str) -> (Vec<String>, AdblockStats) {
     (domains, stats)
 }
 
+/// Parse an Adblock-style filter list with allowlist polarity: the `@@||domain^`
+/// exception rules ARE the entries (that's what a subscribed allowlist is for —
+/// exempting domains from other lists' blocks). Handling:
+///   `@@||good.example.com^`           → allow domain
+///   `@@||good.example.com^$important` → allow domain (non-scoping modifiers ignored)
+///   `@@||x.com^$domain=site.com`      → SKIPPED: only meant to apply on
+///                                       `site.com`; a global DNS allow would
+///                                       over-allow (mirrors the `$domain=`
+///                                       guard on block rules)
+///   `||ads.example.com^`              → ignored: a block rule can't populate
+///                                       an allowlist (counted unsupported)
+///   cosmetic / regex / etc.           → ignored, counted as with blocklists
+///
+/// Stats reuse [`AdblockStats`] with allow semantics: `kept` = allow entries
+/// emitted, `exceptions` = `@@` rules seen, `unblocked_by_exception` = 0.
+pub fn parse_adblock_exceptions(content: &str) -> (Vec<String>, AdblockStats) {
+    let mut domains = Vec::new();
+    let mut exception_rules = 0usize;
+    let mut scoped_skipped = 0usize;
+    let mut cosmetic_skipped = 0usize;
+    let mut unsupported_skipped = 0usize;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('!') || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("@@||") {
+            exception_rules += 1;
+            let (pattern, options) = match rest.split_once('$') {
+                Some((p, o)) => (p, Some(o)),
+                None => (rest, None),
+            };
+            if let Some(opts) = options
+                && opts.split(',').any(|o| o.trim().starts_with("domain="))
+            {
+                scoped_skipped += 1;
+                continue;
+            }
+            match adblock_rule_domain(pattern) {
+                Some(domain) => domains.push(domain),
+                None => unsupported_skipped += 1, // wildcard/path/invalid host
+            }
+            continue;
+        }
+
+        // Everything else can't produce an allow entry; keep the same
+        // diagnostic buckets as the block parse so the UI stays explainable.
+        if is_adblock_syntax(line) {
+            if line.contains("##") || line.contains("#?#") || line.contains("#@#") {
+                cosmetic_skipped += 1;
+            } else {
+                unsupported_skipped += 1;
+            }
+        }
+    }
+
+    let stats = AdblockStats {
+        kept: domains.len(),
+        exceptions: exception_rules,
+        unblocked_by_exception: 0,
+        scoped_skipped,
+        cosmetic_skipped,
+        unsupported_skipped,
+    };
+
+    tracing::debug!(
+        kept = stats.kept,
+        exceptions = stats.exceptions,
+        scoped_skipped = stats.scoped_skipped,
+        cosmetic_skipped = stats.cosmetic_skipped,
+        unsupported_skipped = stats.unsupported_skipped,
+        "parsed adblock list as allowlist"
+    );
+    (domains, stats)
+}
+
 /// Extract a validated, lowercased domain from the body of a `||…`/`@@||…`
 /// rule (the part after the `||`, with `$`-options already stripped). Returns
 /// `None` if the body is not a plain blockable domain (wildcards, paths, etc.).
@@ -374,6 +452,46 @@ ads.example.com  # a real plain entry\n";
         assert!(!domains.contains(&"doubleclick.net".to_string()));
         // A genuine plain line with a trailing comment still parses.
         assert!(domains.contains(&"ads.example.com".to_string()));
+    }
+
+    #[test]
+    fn parse_adblock_exceptions_harvests_exception_rules() {
+        // Allowlist polarity: `@@||domain^` rules ARE the entries; block rules,
+        // cosmetic rules, and referrer-scoped exceptions must not leak through.
+        let content = "\
+! comment\n\
+||ads.example.com^\n\
+@@||good.example.com^\n\
+@@||cdn.example.com^$important\n\
+@@||scoped.example.com^$domain=onlyhere.com\n\
+google.com##.cosmetic\n";
+        let (domains, stats) = parse_adblock_exceptions(content);
+        assert_eq!(
+            domains,
+            vec![
+                "good.example.com".to_string(),
+                "cdn.example.com".to_string()
+            ]
+        );
+        assert!(
+            !domains.contains(&"ads.example.com".to_string()),
+            "a block rule must not become an allow entry"
+        );
+        assert_eq!(stats.kept, 2);
+        assert_eq!(stats.exceptions, 3);
+        assert_eq!(stats.scoped_skipped, 1);
+        assert_eq!(stats.cosmetic_skipped, 1);
+        assert_eq!(stats.unsupported_skipped, 1); // the `||ads…^` block rule
+    }
+
+    #[test]
+    fn parse_adblock_exceptions_skips_path_scoped_rules() {
+        // `@@||google.com/recaptcha^` exempts a path, not the host — a DNS
+        // allowlist can only exempt whole domains, so it must be skipped.
+        let content = "@@||google.com/recaptcha/^\n@@||accounts.google.com^\n";
+        let (domains, stats) = parse_adblock_exceptions(content);
+        assert_eq!(domains, vec!["accounts.google.com".to_string()]);
+        assert_eq!(stats.unsupported_skipped, 1);
     }
 
     #[test]

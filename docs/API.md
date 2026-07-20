@@ -556,6 +556,45 @@ GET /api/blocklist/check/ads.example.com
 { "domain": "ads.example.com", "blocked": true, "whitelisted": false }
 ```
 
+When the exemption comes from a subscribed allowlist, `whitelist_match` names it:
+
+```json
+{
+  "domain": "cdn.example.com",
+  "blocked": false,
+  "whitelisted": true,
+  "whitelist_match": { "entry": "cdn.example.com", "matched": "cdn.example.com", "list": "anudeepND Whitelist" }
+}
+```
+
+### `GET /api/blocklist/profiles` · `PUT /api/blocklist/profiles` — per-device profiles
+
+A profile applies a subset of the subscriptions to specific clients (IP/MAC);
+devices matching no profile use all enabled lists. `PUT` replaces the whole set
+(mirrors `/api/proxy`) and applies hot — profiles recompile from the on-disk
+per-list caches, no network fetch. Unknown list/allowlist names → `400`.
+
+```json
+GET → {
+  "profiles": [
+    {
+      "id": "iot", "name": "IoT Devices",
+      "lists": [],                            // blocklist subset; empty = none
+      "allowlists": ["anudeepND Whitelist"],  // allowlist subset; empty = ALL enabled
+      "clients": ["aa:bb:cc:dd:ee:ff"],
+      "block": [], "allow": ["ntp.example.com"],
+      "default_deny": true                    // block everything not explicitly allowed
+    }
+  ],
+  "available_lists": ["StevenBlack"],
+  "available_allowlists": ["anudeepND Whitelist"]
+}
+```
+
+Under `default_deny`, local-infrastructure names (reverse `*.arpa`, bare
+hostnames, `.lan`/`.local`/`.home`/`.internal`/`.localdomain`, and configured
+`[[zones]]` suffixes) keep resolving without any configuration.
+
 ---
 
 ## Subscription Lists
@@ -672,6 +711,26 @@ POST /api/lists/StevenBlack/refresh
 
 ---
 
+## Allowlist Subscriptions
+
+Remote **allowlists** — domains on them are never blocked. Same mechanics as the
+blocklist subscriptions above (12 h disk cache, format auto-detection, SSRF-guarded
+URLs), opposite polarity: for Adblock-format lists the `@@||domain^` exception
+rules are the allow entries. Endpoints mirror `/api/lists` one-to-one:
+
+```
+GET    /api/allowlists                    list subscriptions (+ domains_loaded)
+POST   /api/allowlists                    add {name, url, enabled?} and refresh
+PATCH  /api/allowlists/:name              {"enabled": bool}
+DELETE /api/allowlists/:name              remove and rebuild
+POST   /api/allowlists/refresh            force re-fetch (rebuilds block + allow sets)
+POST   /api/allowlists/:name/refresh      force re-fetch a single list
+```
+
+Request/response shapes match the `/api/lists` endpoints exactly.
+
+---
+
 ## Custom DNS Records
 
 Local A / AAAA / CNAME overrides. Take priority over blocklist and upstream. Wildcards (`*.home.lan`) are supported. Persisted to SQLite.
@@ -768,8 +827,12 @@ Returns the full parsed config. Non-empty `api_key` and `password_hash` values a
     "decision_cache_size": 50000,
     "lists": [],
     "wildcard_block": [],
-    "whitelist": [],
-    "client_bypass": ["192.168.1.50", "aa:bb:cc:dd:ee:ff"]
+    "client_bypass": ["192.168.1.50", "aa:bb:cc:dd:ee:ff"],
+    "profiles": []
+  },
+  "allowlist": {
+    "domains": [],
+    "lists": []
   },
   "custom_records": []
 }

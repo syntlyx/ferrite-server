@@ -16,8 +16,8 @@ use crate::app::AppState;
 use crate::config::BlocklistProfileConfig;
 use crate::error::FeriteError;
 
-/// GET /api/blocklist/profiles — the configured profiles plus the list names
-/// available to build them from (so the UI can offer checkboxes).
+/// GET /api/blocklist/profiles — the configured profiles plus the blocklist and
+/// allowlist names available to build them from (so the UI can offer checkboxes).
 pub async fn get_profiles(State(state): State<AppState>) -> Json<Value> {
     let profiles = state.inner.blocklist.get_profiles();
     let available_lists: Vec<String> = state
@@ -27,9 +27,17 @@ pub async fn get_profiles(State(state): State<AppState>) -> Json<Value> {
         .into_iter()
         .map(|l| l.name)
         .collect();
+    let available_allowlists: Vec<String> = state
+        .inner
+        .blocklist
+        .get_allow_lists()
+        .into_iter()
+        .map(|l| l.name)
+        .collect();
     Json(json!({
         "profiles": profiles,
         "available_lists": available_lists,
+        "available_allowlists": available_allowlists,
     }))
 }
 
@@ -45,12 +53,32 @@ pub async fn put_profiles(
         .into_iter()
         .map(|l| l.name)
         .collect();
-    let profiles = validate(profiles, &known)?;
+    let known_allow: HashSet<String> = state
+        .inner
+        .blocklist
+        .get_allow_lists()
+        .into_iter()
+        .map(|l| l.name)
+        .collect();
+    let profiles = validate(profiles, &known, &known_allow)?;
 
-    // Apply live (recompiles FSTs from the on-disk per-list caches), then persist.
-    state.inner.blocklist.set_profiles(profiles.clone());
+    // Apply live (recompiles FSTs from the on-disk per-list caches), then
+    // persist. The recompile merges potentially multi-million-domain FSTs, so
+    // it runs on the blocking pool — inline it would stall a runtime worker
+    // (and every DNS query scheduled there) for seconds.
+    {
+        let blocklist = std::sync::Arc::clone(&state.inner.blocklist);
+        let applied = profiles.clone();
+        tokio::task::spawn_blocking(move || blocklist.set_profiles(applied))
+            .await
+            .map_err(|e| {
+                ApiError(FeriteError::Internal(format!(
+                    "profile rebuild task failed: {e}"
+                )))
+            })?;
+    }
     state.live_config.write().blocklist.profiles = profiles;
-    let saved_to = persist(&state);
+    let saved_to = persist(&state).await;
 
     Ok(Json(json!({
         "status": "ok",
@@ -61,10 +89,12 @@ pub async fn put_profiles(
 
 /// Normalise and reject broken profiles with a 400: each needs a slug id and a
 /// name, ids must be unique, and every referenced list must exist (a typo would
-/// otherwise silently apply an empty subset — i.e. block nothing).
+/// otherwise silently apply an empty subset — i.e. block nothing, or for a
+/// default-deny profile's allowlists, allow nothing).
 fn validate(
     mut profiles: Vec<BlocklistProfileConfig>,
     known_lists: &HashSet<String>,
+    known_allowlists: &HashSet<String>,
 ) -> Result<Vec<BlocklistProfileConfig>, ApiError> {
     let mut ids: HashSet<String> = HashSet::new();
     for p in &mut profiles {
@@ -84,6 +114,14 @@ fn validate(
             if !known_lists.contains(list) {
                 return Err(bad(&format!(
                     "profile '{}' references unknown list '{}'",
+                    p.id, list
+                )));
+            }
+        }
+        for list in &p.allowlists {
+            if !known_allowlists.contains(list) {
+                return Err(bad(&format!(
+                    "profile '{}' references unknown allowlist '{}'",
                     p.id, list
                 )));
             }
@@ -109,20 +147,25 @@ fn slugify(s: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-fn persist(state: &AppState) -> Option<String> {
+async fn persist(state: &AppState) -> Option<String> {
     let cfg = state.live_config.read().clone();
     let path = state.config_path.as_ref().clone().or_else(|| {
         crate::config::Config::config_candidates()
             .into_iter()
             .next()
     })?;
-    match cfg.save(&path) {
-        Ok(()) => {
+    let path_clone = path.clone();
+    match tokio::task::spawn_blocking(move || cfg.save(&path_clone)).await {
+        Ok(Ok(())) => {
             tracing::info!("blocklist profiles saved to {}", path.display());
             Some(path.display().to_string())
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::error!("failed to save blocklist profiles: {}", e);
+            None
+        }
+        Err(e) => {
+            tracing::error!("config save task panicked: {}", e);
             None
         }
     }
@@ -143,6 +186,55 @@ mod tests {
         assert_eq!(slugify("  TV  "), "tv");
         assert_eq!(slugify("a__b"), "a-b");
         assert_eq!(slugify("!!!"), "");
+    }
+
+    #[tokio::test]
+    async fn put_rejects_unknown_allowlist_and_accepts_known_one() {
+        let (state, db) = test_support::app_state("profiles-api-allowlists").await;
+
+        state
+            .inner
+            .blocklist
+            .add_allow_list(crate::config::ListConfig {
+                name: "KidSafe".into(),
+                url: "https://x.test/kidsafe".into(),
+                enabled: true,
+            })
+            .unwrap();
+
+        let profile = |allowlists: Vec<String>| BlocklistProfileConfig {
+            id: "kid".into(),
+            name: "Kid".into(),
+            lists: Vec::new(),
+            clients: vec!["10.0.0.2".into()],
+            block: Vec::new(),
+            allow: Vec::new(),
+            allowlists,
+            default_deny: true,
+        };
+
+        // Unknown allowlist name → 400 (a typo would silently allow nothing).
+        let bad = put_profiles(
+            State(state.clone()),
+            Json(vec![profile(vec!["Ghost".into()])]),
+        )
+        .await;
+        assert!(matches!(bad, Err(ApiError(FeriteError::Config(_)))));
+
+        // Known allowlist + default_deny round-trips into live_config.
+        let Json(v) = put_profiles(
+            State(state.clone()),
+            Json(vec![profile(vec!["KidSafe".into()])]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v["status"], json!("ok"));
+        let saved = state.live_config.read().blocklist.profiles.clone();
+        assert_eq!(saved[0].allowlists, vec!["KidSafe"]);
+        assert!(saved[0].default_deny);
+
+        drop(state);
+        test_support::cleanup_sqlite(&db);
     }
 
     #[tokio::test]
@@ -180,6 +272,8 @@ mod tests {
                 clients: vec!["10.0.0.5".into()],
                 block: Vec::new(),
                 allow: Vec::new(),
+                allowlists: Vec::new(),
+                default_deny: false,
             }]),
         )
         .await;
@@ -195,6 +289,8 @@ mod tests {
                 clients: vec!["10.0.0.5".into()],
                 block: Vec::new(),
                 allow: Vec::new(),
+                allowlists: Vec::new(),
+                default_deny: false,
             }]),
         )
         .await

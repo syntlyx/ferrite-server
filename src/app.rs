@@ -95,7 +95,15 @@ impl AppState {
 
         // Blocklist engine
         let fst_path = data_dir.join("blocklist.fst");
-        let blocklist = Arc::new(Blocklist::new(config.blocklist.clone(), fst_path));
+        let blocklist = Arc::new(Blocklist::new(
+            config.blocklist.clone(),
+            config.allowlist.clone(),
+            fst_path,
+        ));
+        // Configured zone suffixes are local infrastructure — exempt from any
+        // profile's default-deny, like *.arpa and the built-in local suffixes.
+        let zone_names: Vec<String> = config.zones.iter().map(|z| z.name.clone()).collect();
+        blocklist.set_local_zones(&zone_names);
 
         // Load persisted whitelist/blacklist from storage.
         match storage.load_custom_entries().await {

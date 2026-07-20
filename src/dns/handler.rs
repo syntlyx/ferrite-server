@@ -718,6 +718,7 @@ mod tests {
                 client_bypass: vec![],
                 profiles: vec![],
             },
+            crate::config::AllowlistConfig::default(),
             temp_fst_path("ferrite-dns-handler"),
         )
     }

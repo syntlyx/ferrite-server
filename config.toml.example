@@ -137,13 +137,9 @@ bind_addr = "127.0.0.1:8080"
 # higher values reduce FST lookups on noisy networks.
 decision_cache_size = 50000
 
-# Domains never blocked, even if they appear in a list.
-# Wildcards: "*.example.com" matches all subdomains (not the apex itself).
-# Also manageable at runtime via POST /api/blocklist/whitelist.
-whitelist = [
-    # "safe.example.com",
-    # "*.internal.corp",
-]
+# NOTE: `whitelist` used to live here; it is deprecated in favour of the
+# [allowlist] section below. Old configs still load — entries are migrated
+# automatically and rewritten in the new shape on the next config save.
 
 # Extra wildcard patterns to always block.
 # Also manageable at runtime via POST /api/blocklist/blacklist.
@@ -165,6 +161,33 @@ enabled = true
 # [[blocklist.lists]]
 # name    = "Local custom"
 # url     = "file:///etc/ferrite/custom.hosts"
+# enabled = true
+
+
+# ── Allowlist ─────────────────────────────────────────────────────────────────
+# Domains never blocked, even when a blocklist contains them. Mirrors the
+# [blocklist] structure: manual entries plus remote subscriptions. Only
+# consulted while blocking is enabled — an allowlist doesn't resolve anything
+# by itself, it only exempts domains from blocking.
+
+[allowlist]
+# Manual entries. An exact domain also exempts its subdomains; wildcards like
+# "*.example.com" match all subdomains (not the apex itself).
+# Also manageable at runtime via POST /api/blocklist/whitelist.
+domains = [
+    # "safe.example.com",
+    # "*.internal.corp",
+]
+
+# Remote allowlist subscriptions — refreshed together with the blocklists.
+# Formats: hosts, plain domain-per-line, or Adblock (there the "@@||domain^"
+# exception rules are the allow entries). Useful for community-maintained
+# false-positive lists. Also manageable at runtime via the /api/allowlists
+# endpoints.
+
+# [[allowlist.lists]]
+# name    = "anudeepND Whitelist"
+# url     = "https://raw.githubusercontent.com/anudeepND/whitelist/master/domains/whitelist.txt"
 # enabled = true
 
 

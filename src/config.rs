@@ -35,6 +35,8 @@ pub struct Config {
     #[serde(default)]
     pub blocklist: BlocklistConfig,
     #[serde(default)]
+    pub allowlist: AllowlistConfig,
+    #[serde(default)]
     pub zones: Vec<ZoneConfig>,
     #[serde(default)]
     pub custom_records: Vec<CustomRecordConfig>,
@@ -213,6 +215,10 @@ pub struct BlocklistConfig {
     pub decision_cache_size: usize,
     pub lists: Vec<ListConfig>,
     pub wildcard_block: Vec<String>,
+    /// DEPRECATED: superseded by `[allowlist] domains`. Still accepted on load —
+    /// `Config::normalize` migrates entries into `allowlist.domains` — and no
+    /// longer serialized, so the next config save rewrites the new shape.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub whitelist: Vec<String>,
     pub client_bypass: Vec<String>,
     /// Per-device blocking profiles. A profile applies a *subset* of the
@@ -246,6 +252,18 @@ pub struct BlocklistProfileConfig {
     /// AND this profile's own subscription lists (exact or `*.wildcard`).
     #[serde(default)]
     pub allow: Vec<String>,
+    /// Allowlist subscription names this profile includes (subset of
+    /// `[allowlist] lists`). Empty = inherit every enabled allowlist (the
+    /// default behaviour, so existing profiles keep their exemptions).
+    #[serde(default)]
+    pub allowlists: Vec<String>,
+    /// Default-deny mode: block every domain that isn't explicitly allowed
+    /// (profile `allow`, manual `[allowlist] domains`, or this profile's
+    /// allowlist subscriptions). Local-infrastructure names — reverse DNS
+    /// (`*.arpa`), bare hostnames, well-known local suffixes, and configured
+    /// `[[zones]]` suffixes — are exempt so LAN plumbing keeps working.
+    #[serde(default)]
+    pub default_deny: bool,
 }
 
 fn default_blocklist_decision_cache_size() -> usize {
@@ -259,6 +277,23 @@ pub struct ListConfig {
     pub url: String,
     pub name: String,
     pub enabled: bool,
+}
+
+/// Domains never blocked, mirroring the `[blocklist]` structure: manual entries
+/// plus remote subscriptions. Subscribed allowlists merge into the same
+/// decision tier as `domains` — above the global block sources, below any
+/// per-device profile `block` override.
+///
+/// Only meaningful while `blocklist.enabled = true`; an allowlist doesn't
+/// resolve anything by itself, it only exempts domains from blocking.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct AllowlistConfig {
+    /// Manual allowlist entries (exact domain or `*.wildcard`).
+    pub domains: Vec<String>,
+    /// Remote allowlist subscriptions (hosts, plain, or Adblock format — for
+    /// Adblock lists the `@@||domain^` exception rules are the allow entries).
+    pub lists: Vec<ListConfig>,
 }
 
 fn default_true() -> bool {
@@ -556,6 +591,7 @@ impl Default for Config {
             api: ApiConfig::default(),
             panel: PanelConfig::default(),
             blocklist: BlocklistConfig::default(),
+            allowlist: AllowlistConfig::default(),
             zones: vec![],
             custom_records: vec![],
             proxy: ProxyConfig::default(),
@@ -599,7 +635,32 @@ impl Config {
         self.api.normalize();
         self.panel.normalize();
         self.blocklist.normalize();
+        self.migrate_whitelist();
         self.proxy.normalize();
+    }
+
+    /// Move deprecated `blocklist.whitelist` entries into `allowlist.domains`.
+    /// Runs on every load and save (via `normalize`), so an old config keeps
+    /// working and is rewritten in the new shape on its next save.
+    fn migrate_whitelist(&mut self) {
+        if self.blocklist.whitelist.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            "blocklist.whitelist is deprecated — moving {} entr{} to [allowlist] domains",
+            self.blocklist.whitelist.len(),
+            if self.blocklist.whitelist.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            }
+        );
+        let existing: HashSet<String> = self.allowlist.domains.iter().cloned().collect();
+        for entry in std::mem::take(&mut self.blocklist.whitelist) {
+            if !existing.contains(&entry) {
+                self.allowlist.domains.push(entry);
+            }
+        }
     }
 
     pub fn config_candidates() -> Vec<PathBuf> {
@@ -861,6 +922,73 @@ mod tests {
         // The rule pointing at a non-existent egress is dropped; the valid one stays.
         assert_eq!(cfg.proxy.rules.len(), 1);
         assert_eq!(cfg.proxy.rules[0].pattern, "example.com");
+    }
+
+    #[test]
+    fn config_toml_example_parses() {
+        let raw = include_str!("../config.toml.example");
+        let cfg = toml::from_str::<Config>(raw).unwrap().normalized();
+        // The example ships with everything in [allowlist] commented out.
+        assert!(cfg.allowlist.domains.is_empty());
+        assert!(cfg.allowlist.lists.is_empty());
+        assert!(cfg.blocklist.whitelist.is_empty());
+    }
+
+    #[test]
+    fn deprecated_blocklist_whitelist_migrates_to_allowlist_domains() {
+        let cfg = toml::from_str::<Config>(
+            r#"
+            [blocklist]
+            whitelist = ["safe.example.com", "*.internal.corp"]
+
+            [allowlist]
+            domains = ["already.there", "safe.example.com"]
+            "#,
+        )
+        .unwrap()
+        .normalized();
+
+        // Migrated (deduplicated) into allowlist.domains, old field drained.
+        assert!(cfg.blocklist.whitelist.is_empty());
+        assert_eq!(
+            cfg.allowlist.domains,
+            vec!["already.there", "safe.example.com", "*.internal.corp"]
+        );
+
+        // A save writes only the new shape — no `whitelist` key resurrects.
+        let raw = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!raw.contains("whitelist"));
+        assert!(raw.contains("[allowlist]"));
+
+        let reparsed = toml::from_str::<Config>(&raw).unwrap().normalized();
+        assert_eq!(reparsed.allowlist.domains.len(), 3);
+    }
+
+    #[test]
+    fn allowlist_domains_and_lists_round_trip() {
+        let cfg = toml::from_str::<Config>(
+            r#"
+            [allowlist]
+            domains = ["safe.example.com"]
+
+            [[allowlist.lists]]
+            name    = "anudeepND Whitelist"
+            url     = "https://example.test/whitelist.txt"
+            enabled = true
+            "#,
+        )
+        .unwrap()
+        .normalized();
+
+        assert_eq!(cfg.allowlist.domains, vec!["safe.example.com"]);
+        assert_eq!(cfg.allowlist.lists.len(), 1);
+        assert_eq!(cfg.allowlist.lists[0].name, "anudeepND Whitelist");
+
+        let raw = toml::to_string_pretty(&cfg).unwrap();
+        assert!(raw.contains("domains = [\"safe.example.com\"]"));
+        let reparsed = toml::from_str::<Config>(&raw).unwrap().normalized();
+        assert_eq!(reparsed.allowlist.domains, vec!["safe.example.com"]);
+        assert_eq!(reparsed.allowlist.lists.len(), 1);
     }
 
     #[test]

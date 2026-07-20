@@ -15,6 +15,9 @@ written in Rust.
   blocker and a VPN — it's the same server.
 - **Anti-censorship built in.** Route blocked domains through Tor or a tunnel,
   with TLS-ClientHello (SNI) fragmentation to defeat DPI — per device, your choice.
+- **Per-device profiles, up to default-deny.** Different block/allow lists per
+  device — or flip a profile to *block everything except an allowlist* (kid /
+  IoT mode) while local network names keep resolving.
 - **No root, no TUN device.** WireGuard runs in userspace (boringtun + smoltcp),
   fully in-process.
 - **Fast and small.** Rust, single binary, sub-2 ms cache/block decisions,
@@ -152,14 +155,16 @@ type = "quic"; address = "94.140.14.14"; port = 853; tls_name = "dns.adguard-dns
 > `bootstrap_ip` is needed for DoH when ferrite is the system resolver (it can't
 > resolve the DoH hostname through itself). DoT/DoQ use a literal IP — no bootstrap.
 
-**Blocklists** — subscribe to any public list by URL (StevenBlack, OISD, AdGuard,
-Hagezi…); formats (hosts / Adblock `||domain^` / plain) are auto-detected and
-compiled into one fast FST. Manage them live in the UI.
+**Blocklists & allowlists** — subscribe to any public list by URL (StevenBlack,
+OISD, AdGuard, Hagezi…); formats (hosts / Adblock `||domain^` / plain) are
+auto-detected and compiled into one fast FST. Allowlists work the same way in
+reverse — subscribe to a community false-positive feed (e.g. anudeepND) and its
+domains are never blocked; for Adblock-format lists the `@@||domain^` exception
+rules are the allow entries. Manage everything live in the UI.
 
 ```toml
 [blocklist]
 enabled = true
-whitelist       = ["safe.example.com", "*.internal.corp"]
 wildcard_block  = ["*.doubleclick.net"]
 client_bypass   = ["192.168.1.50", "aa:bb:cc:dd:ee:ff"]   # these clients skip filtering
 
@@ -167,6 +172,28 @@ client_bypass   = ["192.168.1.50", "aa:bb:cc:dd:ee:ff"]   # these clients skip f
 name = "StevenBlack"
 url  = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
 enabled = true
+
+[allowlist]
+domains = ["safe.example.com", "*.internal.corp"]   # never blocked (manual entries)
+
+[[allowlist.lists]]
+name = "anudeepND Whitelist"
+url  = "https://raw.githubusercontent.com/anudeepND/whitelist/master/domains/whitelist.txt"
+enabled = true
+```
+
+**Per-device profiles** — apply a subset of the block/allow subscriptions to
+specific devices (by IP/MAC), with per-profile manual block/allow overrides. A
+profile can also flip to **default-deny**: everything is blocked except what's
+explicitly allowed. Local network names — PTR/reverse zones, `.lan`, `.local`,
+your `[[zones]]` — stay resolvable automatically, no extra configuration.
+
+```toml
+[[blocklist.profiles]]
+id = "iot"; name = "IoT Devices"
+clients      = ["aa:bb:cc:dd:ee:ff"]
+allowlists   = ["anudeepND Whitelist"]   # empty = all enabled allowlists apply
+default_deny = true                      # block everything not explicitly allowed
 ```
 
 **Custom records** (take priority over blocklist + upstream):
@@ -252,9 +279,13 @@ GET/POST/DELETE  /api/clients/aliases[/{ip}]   manual client aliases
 GET/POST  /api/blocklist/whitelist|blacklist   list · add (exact or *.wildcard)
 DELETE    /api/blocklist/whitelist|blacklist/{domain}
 GET    /api/blocklist/check/{domain}           why-blocked: which list/rule matched
+GET/PUT   /api/blocklist/profiles              per-device profiles (list subsets, default-deny)
 
-GET/POST  /api/lists      PATCH/DELETE /api/lists/{name}    subscriptions
+GET/POST  /api/lists      PATCH/DELETE /api/lists/{name}    blocklist subscriptions
 POST   /api/lists/refresh · /api/lists/{name}/refresh
+
+GET/POST  /api/allowlists PATCH/DELETE /api/allowlists/{name}   allowlist subscriptions
+POST   /api/allowlists/refresh · /api/allowlists/{name}/refresh
 
 GET/POST  /api/custom-records   DELETE /api/custom-records/{domain}
 
@@ -278,13 +309,15 @@ GET    /api/update/check   POST /api/update/server|web
 
 All under `~/.local/share/ferrite/`:
 
-| File             | Contents                                                       |
-| ---------------- | -------------------------------------------------------------- |
-| `ferrite.db`     | SQLite — query log, stats, whitelist/blacklist, custom records |
-| `blocklist.fst`  | Compiled blocklist (rebuilt on list changes)                   |
-| `lists/<name>.*` | Per-list parsed-domain cache                                   |
-| `state.bin`      | Warm-restart snapshot (DNS cache + counters)                   |
-| `web/`           | Web UI static files                                            |
+| File                  | Contents                                                       |
+| --------------------- | -------------------------------------------------------------- |
+| `ferrite.db`          | SQLite — query log, stats, whitelist/blacklist, custom records |
+| `blocklist.fst`       | Compiled blocklist (rebuilt on list changes)                   |
+| `allowlist.fst`       | Compiled subscribed allowlists                                 |
+| `lists/<name>.*`      | Per-blocklist parsed-domain cache                              |
+| `allowlists/<name>.*` | Per-allowlist parsed-domain cache                              |
+| `state.bin`           | Warm-restart snapshot (DNS cache + counters)                   |
+| `web/`                | Web UI static files                                            |
 
 ## License
 
