@@ -85,7 +85,7 @@ pub struct ClientRegistry {
 
 /// Build the reverse-DNS PTR domain for an IP.
 /// Shared by `resolver.rs` and `mdns.rs` to avoid duplication.
-pub(super) fn ip_to_ptr_domain(ip: IpAddr) -> String {
+pub(crate) fn ip_to_ptr_domain(ip: IpAddr) -> String {
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
@@ -109,7 +109,7 @@ pub(super) fn ip_to_ptr_domain(ip: IpAddr) -> String {
     }
 }
 
-pub(super) fn random_query_id() -> Option<u16> {
+pub(crate) fn random_query_id() -> Option<u16> {
     let mut bytes = [0u8; 2];
     SystemRandom::new().fill(&mut bytes).ok()?;
     Some(u16::from_be_bytes(bytes))

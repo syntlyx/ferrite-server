@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 ferrite-blocklist.workspace = true
+ferrite-clients.workspace = true
 ferrite-core.workspace = true
 ferrite-storage.workspace = true
 ferrite-upstream.workspace = true

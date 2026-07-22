@@ -18,6 +18,7 @@ license = "MIT"
 [workspace.dependencies]
 # ── Internal crates ───────────────────────────────────────────────────────────
 ferrite-blocklist = { path = "crates/blocklist" }
+ferrite-clients = { path = "crates/clients" }
 ferrite-core = { path = "crates/core" }
 ferrite-storage = { path = "crates/storage" }
 ferrite-upstream = { path = "crates/upstream" }

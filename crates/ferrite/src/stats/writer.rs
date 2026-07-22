@@ -5,8 +5,8 @@ use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
 use tokio::time::timeout;
 
-use crate::clients::ClientRegistry;
 use crate::stats::live::LiveStats;
+use ferrite_clients::ClientRegistry;
 use ferrite_core::net::parse_ip;
 use ferrite_core::types::QueryEntry;
 use ferrite_storage::Storage;

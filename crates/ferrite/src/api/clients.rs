@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::ApiError;
 use crate::app::AppState;
-use crate::clients::ClientRegistry;
+use ferrite_clients::ClientRegistry;
 use ferrite_core::net::{format_mac, parse_ip, parse_mac};
 
 #[derive(Deserialize, Default)]

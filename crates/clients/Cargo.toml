@@ -1,0 +1,18 @@
+[package]
+name = "ferrite-clients"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ferrite-core.workspace = true
+ferrite-storage.workspace = true
+ferrite-upstream.workspace = true
+
+chrono.workspace = true
+hickory-proto.workspace = true
+dashmap.workspace = true
+ring.workspace = true
+socket2.workspace = true
+tokio.workspace = true
+tracing.workspace = true

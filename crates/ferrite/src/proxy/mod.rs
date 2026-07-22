@@ -38,9 +38,9 @@ use hickory_proto::serialize::binary::BinEncodable;
 use parking_lot::RwLock;
 use tokio::sync::Notify;
 
-use crate::clients::ClientRegistry;
 use crate::dns::intercept::{DnsInterceptor, Intercept};
 use crate::dns::types::{DnsResponse, qtype as qt};
+use ferrite_clients::ClientRegistry;
 use ferrite_core::config::{Config, EgressConfig, ProxyConfig};
 use ferrite_upstream::{EgressConnectError, EgressConnectFuture, EgressConnector, ZoneRouter};
 

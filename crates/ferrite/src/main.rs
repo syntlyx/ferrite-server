@@ -1,6 +1,5 @@
 mod api;
 mod app;
-mod clients;
 mod dns;
 mod proxy;
 mod setup;

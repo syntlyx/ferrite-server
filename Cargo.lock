@@ -748,6 +748,7 @@ dependencies = [
  "dashmap",
  "dirs",
  "ferrite-blocklist",
+ "ferrite-clients",
  "ferrite-core",
  "ferrite-storage",
  "ferrite-upstream",
@@ -803,6 +804,22 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ferrite-clients"
+version = "0.1.7"
+dependencies = [
+ "chrono",
+ "dashmap",
+ "ferrite-core",
+ "ferrite-storage",
+ "ferrite-upstream",
+ "hickory-proto",
+ "ring",
+ "socket2",
  "tokio",
  "tracing",
 ]

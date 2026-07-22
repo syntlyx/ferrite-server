@@ -5,12 +5,12 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use tokio::sync::{Semaphore, mpsc};
 
-use crate::clients::ClientRegistry;
 use crate::dns::cache::DnsCache;
 use crate::dns::custom::CustomRecords;
 use crate::dns::intercept::DnsInterceptor;
 use crate::stats::live::LiveStats;
 use ferrite_blocklist::Blocklist;
+use ferrite_clients::ClientRegistry;
 use ferrite_core::config::DnsConfig;
 use ferrite_core::types::QueryEntry;
 use ferrite_upstream::ZoneRouter;
