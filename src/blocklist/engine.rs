@@ -11,8 +11,8 @@ use regex::Regex;
 use crate::blocklist::cache::BlocklistCache;
 use crate::blocklist::loader::{self, FstMap};
 use crate::blocklist::{AdblockStats, ListPolarity, refresh};
-use crate::clients::normalize_client_key;
 use crate::config::{AllowlistConfig, BlocklistConfig, ListConfig};
+use crate::core::net::normalize_client_key;
 use crate::error::{FeriteError, Result};
 
 /// What [`refresh_list_set`] hands back: the merged FST, per-list domain

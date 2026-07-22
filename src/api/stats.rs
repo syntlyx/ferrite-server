@@ -10,9 +10,10 @@ use serde_json::Value;
 
 use crate::api::ApiError;
 use crate::app::AppState;
-use crate::clients::{ClientRegistry, parse_ip};
-use crate::dns::types::{QueryEntry, QueryStatus};
-use crate::stats::timeseries::TimeseriesBucket;
+use crate::clients::ClientRegistry;
+use crate::core::net::parse_ip;
+use crate::core::types::TimeseriesBucket;
+use crate::core::types::{QueryEntry, QueryStatus};
 
 // ── Response types ────────────────────────────────────────────────────────────
 

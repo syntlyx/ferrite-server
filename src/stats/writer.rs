@@ -5,8 +5,9 @@ use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
 use tokio::time::timeout;
 
-use crate::clients::{ClientRegistry, parse_ip};
-use crate::dns::types::QueryEntry;
+use crate::clients::ClientRegistry;
+use crate::core::net::parse_ip;
+use crate::core::types::QueryEntry;
 use crate::stats::live::LiveStats;
 use crate::storage::Storage;
 

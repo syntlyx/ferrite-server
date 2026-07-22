@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 
-use crate::clients::normalize_client_key;
+use crate::core::net::normalize_client_key;
 use crate::error::{FeriteError, Result};
 
 /// XDG-style config dir: always `~/.config/ferrite` on every platform.

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::dns::types::{QueryEntry, QueryStatus};
+use crate::core::types::{QueryEntry, QueryStatus};
 use crate::stats::recent::QueryRingBuffer;
 use crate::stats::timeseries::InMemoryTimeseries;
 use crate::stats::top_list::TopNCounter;

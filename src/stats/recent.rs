@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use parking_lot::Mutex;
 
-use crate::dns::types::QueryEntry;
+use crate::core::types::QueryEntry;
 
 /// Fixed-capacity ring buffer of recent query entries.
 pub struct QueryRingBuffer {
@@ -93,7 +93,7 @@ impl std::fmt::Debug for QueryRingBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dns::types::QueryStatus;
+    use crate::core::types::QueryStatus;
 
     fn entry(id: u64) -> QueryEntry {
         QueryEntry {

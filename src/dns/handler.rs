@@ -10,9 +10,10 @@ use hickory_proto::rr::rdata::opt::EdnsCode;
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use tokio::sync::mpsc;
 
-use crate::clients::unmap_v4;
+use crate::core::net::unmap_v4;
+use crate::core::types::{QueryEntry, QueryStatus};
 use crate::dns::ctx::DnsCtx;
-use crate::dns::types::{DnsResponse, QueryEntry, QueryStatus};
+use crate::dns::types::DnsResponse;
 use crate::error::Result;
 
 static QUERY_COUNTER: AtomicU64 = AtomicU64::new(1);

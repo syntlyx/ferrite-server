@@ -9,9 +9,9 @@ use tokio::sync::{Notify, Semaphore, mpsc};
 use crate::blocklist::Blocklist;
 use crate::clients::ClientRegistry;
 use crate::config::{Config, CustomRecordConfig};
+use crate::core::types::QueryEntry;
 use crate::dns::cache::DnsCache;
 use crate::dns::custom::CustomRecords;
-use crate::dns::types::QueryEntry;
 use crate::error::Result;
 use crate::stats::CpuSampler;
 use crate::stats::live::LiveStats;
@@ -412,7 +412,7 @@ fn panel_ipv4(config: &Config) -> Option<Ipv4Addr> {
         .filter(|ip| !ip.is_unspecified())
         .or_else(|| non_loopback_ipv4(config.api.bind_addr))
         .or_else(|| non_loopback_ipv4(config.dns.bind_addr))
-        .or_else(crate::setup::local_ipv4_for_internet)
+        .or_else(crate::core::net::local_ipv4_for_internet)
         .or_else(|| loopback_ipv4(config.api.bind_addr))
         .or_else(|| loopback_ipv4(config.dns.bind_addr))
 }
@@ -495,7 +495,7 @@ fn trim_env(key: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::UpstreamConfig;
-    use crate::dns::types::{QueryEntry, QueryStatus};
+    use crate::core::types::{QueryEntry, QueryStatus};
     use crate::storage::{SqliteStorage, Storage};
 
     #[test]

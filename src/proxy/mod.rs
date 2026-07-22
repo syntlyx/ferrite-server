@@ -431,7 +431,7 @@ fn build_snapshot(
         enabled,
         advertise_ipv4: cfg
             .advertise_ipv4
-            .or_else(crate::setup::local_ipv4_for_internet),
+            .or_else(crate::core::net::local_ipv4_for_internet),
         advertise_ipv6: cfg.advertise_ipv6,
         egresses,
         egress_configs,

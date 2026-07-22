@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::config::{Config, ZoneConfig};
 
@@ -112,7 +112,7 @@ struct NetworkInfo {
 }
 
 fn detect_network() -> NetworkInfo {
-    let local_ipv4 = local_ipv4_for_internet();
+    let local_ipv4 = crate::core::net::local_ipv4_for_internet();
     let ipv4_prefix = local_ipv4.and_then(detect_ipv4_prefix).unwrap_or(24);
     let local_ipv6 = detect_ipv6_addrs();
     let gateway = detect_gateway();
@@ -121,16 +121,6 @@ fn detect_network() -> NetworkInfo {
         ipv4_prefix,
         local_ipv6,
         gateway,
-    }
-}
-
-/// Local IPv4 for internet traffic via dummy UDP connect (no packets sent).
-pub(crate) fn local_ipv4_for_internet() -> Option<Ipv4Addr> {
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    match socket.local_addr().ok()?.ip() {
-        IpAddr::V4(v4) if !v4.is_loopback() => Some(v4),
-        _ => None,
     }
 }
 

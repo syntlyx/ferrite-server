@@ -3,6 +3,7 @@ mod app;
 mod blocklist;
 mod clients;
 mod config;
+mod core;
 mod dns;
 mod error;
 mod logbuf;

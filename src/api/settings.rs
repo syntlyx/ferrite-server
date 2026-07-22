@@ -8,8 +8,8 @@ use std::collections::BTreeSet;
 use crate::api::ApiError;
 use crate::api::auth::hash_password;
 use crate::app::AppState;
-use crate::clients::normalize_client_key;
 use crate::config::{UpstreamConfig, ZoneConfig};
+use crate::core::net::normalize_client_key;
 use crate::dns::cache::{MAX_TTL, MIN_TTL};
 use crate::error::FeriteError;
 

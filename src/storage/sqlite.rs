@@ -6,9 +6,9 @@ use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 use tokio_rusqlite::Connection;
 
-use crate::dns::types::{QueryEntry, QueryStatus};
+use crate::core::types::TimeseriesBucket;
+use crate::core::types::{QueryEntry, QueryStatus};
 use crate::error::{FeriteError, Result};
-use crate::stats::timeseries::TimeseriesBucket;
 use crate::storage::schema::SCHEMA;
 use crate::storage::{ClientStats, QueryFilter, Storage, SummaryStats};
 

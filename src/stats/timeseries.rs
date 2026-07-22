@@ -1,24 +1,8 @@
 use std::collections::HashMap;
 
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 
-use crate::dns::types::QueryStatus;
-
-/// One time bucket in the 24-hour rolling window (10-minute granularity).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TimeseriesBucket {
-    /// Unix timestamp of the start of this bucket (aligned to 600 s).
-    pub bucket: u64,
-    /// Total queries in this bucket.
-    pub total: u64,
-    /// Blocked queries in this bucket.
-    pub blocked: u64,
-    /// Served from DNS cache in this bucket.
-    pub cached: u64,
-    /// Forwarded to upstream resolvers in this bucket.
-    pub upstream: u64,
-}
+use crate::core::types::{QueryStatus, TimeseriesBucket};
 
 /// Rolling 24-hour timeseries with 10-minute bucket granularity, kept in memory.
 /// Updated on every query; read on dashboard polls.

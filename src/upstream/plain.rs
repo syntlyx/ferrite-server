@@ -166,7 +166,7 @@ fn response_matches_query(query: &[u8], response: &[u8]) -> bool {
         return false;
     }
     // Compare the question section verbatim.
-    match crate::dns::types::question_end(query) {
+    match crate::core::types::question_end(query) {
         Some(end) => response.len() >= end && query[12..end] == response[12..end],
         // No question to compare (qdcount 0 or malformed query): the header
         // checks above are all we can assert.

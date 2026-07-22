@@ -172,7 +172,7 @@ impl ClientRegistry {
     async fn persist_device(&self, mac: [u8; 6], name: &str) {
         if let Err(e) = self
             .storage
-            .upsert_device(&super::format_mac(&mac), Some(name))
+            .upsert_device(&crate::core::net::format_mac(&mac), Some(name))
             .await
         {
             tracing::debug!("failed to persist device {:02x?}: {}", mac, e);
@@ -183,7 +183,7 @@ impl ClientRegistry {
     pub(super) async fn persist_binding(&self, ip: IpAddr, mac: [u8; 6]) {
         if let Err(e) = self
             .storage
-            .upsert_ip_binding(&ip.to_string(), &super::format_mac(&mac))
+            .upsert_ip_binding(&ip.to_string(), &crate::core::net::format_mac(&mac))
             .await
         {
             tracing::debug!("failed to persist binding {} → {:02x?}: {}", ip, mac, e);

@@ -7,10 +7,9 @@ use crate::error::Result;
 use crate::storage::Storage;
 use crate::upstream::ZoneRouter;
 
-use super::{
-    BINDING_RETENTION, BINDING_TOUCH_INTERVAL, ClientRegistry, DashMap, DashSet, format_mac,
-    parse_ip, parse_mac, unmap_v4,
-};
+use crate::core::net::{format_mac, parse_ip, parse_mac, unmap_v4};
+
+use super::{BINDING_RETENTION, BINDING_TOUCH_INTERVAL, ClientRegistry, DashMap, DashSet};
 
 impl ClientRegistry {
     pub async fn new(upstream: Arc<ZoneRouter>, storage: Arc<dyn Storage>) -> Arc<Self> {

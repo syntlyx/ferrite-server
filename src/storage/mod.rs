@@ -4,9 +4,9 @@ pub mod sqlite;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::dns::types::QueryEntry;
+use crate::core::types::QueryEntry;
+use crate::core::types::TimeseriesBucket;
 use crate::error::Result;
-use crate::stats::timeseries::TimeseriesBucket;
 
 /// Filter parameters for querying the DNS log.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -26,7 +26,7 @@ pub struct QueryFilter {
 }
 
 /// Aggregated statistics per device (keyed by the device identity token: a MAC
-/// when known, else an IP fallback — see [`crate::dns::types::QueryEntry::device`]).
+/// when known, else an IP fallback — see [`crate::core::types::QueryEntry::device`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientStats {
     /// Device identity token (MAC or IP fallback).

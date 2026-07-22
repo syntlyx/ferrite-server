@@ -8,10 +8,10 @@ use tokio::sync::{Semaphore, mpsc};
 use crate::blocklist::Blocklist;
 use crate::clients::ClientRegistry;
 use crate::config::DnsConfig;
+use crate::core::types::QueryEntry;
 use crate::dns::cache::DnsCache;
 use crate::dns::custom::CustomRecords;
 use crate::dns::intercept::DnsInterceptor;
-use crate::dns::types::QueryEntry;
 use crate::stats::live::LiveStats;
 use crate::upstream::ZoneRouter;
 

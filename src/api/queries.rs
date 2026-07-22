@@ -8,8 +8,9 @@ use serde_json::Value;
 
 use crate::api::ApiError;
 use crate::app::AppState;
-use crate::clients::{ClientRegistry, parse_ip};
-use crate::dns::types::QueryEntry;
+use crate::clients::ClientRegistry;
+use crate::core::net::parse_ip;
+use crate::core::types::QueryEntry;
 use crate::storage::QueryFilter;
 
 #[derive(Deserialize, Default)]
