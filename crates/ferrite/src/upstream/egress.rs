@@ -16,7 +16,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::net::TcpStream;
 
-use crate::error::FeriteError;
+use ferrite_core::error::FeriteError;
 
 /// A bidirectional connection to a real destination, ready for splicing.
 pub enum EgressConn {

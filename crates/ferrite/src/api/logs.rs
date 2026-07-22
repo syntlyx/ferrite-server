@@ -5,7 +5,7 @@ use axum::extract::Query;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::logbuf;
+use ferrite_core::logbuf;
 
 #[derive(Deserialize)]
 pub struct LogQuery {

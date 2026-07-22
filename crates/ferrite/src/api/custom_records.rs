@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 
 use crate::api::ApiError;
 use crate::app::AppState;
-use crate::config::CustomRecordConfig;
-use crate::error::FeriteError;
+use ferrite_core::config::CustomRecordConfig;
+use ferrite_core::error::FeriteError;
 
 /// GET /api/custom-records
 pub async fn list_records(State(state): State<AppState>) -> Json<Value> {

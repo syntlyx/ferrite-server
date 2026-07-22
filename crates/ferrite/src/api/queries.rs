@@ -9,9 +9,9 @@ use serde_json::Value;
 use crate::api::ApiError;
 use crate::app::AppState;
 use crate::clients::ClientRegistry;
-use crate::core::net::parse_ip;
-use crate::core::types::QueryEntry;
 use crate::storage::QueryFilter;
+use ferrite_core::net::parse_ip;
+use ferrite_core::types::QueryEntry;
 
 #[derive(Deserialize, Default)]
 pub struct ListQueriesParams {

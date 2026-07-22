@@ -1,8 +1,8 @@
 use reqwest::{Client, RequestBuilder, redirect::Policy};
 use serde::Deserialize;
 
-use crate::error::{FeriteError, Result};
 use crate::updater::checksum;
+use ferrite_core::error::{FeriteError, Result};
 
 pub const RELEASE_API_BASE: &str = "https://api.github.com";
 pub const RELEASE_OWNER: &str = "syntlyx";

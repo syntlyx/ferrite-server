@@ -2,9 +2,9 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 
 use crate::dns::cache::DnsCache;
-use crate::error::Result;
 use crate::snapshot::{SNAPSHOT_MAGIC, SNAPSHOT_VERSION, StateSnapshot};
 use crate::stats::live::LiveStats;
+use ferrite_core::error::Result;
 
 /// Deserialize a `StateSnapshot` from `path`.
 /// Returns `Ok(None)` if the file doesn't exist.

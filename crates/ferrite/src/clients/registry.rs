@@ -3,11 +3,11 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use crate::error::Result;
 use crate::storage::Storage;
 use crate::upstream::ZoneRouter;
+use ferrite_core::error::Result;
 
-use crate::core::net::{format_mac, parse_ip, parse_mac, unmap_v4};
+use ferrite_core::net::{format_mac, parse_ip, parse_mac, unmap_v4};
 
 use super::{BINDING_RETENTION, BINDING_TOUCH_INTERVAL, ClientRegistry, DashMap, DashSet};
 

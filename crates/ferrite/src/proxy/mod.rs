@@ -39,10 +39,10 @@ use parking_lot::RwLock;
 use tokio::sync::Notify;
 
 use crate::clients::ClientRegistry;
-use crate::config::{Config, EgressConfig, ProxyConfig};
 use crate::dns::intercept::{DnsInterceptor, Intercept};
 use crate::dns::types::{DnsResponse, qtype as qt};
 use crate::upstream::{EgressConnectError, EgressConnectFuture, EgressConnector, ZoneRouter};
+use ferrite_core::config::{Config, EgressConfig, ProxyConfig};
 
 pub(crate) use egress::direct_connect;
 pub(crate) use egress::usable_rcvbuf_bytes;
@@ -386,7 +386,7 @@ impl EgressConnector for ProxyState {
 }
 
 /// Validate a pasted WireGuard `.conf` so the API can reject a bad one with 400.
-pub fn validate_wireguard_conf(text: &str) -> crate::error::Result<()> {
+pub fn validate_wireguard_conf(text: &str) -> ferrite_core::error::Result<()> {
     egress::validate_wireguard_conf(text)
 }
 
@@ -431,7 +431,7 @@ fn build_snapshot(
         enabled,
         advertise_ipv4: cfg
             .advertise_ipv4
-            .or_else(crate::core::net::local_ipv4_for_internet),
+            .or_else(ferrite_core::net::local_ipv4_for_internet),
         advertise_ipv6: cfg.advertise_ipv6,
         egresses,
         egress_configs,
@@ -523,9 +523,9 @@ mod tests {
     use hickory_proto::rr::{Name, RecordType};
     use hickory_proto::serialize::binary::BinDecodable;
 
-    use crate::config::{EgressConfig, ProxyConfig, RuleConfig, UpstreamConfig};
     use crate::dns::types::qtype;
     use crate::upstream::{UpstreamPool, ZoneRouter, no_proxy};
+    use ferrite_core::config::{EgressConfig, ProxyConfig, RuleConfig, UpstreamConfig};
 
     fn upstream() -> Arc<ZoneRouter> {
         let pool = UpstreamPool::from_config(

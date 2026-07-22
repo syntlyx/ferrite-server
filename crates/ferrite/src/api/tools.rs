@@ -24,9 +24,9 @@ use tokio_rustls::rustls::pki_types::ServerName;
 
 use crate::api::ApiError;
 use crate::app::AppState;
-use crate::error::FeriteError;
 use crate::proxy::{EgressConn, direct_connect};
 use crate::upstream::tunneled::client_config;
+use ferrite_core::error::FeriteError;
 
 /// Read budget + TLS handshake timeout for the connection-based tools.
 const TLS_TIMEOUT: Duration = Duration::from_secs(10);

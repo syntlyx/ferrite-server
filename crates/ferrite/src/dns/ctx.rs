@@ -7,13 +7,13 @@ use tokio::sync::{Semaphore, mpsc};
 
 use crate::blocklist::Blocklist;
 use crate::clients::ClientRegistry;
-use crate::config::DnsConfig;
-use crate::core::types::QueryEntry;
 use crate::dns::cache::DnsCache;
 use crate::dns::custom::CustomRecords;
 use crate::dns::intercept::DnsInterceptor;
 use crate::stats::live::LiveStats;
 use crate::upstream::ZoneRouter;
+use ferrite_core::config::DnsConfig;
+use ferrite_core::types::QueryEntry;
 
 /// Everything the DNS servers and the per-query pipeline need. Built once at
 /// startup by the composition root; shared as one `Arc` per query task.

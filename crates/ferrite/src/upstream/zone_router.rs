@@ -4,9 +4,9 @@ use std::sync::Arc;
 use hickory_proto::op::Message;
 use hickory_proto::serialize::binary::BinDecodable;
 
-use crate::config::ZoneConfig;
-use crate::error::{FeriteError, Result};
 use crate::upstream::{UpstreamPool, plain::PlainResolver};
+use ferrite_core::config::ZoneConfig;
+use ferrite_core::error::{FeriteError, Result};
 
 /// Routes DNS queries to zone-specific upstreams or the default pool.
 ///

@@ -6,11 +6,11 @@ use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 use tokio_rusqlite::Connection;
 
-use crate::core::types::TimeseriesBucket;
-use crate::core::types::{QueryEntry, QueryStatus};
-use crate::error::{FeriteError, Result};
 use crate::storage::schema::SCHEMA;
 use crate::storage::{ClientStats, QueryFilter, Storage, SummaryStats};
+use ferrite_core::error::{FeriteError, Result};
+use ferrite_core::types::TimeseriesBucket;
+use ferrite_core::types::{QueryEntry, QueryStatus};
 
 const ROLLUP_BUCKET_SECS: i64 = 600;
 
@@ -769,7 +769,7 @@ impl Storage for SqliteStorage {
             .map_err(FeriteError::TokioDatabase)
     }
 
-    async fn load_custom_records(&self) -> Result<Vec<crate::config::CustomRecordConfig>> {
+    async fn load_custom_records(&self) -> Result<Vec<ferrite_core::config::CustomRecordConfig>> {
         self.conn
             .call(|c| {
                 let mut stmt = c.prepare(
@@ -778,7 +778,7 @@ impl Storage for SqliteStorage {
                 )?;
                 let rows = stmt
                     .query_map([], |row| {
-                        Ok(crate::config::CustomRecordConfig {
+                        Ok(ferrite_core::config::CustomRecordConfig {
                             domain: row.get(0)?,
                             record_type: row.get(1)?,
                             value: row.get(2)?,

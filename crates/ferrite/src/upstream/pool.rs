@@ -3,13 +3,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio_rustls::rustls::ClientConfig;
 
-use crate::config::UpstreamConfig;
-use crate::error::{FeriteError, Result};
 use crate::upstream::egress::ProxyHandle;
 use crate::upstream::tunneled::{TunneledResolver, client_config};
 use crate::upstream::{
     doh::DohResolver, doq::DoqResolver, plain::PlainResolver, stream::StreamResolver,
 };
+use ferrite_core::config::UpstreamConfig;
+use ferrite_core::error::{FeriteError, Result};
 
 /// A single upstream entry, wrapping one of the protocol variants.
 pub enum UpstreamEntry {

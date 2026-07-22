@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use regex::Regex;
 
 use crate::blocklist::engine::wildcard_to_regex;
-use crate::config::RuleConfig;
+use ferrite_core::config::RuleConfig;
 
 pub enum Matcher {
     /// Exact domain: matches the name itself and any subdomain of it.

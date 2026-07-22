@@ -27,8 +27,8 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
-use crate::error::{FeriteError, Result};
 use crate::upstream::egress::{EgressConn, EgressConnectError, ProxyHandle};
+use ferrite_core::error::{FeriteError, Result};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     fn egress_field_serde_roundtrips_and_skips_when_none() {
-        use crate::config::UpstreamConfig;
+        use ferrite_core::config::UpstreamConfig;
         let with = UpstreamConfig::Plain {
             address: "10.2.0.1".into(),
             port: 53,

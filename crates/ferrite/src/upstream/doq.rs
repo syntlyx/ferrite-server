@@ -7,8 +7,8 @@ use hickory_resolver::{
     config::{NameServerConfig, ResolverConfig, ResolverOpts},
 };
 
-use crate::error::{FeriteError, Result};
 use crate::upstream::hickory_util;
+use ferrite_core::error::{FeriteError, Result};
 
 /// DNS-over-QUIC upstream resolver (RFC 9250).
 ///

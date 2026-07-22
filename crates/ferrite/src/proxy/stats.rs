@@ -23,7 +23,7 @@ use dashmap::DashMap;
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::config::ProxyConfig;
+use ferrite_core::config::ProxyConfig;
 
 /// Cap on each egress's routed-domain table. Full + new domain → the
 /// least-recently-seen entry is evicted, so the table tracks what the tunnel is
@@ -493,7 +493,7 @@ mod tests {
 
     #[test]
     fn prune_drops_removed_egresses_and_rules() {
-        use crate::config::{EgressConfig, RuleConfig};
+        use ferrite_core::config::{EgressConfig, RuleConfig};
 
         let stats = ProxyStats::default();
         stats.egress("keep").record_connect_fail();

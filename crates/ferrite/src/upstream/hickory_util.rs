@@ -8,7 +8,7 @@ use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use hickory_resolver::TokioResolver;
 use hickory_resolver::net::{DnsError, NetError};
 
-use crate::error::{FeriteError, Result};
+use ferrite_core::error::{FeriteError, Result};
 
 /// Forward `raw` DNS wire bytes through `resolver` and return a wire-format
 /// response with correct flags, EDNS echo, and NXDOMAIN propagation.

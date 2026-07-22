@@ -9,8 +9,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use parking_lot::RwLock;
 use serde::Serialize;
 
-use crate::config::Config;
-use crate::error::Result;
+use ferrite_core::config::Config;
+use ferrite_core::error::Result;
 
 /// The slice of app state the updater needs: the shared check cache plus the
 /// live config (`web_dir` is hot-patchable via the settings API).
@@ -209,7 +209,7 @@ async fn installed_versions_snapshot(
         .read()
         .web_dir
         .clone()
-        .unwrap_or_else(|| crate::config::data_dir().join("web"));
+        .unwrap_or_else(|| ferrite_core::config::data_dir().join("web"));
     let current_web_version = tokio::fs::read_to_string(web_dir.with_extension("version"))
         .await
         .map(|version| normalize_release_version(&version))

@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 
 use crate::api::ApiError;
 use crate::app::AppState;
-use crate::error::FeriteError;
 use crate::updater;
+use ferrite_core::error::FeriteError;
 
 #[derive(Debug, Deserialize, Default)]
 pub struct UpdateCheckQuery {
@@ -71,7 +71,7 @@ pub async fn update_web(State(state): State<AppState>) -> Result<Json<Value>, Ap
         .read()
         .web_dir
         .clone()
-        .unwrap_or_else(|| crate::config::data_dir().join("web"));
+        .unwrap_or_else(|| ferrite_core::config::data_dir().join("web"));
 
     // Read installed version from web.version file if it exists.
     let current_web = tokio::fs::read_to_string(web_dir.with_extension("version"))

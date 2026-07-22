@@ -1,10 +1,10 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::core::types::{QueryEntry, QueryStatus};
 use crate::stats::recent::QueryRingBuffer;
 use crate::stats::timeseries::InMemoryTimeseries;
 use crate::stats::top_list::TopNCounter;
+use ferrite_core::types::{QueryEntry, QueryStatus};
 
 /// In-memory live statistics: lock-free atomic counters in the DNS hot path,
 /// plus top-N accumulators and a recent-query ring buffer updated in the stats writer.

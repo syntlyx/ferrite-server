@@ -8,15 +8,15 @@ use tokio::sync::{Notify, Semaphore, mpsc};
 
 use crate::blocklist::Blocklist;
 use crate::clients::ClientRegistry;
-use crate::config::{Config, CustomRecordConfig};
-use crate::core::types::QueryEntry;
 use crate::dns::cache::DnsCache;
 use crate::dns::custom::CustomRecords;
-use crate::error::Result;
 use crate::stats::CpuSampler;
 use crate::stats::live::LiveStats;
 use crate::storage::{SqliteStorage, Storage};
 use crate::upstream::{UpstreamPool, ZoneRouter};
+use ferrite_core::config::{Config, CustomRecordConfig};
+use ferrite_core::error::Result;
+use ferrite_core::types::QueryEntry;
 
 /// Capacity of the query channel (DNS handler → stats writer).
 const QUERY_CHANNEL_CAPACITY: usize = 8_192;
@@ -136,7 +136,7 @@ impl AppState {
         // Storage
         let storage: Arc<dyn Storage> = SqliteStorage::open(&config.storage.path).await?;
 
-        let data_dir = crate::config::data_dir();
+        let data_dir = ferrite_core::config::data_dir();
 
         // DNS cache
         let dns_cache = Arc::new(DnsCache::new(
@@ -412,7 +412,7 @@ fn panel_ipv4(config: &Config) -> Option<Ipv4Addr> {
         .filter(|ip| !ip.is_unspecified())
         .or_else(|| non_loopback_ipv4(config.api.bind_addr))
         .or_else(|| non_loopback_ipv4(config.dns.bind_addr))
-        .or_else(crate::core::net::local_ipv4_for_internet)
+        .or_else(ferrite_core::net::local_ipv4_for_internet)
         .or_else(|| loopback_ipv4(config.api.bind_addr))
         .or_else(|| loopback_ipv4(config.dns.bind_addr))
 }
@@ -494,9 +494,9 @@ fn trim_env(key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::UpstreamConfig;
-    use crate::core::types::{QueryEntry, QueryStatus};
     use crate::storage::{SqliteStorage, Storage};
+    use ferrite_core::config::UpstreamConfig;
+    use ferrite_core::types::{QueryEntry, QueryStatus};
 
     #[test]
     fn panel_record_uses_configured_ipv4_and_domain() {

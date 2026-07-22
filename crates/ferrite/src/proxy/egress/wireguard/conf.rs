@@ -8,7 +8,7 @@ use std::str::FromStr;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
-use crate::error::{FeriteError, Result};
+use ferrite_core::error::{FeriteError, Result};
 
 /// A parsed WireGuard configuration (the subset ferrite needs to bring up a
 /// userspace client tunnel).

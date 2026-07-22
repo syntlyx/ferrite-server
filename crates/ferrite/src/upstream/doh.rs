@@ -4,7 +4,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use reqwest::Client;
 
-use crate::error::{FeriteError, Result};
+use ferrite_core::error::{FeriteError, Result};
 
 /// DNS-over-HTTPS upstream resolver (RFC 8484).
 ///

@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::api::ApiError;
 use crate::app::AppState;
-use crate::error::FeriteError;
+use ferrite_core::error::FeriteError;
 
 #[derive(Deserialize)]
 pub struct DomainPayload {

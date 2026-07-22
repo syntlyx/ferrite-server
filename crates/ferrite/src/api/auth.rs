@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use crate::api::ApiError;
 use crate::app::AppState;
-use crate::error::FeriteError;
+use ferrite_core::error::FeriteError;
 
 /// Session TTL — 24 hours.
 const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -82,7 +82,7 @@ fn check_login_rate() -> Result<(), FeriteError> {
 // ── Public helpers ────────────────────────────────────────────────────────────
 
 /// Hash a plaintext password with Argon2id. Returns a PHC string.
-pub fn hash_password(password: &str) -> crate::error::Result<String> {
+pub fn hash_password(password: &str) -> ferrite_core::error::Result<String> {
     let mut salt_bytes = [0u8; 16];
     fill_random(&mut salt_bytes)?;
     let salt = SaltString::encode_b64(&salt_bytes)
@@ -187,13 +187,13 @@ pub async fn login(
     })))
 }
 
-fn generate_session_token() -> crate::error::Result<String> {
+fn generate_session_token() -> ferrite_core::error::Result<String> {
     let mut bytes = [0u8; 32];
     fill_random(&mut bytes)?;
     Ok(to_lower_hex(&bytes))
 }
 
-fn fill_random(bytes: &mut [u8]) -> crate::error::Result<()> {
+fn fill_random(bytes: &mut [u8]) -> ferrite_core::error::Result<()> {
     SystemRandom::new()
         .fill(bytes)
         .map_err(|_| FeriteError::Internal("secure random generation failed".into()))

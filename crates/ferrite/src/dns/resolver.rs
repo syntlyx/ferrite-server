@@ -5,7 +5,7 @@ use hickory_resolver::{
 };
 use std::net::IpAddr;
 
-use crate::error::Result;
+use ferrite_core::error::Result;
 
 /// Thin wrapper around `hickory_resolver::TokioResolver`.
 #[allow(dead_code)]

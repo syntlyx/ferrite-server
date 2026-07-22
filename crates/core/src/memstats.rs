@@ -187,6 +187,12 @@ pub fn fd_count() -> Option<usize> {
 mod tests {
     use super::*;
 
+    /// The wrapper only counts when installed as the global allocator. The
+    /// binary installs it in `main.rs`; this test binary installs its own
+    /// (over the system allocator) so the counter tests exercise real traffic.
+    #[global_allocator]
+    static TEST_ALLOC: CountingAlloc<std::alloc::System> = CountingAlloc(std::alloc::System);
+
     #[test]
     fn gauge_counts_guards_across_all_drop_paths() {
         static G: Gauge = Gauge::new();

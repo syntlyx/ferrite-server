@@ -10,11 +10,11 @@ use hickory_proto::rr::rdata::opt::EdnsCode;
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use tokio::sync::mpsc;
 
-use crate::core::net::unmap_v4;
-use crate::core::types::{QueryEntry, QueryStatus};
 use crate::dns::ctx::DnsCtx;
 use crate::dns::types::DnsResponse;
-use crate::error::Result;
+use ferrite_core::error::Result;
+use ferrite_core::net::unmap_v4;
+use ferrite_core::types::{QueryEntry, QueryStatus};
 
 static QUERY_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -578,8 +578,8 @@ mod tests {
     use hickory_proto::rr::{Name, RData, Record, RecordType};
 
     use crate::blocklist::Blocklist;
-    use crate::config::{BlocklistConfig, CustomRecordConfig};
     use crate::test_support;
+    use ferrite_core::config::{BlocklistConfig, CustomRecordConfig};
 
     #[test]
     fn sanitize_query_strips_ecs_and_sets_do() {
@@ -697,7 +697,7 @@ mod tests {
                 client_bypass: vec![],
                 profiles: vec![],
             },
-            crate::config::AllowlistConfig::default(),
+            ferrite_core::config::AllowlistConfig::default(),
             temp_fst_path("ferrite-dns-handler"),
         )
     }
@@ -997,7 +997,7 @@ mod tests {
 
     #[tokio::test]
     async fn routed_domain_is_logged_with_routed_status_and_egress() {
-        use crate::config::{EgressConfig, ProxyConfig, RuleConfig};
+        use ferrite_core::config::{EgressConfig, ProxyConfig, RuleConfig};
 
         let (state, db_path) = test_support::app_state("dns-routed").await;
         let mut proxy_cfg = ProxyConfig {

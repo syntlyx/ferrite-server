@@ -12,9 +12,9 @@ use serde_json::{Value, json};
 
 use crate::api::ApiError;
 use crate::app::AppState;
-use crate::config::{EgressConfig, ProxyConfig};
-use crate::error::FeriteError;
 use crate::proxy::usable_rcvbuf_bytes;
+use ferrite_core::config::{EgressConfig, ProxyConfig};
+use ferrite_core::error::FeriteError;
 
 /// GET /api/proxy — current config (socks5 passwords redacted) + egress health.
 pub async fn get_proxy(State(state): State<AppState>) -> Json<Value> {
@@ -342,7 +342,7 @@ fn match_prev<'a>(old: &'a ProxyConfig, e: &EgressConfig, id: &str) -> Option<&'
 fn persist(state: &AppState) -> Option<String> {
     let cfg = state.live_config.read().clone();
     let path = state.config_path.as_ref().clone().or_else(|| {
-        crate::config::Config::config_candidates()
+        ferrite_core::config::Config::config_candidates()
             .into_iter()
             .next()
     })?;
@@ -364,10 +364,10 @@ fn bad(msg: &str) -> ApiError {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{EgressConfig, RuleConfig};
     use crate::test_support;
     use axum::Json;
     use axum::extract::State;
+    use ferrite_core::config::{EgressConfig, RuleConfig};
 
     use super::*;
 

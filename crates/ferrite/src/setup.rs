@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::config::{Config, ZoneConfig};
+use ferrite_core::config::{Config, ZoneConfig};
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -48,7 +48,7 @@ pub fn cmd_setup() -> anyhow::Result<()> {
     let config_path = Config::config_candidates()
         .into_iter()
         .find(|p| p.exists())
-        .unwrap_or_else(|| crate::config::config_dir().join("config.toml"));
+        .unwrap_or_else(|| ferrite_core::config::config_dir().join("config.toml"));
 
     if config_path.exists() {
         let raw = std::fs::read_to_string(&config_path)?;
@@ -112,7 +112,7 @@ struct NetworkInfo {
 }
 
 fn detect_network() -> NetworkInfo {
-    let local_ipv4 = crate::core::net::local_ipv4_for_internet();
+    let local_ipv4 = ferrite_core::net::local_ipv4_for_internet();
     let ipv4_prefix = local_ipv4.and_then(detect_ipv4_prefix).unwrap_or(24);
     let local_ipv6 = detect_ipv6_addrs();
     let gateway = detect_gateway();

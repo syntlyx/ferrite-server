@@ -4,7 +4,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
 use crate::dns::ctx::DnsCtx;
-use crate::error::FeriteError;
+use ferrite_core::error::FeriteError;
 
 /// Maximum DNS UDP payload (EDNS0).
 const MAX_UDP_PAYLOAD: usize = 4096;
@@ -145,7 +145,7 @@ fn truncate_response(resp: &[u8]) -> Vec<u8> {
     out[9] = 0; // NSCOUNT = 0
     out[10] = 0;
     out[11] = 0; // ARCOUNT = 0
-    match crate::core::types::question_end(resp) {
+    match ferrite_core::types::question_end(resp) {
         Some(end) => out.extend_from_slice(&resp[12..end]),
         // No parseable question — keep the header consistent by zeroing QDCOUNT.
         None => {
@@ -288,7 +288,7 @@ mod udp_tests {
         // A "response": query bytes with QR set and a fake oversized answer tail.
         let mut resp = query_no_edns();
         resp[2] |= 0x80; // QR
-        let q_end = crate::core::types::question_end(&resp).unwrap();
+        let q_end = ferrite_core::types::question_end(&resp).unwrap();
         resp.truncate(q_end);
         resp.extend_from_slice(&[0xFF; 200]); // pretend answer payload
 

@@ -25,9 +25,9 @@ use std::time::Duration;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
 
-use crate::config::EgressConfig;
-use crate::error::{FeriteError, Result};
 use crate::upstream::ZoneRouter;
+use ferrite_core::config::EgressConfig;
+use ferrite_core::error::{FeriteError, Result};
 
 pub use crate::upstream::EgressConn;
 

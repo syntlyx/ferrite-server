@@ -7,7 +7,7 @@ use reqwest::{Client, Url};
 
 use crate::blocklist::ListPolarity;
 use crate::blocklist::parser::{self, AdblockStats};
-use crate::error::{FeriteError, Result};
+use ferrite_core::error::{FeriteError, Result};
 
 /// Standard error message returned when a user-submitted blocklist URL fails
 /// validation. Kept as a constant so the API and tests share one wording.

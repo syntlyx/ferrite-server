@@ -180,7 +180,7 @@ async fn accept_loop(
 }
 
 async fn handle(mut client: TcpStream, ctx: ProxyCtx, proto: Protocol) -> std::io::Result<()> {
-    let _live = crate::memstats::PROXY_CONNS.guard();
+    let _live = ferrite_core::memstats::PROXY_CONNS.guard();
     enable_keepalive(&client);
 
     // Peek the destination host from the first bytes.

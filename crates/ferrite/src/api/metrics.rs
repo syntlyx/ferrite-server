@@ -21,7 +21,7 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 
 use crate::app::AppState;
-use crate::memstats;
+use ferrite_core::memstats;
 
 const CONTENT_TYPE_PROM: &str = "text/plain; version=0.0.4; charset=utf-8";
 
@@ -422,8 +422,8 @@ fn escape_label(v: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{EgressConfig, ProxyConfig, RuleConfig};
     use crate::test_support;
+    use ferrite_core::config::{EgressConfig, ProxyConfig, RuleConfig};
 
     #[test]
     fn label_values_are_escaped() {

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::error::{FeriteError, Result};
+use ferrite_core::error::{FeriteError, Result};
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, bytes);

@@ -6,10 +6,10 @@ use tokio::sync::{Notify, mpsc};
 use tokio::time::timeout;
 
 use crate::clients::ClientRegistry;
-use crate::core::net::parse_ip;
-use crate::core::types::QueryEntry;
 use crate::stats::live::LiveStats;
 use crate::storage::Storage;
+use ferrite_core::net::parse_ip;
+use ferrite_core::types::QueryEntry;
 
 const BATCH_SIZE: usize = 500;
 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);

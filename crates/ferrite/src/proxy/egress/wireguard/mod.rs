@@ -45,9 +45,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::timeout;
 
-use crate::config::EgressConfig;
-use crate::error::{FeriteError, Result};
 use crate::upstream::ZoneRouter;
+use ferrite_core::config::EgressConfig;
+use ferrite_core::error::{FeriteError, Result};
 
 use device::WgDevice;
 
@@ -527,7 +527,7 @@ struct Conn {
     local_port: u16,
     /// Keeps the global WG-connection gauge honest: dropped on reap, close, or
     /// whole-tunnel teardown alike.
-    _live: crate::memstats::GaugeGuard,
+    _live: ferrite_core::memstats::GaugeGuard,
     /// Held open until the connect resolves: fired `Ok` once ESTABLISHED, or `Err`
     /// on refusal / [`WG_CONNECT_TIMEOUT`]. Deferring the reply (instead of acking
     /// the SYN immediately) means a dead destination fails fast rather than hanging
@@ -907,7 +907,7 @@ fn open_conn(
             local_port,
             connect_reply: Some(reply),
             connect_deadline: Instant::now() + WG_CONNECT_TIMEOUT,
-            _live: crate::memstats::WG_CONNS.guard(),
+            _live: ferrite_core::memstats::WG_CONNS.guard(),
         },
     );
 
@@ -1273,8 +1273,8 @@ mod smoke {
     //! It proves the layers a unit test can't: the boringtun handshake against a
     //! real peer, and a TCP byte exchange routed all the way through the tunnel.
     use super::*;
-    use crate::config::{EgressConfig, UpstreamConfig};
     use crate::upstream::{UpstreamPool, ZoneRouter, no_proxy};
+    use ferrite_core::config::{EgressConfig, UpstreamConfig};
 
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::{Name, RData, RecordType};

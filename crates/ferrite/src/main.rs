@@ -2,12 +2,7 @@ mod api;
 mod app;
 mod blocklist;
 mod clients;
-mod config;
-mod core;
 mod dns;
-mod error;
-mod logbuf;
-mod memstats;
 mod proxy;
 mod setup;
 mod snapshot;
@@ -20,6 +15,8 @@ mod upstream;
 mod web;
 
 use std::{sync::Arc, time::Duration};
+
+use ferrite_core::{config, logbuf, memstats};
 
 /// mimalloc instead of the platform malloc: musl's allocator retains freed
 /// pages and fragments badly under threads, which read as an unbounded "leak"

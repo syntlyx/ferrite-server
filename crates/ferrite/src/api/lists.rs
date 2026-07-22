@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 use crate::api::ApiError;
 use crate::app::AppState;
 use crate::blocklist::{AdblockStats, Blocklist};
-use crate::config::ListConfig;
-use crate::error::FeriteError;
+use ferrite_core::config::ListConfig;
+use ferrite_core::error::FeriteError;
 
 /// `ListConfig` enriched with the live domain count from the last refresh, plus
 /// the Adblock parse breakdown for Adblock-format lists (absent otherwise).
@@ -144,7 +144,7 @@ async fn sync_lists_to_config(state: &AppState) {
 
     let cfg = state.live_config.read().clone();
     let path = state.config_path.as_ref().clone().or_else(|| {
-        crate::config::Config::config_candidates()
+        ferrite_core::config::Config::config_candidates()
             .into_iter()
             .next()
     });

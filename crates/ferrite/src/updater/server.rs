@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 
-use crate::error::{FeriteError, Result};
 use crate::updater::checksum;
 use crate::updater::github::{
     HTTP_CLIENT, RELEASE_OWNER, RELEASE_REPO_SERVER, current_platform_target, fetch_latest_release,
     resolve_asset_sha256, update_available, with_release_auth,
 };
+use ferrite_core::error::{FeriteError, Result};
 
 /// Information about an available update.
 pub struct UpdateInfo {

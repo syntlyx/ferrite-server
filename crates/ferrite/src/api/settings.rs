@@ -8,10 +8,10 @@ use std::collections::BTreeSet;
 use crate::api::ApiError;
 use crate::api::auth::hash_password;
 use crate::app::AppState;
-use crate::config::{UpstreamConfig, ZoneConfig};
-use crate::core::net::normalize_client_key;
 use crate::dns::cache::{MAX_TTL, MIN_TTL};
-use crate::error::FeriteError;
+use ferrite_core::config::{UpstreamConfig, ZoneConfig};
+use ferrite_core::error::FeriteError;
+use ferrite_core::net::normalize_client_key;
 
 /// GET /api/settings — return the current live configuration.
 /// `api_key` and `password_hash`: `"***"` if non-empty, `null` if not — always present.
@@ -364,7 +364,7 @@ pub async fn update_settings(
     if let Some(debug) = debug_logging_to_apply
         && std::env::var_os("RUST_LOG").is_none()
     {
-        crate::logbuf::set_debug(debug);
+        ferrite_core::logbuf::set_debug(debug);
     }
 
     let all_changed = hot_changed.len() + restart_changed.len();
@@ -430,7 +430,7 @@ async fn persist_config(state: &AppState) -> Option<String> {
     let cfg = state.live_config.read().clone();
 
     let path = state.config_path.as_ref().clone().or_else(|| {
-        crate::config::Config::config_candidates()
+        ferrite_core::config::Config::config_candidates()
             .into_iter()
             .next()
     })?;
@@ -455,8 +455,8 @@ async fn persist_config(state: &AppState) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use crate::test_support;
+    use ferrite_core::config::Config;
 
     #[tokio::test]
     async fn get_settings_masks_secret_fields_but_keeps_shape_stable() {

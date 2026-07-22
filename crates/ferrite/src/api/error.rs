@@ -1,6 +1,6 @@
 use axum::{http::StatusCode, response::IntoResponse};
 
-use crate::error::FeriteError;
+use ferrite_core::error::FeriteError;
 
 /// Wrapper that converts `FeriteError` into an appropriate HTTP response.
 /// Used as the `E` type in all `Result<Json<_>, ApiError>` handler return types.

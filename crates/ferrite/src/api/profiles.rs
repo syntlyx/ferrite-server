@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 
 use crate::api::ApiError;
 use crate::app::AppState;
-use crate::config::BlocklistProfileConfig;
-use crate::error::FeriteError;
+use ferrite_core::config::BlocklistProfileConfig;
+use ferrite_core::error::FeriteError;
 
 /// GET /api/blocklist/profiles — the configured profiles plus the blocklist and
 /// allowlist names available to build them from (so the UI can offer checkboxes).
@@ -150,7 +150,7 @@ fn slugify(s: &str) -> String {
 async fn persist(state: &AppState) -> Option<String> {
     let cfg = state.live_config.read().clone();
     let path = state.config_path.as_ref().clone().or_else(|| {
-        crate::config::Config::config_candidates()
+        ferrite_core::config::Config::config_candidates()
             .into_iter()
             .next()
     })?;
@@ -195,7 +195,7 @@ mod tests {
         state
             .inner
             .blocklist
-            .add_allow_list(crate::config::ListConfig {
+            .add_allow_list(ferrite_core::config::ListConfig {
                 name: "KidSafe".into(),
                 url: "https://x.test/kidsafe".into(),
                 enabled: true,
@@ -247,7 +247,7 @@ mod tests {
             .write()
             .blocklist
             .lists
-            .push(crate::config::ListConfig {
+            .push(ferrite_core::config::ListConfig {
                 name: "Ads".into(),
                 url: "https://x.test/ads".into(),
                 enabled: true,
@@ -255,7 +255,7 @@ mod tests {
         state
             .inner
             .blocklist
-            .add_list(crate::config::ListConfig {
+            .add_list(ferrite_core::config::ListConfig {
                 name: "Ads".into(),
                 url: "https://x.test/ads".into(),
                 enabled: true,

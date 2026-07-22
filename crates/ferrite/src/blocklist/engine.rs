@@ -11,9 +11,9 @@ use regex::Regex;
 use crate::blocklist::cache::BlocklistCache;
 use crate::blocklist::loader::{self, FstMap};
 use crate::blocklist::{AdblockStats, ListPolarity, refresh};
-use crate::config::{AllowlistConfig, BlocklistConfig, ListConfig};
-use crate::core::net::normalize_client_key;
-use crate::error::{FeriteError, Result};
+use ferrite_core::config::{AllowlistConfig, BlocklistConfig, ListConfig};
+use ferrite_core::error::{FeriteError, Result};
+use ferrite_core::net::normalize_client_key;
 
 /// What [`refresh_list_set`] hands back: the merged FST, per-list domain
 /// counts, per-list Adblock parse stats, and the merged unique-domain count.
@@ -195,7 +195,7 @@ pub struct Blocklist {
     profiles: ArcSwap<Vec<Arc<CompiledProfile>>>,
     /// Source of truth for [`Self::rebuild_profiles`]; the compiled `profiles`
     /// above are derived from this plus the per-list disk caches.
-    profiles_config: RwLock<Vec<crate::config::BlocklistProfileConfig>>,
+    profiles_config: RwLock<Vec<ferrite_core::config::BlocklistProfileConfig>>,
     client_bypass: ArcSwap<HashSet<String>>,
     whitelist: RwLock<HashSet<String>>,
     /// Wildcard entries for the whitelist, e.g. `*.safe.example.com`.
@@ -684,7 +684,7 @@ impl Blocklist {
 
     /// Replace the profile set and rebuild their FSTs from the on-disk per-list
     /// caches. Used by the API after a config change; persists nothing itself.
-    pub fn set_profiles(&self, profiles: Vec<crate::config::BlocklistProfileConfig>) {
+    pub fn set_profiles(&self, profiles: Vec<ferrite_core::config::BlocklistProfileConfig>) {
         self.has_profiles
             .store(!profiles.is_empty(), Ordering::Relaxed);
         *self.profiles_config.write() = profiles;
@@ -692,7 +692,7 @@ impl Blocklist {
     }
 
     /// Current profile configs (for the API to echo back / persist).
-    pub fn get_profiles(&self) -> Vec<crate::config::BlocklistProfileConfig> {
+    pub fn get_profiles(&self) -> Vec<ferrite_core::config::BlocklistProfileConfig> {
         self.profiles_config.read().clone()
     }
 
@@ -1360,7 +1360,7 @@ async fn refresh_list_set(
 /// themselves mmap'd from `profile_<id>.fst` files (kept off anonymous RSS,
 /// like the global FST).
 fn compile_profiles(
-    configs: &[crate::config::BlocklistProfileConfig],
+    configs: &[ferrite_core::config::BlocklistProfileConfig],
     list_cache_dir: &Path,
     allow_cache_dir: &Path,
 ) -> Vec<Arc<CompiledProfile>> {
@@ -1620,7 +1620,7 @@ mod tests {
 
     #[test]
     fn per_device_profile_applies_a_list_subset_to_matched_clients() {
-        use crate::config::BlocklistProfileConfig;
+        use ferrite_core::config::BlocklistProfileConfig;
 
         let fst_path = temp_fst_path("ferrite-blocklist-profiles");
         let cache_dir = fst_path.parent().unwrap().join("lists");
@@ -1717,7 +1717,7 @@ mod tests {
 
     #[test]
     fn per_profile_manual_rules_override_global() {
-        use crate::config::BlocklistProfileConfig;
+        use ferrite_core::config::BlocklistProfileConfig;
 
         let fst_path = temp_fst_path("ferrite-blocklist-profile-overrides");
         let cache_dir = fst_path.parent().unwrap().join("lists");
@@ -2078,7 +2078,7 @@ mod tests {
 
     #[tokio::test]
     async fn profile_block_overrides_subscribed_allowlist() {
-        use crate::config::BlocklistProfileConfig;
+        use ferrite_core::config::BlocklistProfileConfig;
 
         let fst_path = temp_fst_path("ferrite-allowlist-profile-block");
         let dir = fst_path.parent().unwrap().to_path_buf();
@@ -2240,7 +2240,7 @@ mod tests {
 
     #[tokio::test]
     async fn default_deny_blocks_everything_except_allow_tiers() {
-        use crate::config::BlocklistProfileConfig;
+        use ferrite_core::config::BlocklistProfileConfig;
 
         let fst_path = temp_fst_path("ferrite-default-deny");
         let dir = fst_path.parent().unwrap().to_path_buf();
@@ -2300,7 +2300,7 @@ mod tests {
 
     #[tokio::test]
     async fn default_deny_exempts_local_infra_but_not_from_blacklist() {
-        use crate::config::BlocklistProfileConfig;
+        use ferrite_core::config::BlocklistProfileConfig;
 
         let blocklist = Blocklist::new(
             BlocklistConfig {
@@ -2361,7 +2361,7 @@ mod tests {
 
     #[tokio::test]
     async fn profile_allowlist_subset_overrides_the_global_allow_set() {
-        use crate::config::BlocklistProfileConfig;
+        use ferrite_core::config::BlocklistProfileConfig;
 
         let fst_path = temp_fst_path("ferrite-profile-allowlist-subset");
         let dir = fst_path.parent().unwrap().to_path_buf();

@@ -2,12 +2,12 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::error::{FeriteError, Result};
 use crate::updater::checksum;
 use crate::updater::github::{
     HTTP_CLIENT, RELEASE_OWNER, RELEASE_REPO_WEB, fetch_asset_text, fetch_releases, parse_semver,
     resolve_asset_sha256, update_available, with_release_auth,
 };
+use ferrite_core::error::{FeriteError, Result};
 
 const WEB_RELEASE_SCAN_LIMIT: usize = 20;
 const WEB_MANIFEST_ASSET: &str = "dist.manifest.json";

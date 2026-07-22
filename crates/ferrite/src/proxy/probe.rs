@@ -16,7 +16,7 @@
 use std::time::{Duration, Instant};
 
 use super::ProxyCtx;
-use crate::config::DEFAULT_PROBE_TARGET;
+use ferrite_core::config::DEFAULT_PROBE_TARGET;
 
 /// How often each egress is probed.
 const PROBE_INTERVAL: Duration = Duration::from_secs(30);

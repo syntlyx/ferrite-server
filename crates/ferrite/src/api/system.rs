@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::api::ApiError;
 use crate::app::AppState;
-use crate::error::FeriteError;
+use ferrite_core::error::FeriteError;
 
 /// Cache TTL for system stats — sysinfo is expensive (200ms sleep + hwmon reads).
 const SYSTEM_STATS_TTL: Duration = Duration::from_secs(3);
@@ -62,24 +62,24 @@ pub async fn get_system_stats(State(state): State<AppState>) -> Result<Json<Valu
 /// arena slice usage. Watch its trend, never subtract it from RSS.
 fn ferrite_internals(state: &AppState) -> Value {
     let (ptr_cache, ip_to_mac) = state.inner.client_registry.cache_sizes();
-    let rss = crate::memstats::smaps_rollup();
-    let alloc = crate::memstats::mimalloc_commit();
+    let rss = ferrite_core::memstats::smaps_rollup();
+    let alloc = ferrite_core::memstats::mimalloc_commit();
     serde_json::json!({
-        "heap_live_bytes": crate::memstats::heap_live_bytes(),
-        "heap_peak_bytes": crate::memstats::heap_peak_bytes(),
+        "heap_live_bytes": ferrite_core::memstats::heap_live_bytes(),
+        "heap_peak_bytes": ferrite_core::memstats::heap_peak_bytes(),
         "mimalloc_commit_bytes": alloc.commit_bytes,
         "mimalloc_commit_peak_bytes": alloc.commit_peak_bytes,
         "rss_bytes": rss.as_ref().map(|r| r.rss_bytes),
         "rss_anonymous_bytes": rss.as_ref().map(|r| r.anonymous_bytes),
-        "fd_count": crate::memstats::fd_count(),
+        "fd_count": ferrite_core::memstats::fd_count(),
         "dns_cache": {
             "entries": state.inner.dns_cache.len(),
             "bytes":   state.inner.dns_cache.bytes(),
         },
         "blocklist_decision_cache_entries": state.inner.blocklist.decision_cache_entries(),
         "client_registry": { "ptr_cache": ptr_cache, "ip_to_mac": ip_to_mac },
-        "proxy_active_connections": crate::memstats::PROXY_CONNS.get(),
-        "wg_virtual_connections":   crate::memstats::WG_CONNS.get(),
+        "proxy_active_connections": ferrite_core::memstats::PROXY_CONNS.get(),
+        "wg_virtual_connections":   ferrite_core::memstats::WG_CONNS.get(),
         "sessions": state.sessions.len(),
     })
 }

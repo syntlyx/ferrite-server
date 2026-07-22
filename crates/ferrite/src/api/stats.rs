@@ -11,9 +11,9 @@ use serde_json::Value;
 use crate::api::ApiError;
 use crate::app::AppState;
 use crate::clients::ClientRegistry;
-use crate::core::net::parse_ip;
-use crate::core::types::TimeseriesBucket;
-use crate::core::types::{QueryEntry, QueryStatus};
+use ferrite_core::net::parse_ip;
+use ferrite_core::types::TimeseriesBucket;
+use ferrite_core::types::{QueryEntry, QueryStatus};
 
 // ── Response types ────────────────────────────────────────────────────────────
 

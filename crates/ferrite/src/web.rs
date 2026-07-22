@@ -17,7 +17,7 @@ pub async fn static_handler(uri: Uri, State(state): State<AppState>) -> Response
         .read()
         .web_dir
         .clone()
-        .unwrap_or_else(|| crate::config::data_dir().join("web"));
+        .unwrap_or_else(|| ferrite_core::config::data_dir().join("web"));
 
     let rel = uri.path().trim_start_matches('/');
     let rel = if rel.is_empty() { "index.html" } else { rel };

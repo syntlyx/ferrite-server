@@ -9,9 +9,9 @@ use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinEncodable;
 use parking_lot::RwLock;
 
-use crate::config::CustomRecordConfig;
 use crate::dns::types::DnsResponse;
-use crate::error::{FeriteError, Result};
+use ferrite_core::config::CustomRecordConfig;
+use ferrite_core::error::{FeriteError, Result};
 
 /// One parsed custom DNS record stored in memory.
 #[derive(Debug, Clone)]

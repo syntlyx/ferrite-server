@@ -4,8 +4,8 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
-use crate::error::{FeriteError, Result};
 use crate::upstream::stream::StreamPool;
+use ferrite_core::error::{FeriteError, Result};
 
 const UDP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Max DNS message size over UDP (EDNS0).
@@ -166,7 +166,7 @@ fn response_matches_query(query: &[u8], response: &[u8]) -> bool {
         return false;
     }
     // Compare the question section verbatim.
-    match crate::core::types::question_end(query) {
+    match ferrite_core::types::question_end(query) {
         Some(end) => response.len() >= end && query[12..end] == response[12..end],
         // No question to compare (qdcount 0 or malformed query): the header
         // checks above are all we can assert.

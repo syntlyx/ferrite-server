@@ -24,8 +24,8 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 
-use crate::error::{FeriteError, Result};
 use crate::upstream::tunneled::client_config;
+use ferrite_core::error::{FeriteError, Result};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const IO_TIMEOUT: Duration = Duration::from_secs(8);

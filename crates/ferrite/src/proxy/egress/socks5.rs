@@ -11,8 +11,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-use crate::config::EgressConfig;
-use crate::error::{FeriteError, Result};
+use ferrite_core::config::EgressConfig;
+use ferrite_core::error::{FeriteError, Result};
 
 use super::{ConnectError, enable_keepalive};
 

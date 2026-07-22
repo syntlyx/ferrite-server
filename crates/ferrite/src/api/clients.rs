@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::api::ApiError;
 use crate::app::AppState;
 use crate::clients::ClientRegistry;
-use crate::core::net::{format_mac, parse_ip, parse_mac};
+use ferrite_core::net::{format_mac, parse_ip, parse_mac};
 
 #[derive(Deserialize, Default)]
 pub struct ListClientsParams {
@@ -168,7 +168,7 @@ pub async fn add_alias(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let name = payload.name.trim().to_string();
     if name.is_empty() {
-        return Err(ApiError(crate::error::FeriteError::Config(
+        return Err(ApiError(ferrite_core::error::FeriteError::Config(
             "name must not be empty".into(),
         )));
     }
@@ -176,7 +176,9 @@ pub async fn add_alias(
     match (payload.ip, payload.mac) {
         (Some(ip_str), None) => {
             let ip = parse_ip(&ip_str)
-                .ok_or_else(|| crate::error::FeriteError::Config(format!("invalid IP: {}", ip_str)))
+                .ok_or_else(|| {
+                    ferrite_core::error::FeriteError::Config(format!("invalid IP: {}", ip_str))
+                })
                 .map_err(ApiError)?;
             state
                 .inner
@@ -192,7 +194,7 @@ pub async fn add_alias(
         (None, Some(mac_str)) => {
             let mac = parse_mac(&mac_str)
                 .ok_or_else(|| {
-                    crate::error::FeriteError::Config(format!("invalid MAC: {}", mac_str))
+                    ferrite_core::error::FeriteError::Config(format!("invalid MAC: {}", mac_str))
                 })
                 .map_err(ApiError)?;
             state
@@ -206,7 +208,7 @@ pub async fn add_alias(
                 Json(json!({ "mac": format_mac(&mac), "name": name, "type": "mac" })),
             ))
         }
-        _ => Err(ApiError(crate::error::FeriteError::Config(
+        _ => Err(ApiError(ferrite_core::error::FeriteError::Config(
             "provide exactly one of 'ip' or 'mac'".into(),
         ))),
     }
@@ -224,7 +226,7 @@ pub async fn client_ip_stats(
         .client_stats(&device)
         .await?
         .ok_or_else(|| {
-            ApiError(crate::error::FeriteError::NotFound(format!(
+            ApiError(ferrite_core::error::FeriteError::NotFound(format!(
                 "client '{}' not found",
                 device
             )))
@@ -264,7 +266,7 @@ pub async fn remove_alias(
         return Ok(Json(json!({ "ip": ip.to_string(), "status": "removed" })));
     }
 
-    Err(ApiError(crate::error::FeriteError::Config(format!(
+    Err(ApiError(ferrite_core::error::FeriteError::Config(format!(
         "'{}' is neither a valid IP nor a MAC address",
         key_str
     ))))

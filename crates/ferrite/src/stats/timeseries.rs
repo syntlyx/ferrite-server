@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use parking_lot::Mutex;
 
-use crate::core::types::{QueryStatus, TimeseriesBucket};
+use ferrite_core::types::{QueryStatus, TimeseriesBucket};
 
 /// Rolling 24-hour timeseries with 10-minute bucket granularity, kept in memory.
 /// Updated on every query; read on dashboard polls.
