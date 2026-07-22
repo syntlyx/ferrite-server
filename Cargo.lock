@@ -750,6 +750,7 @@ dependencies = [
  "ferrite-blocklist",
  "ferrite-clients",
  "ferrite-core",
+ "ferrite-stats",
  "ferrite-storage",
  "ferrite-upstream",
  "flate2",
@@ -844,6 +845,21 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "ferrite-stats"
+version = "0.1.7"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "ferrite-clients",
+ "ferrite-core",
+ "ferrite-storage",
+ "parking_lot",
+ "sysinfo",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

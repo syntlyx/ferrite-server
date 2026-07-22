@@ -4,7 +4,6 @@ mod dns;
 mod proxy;
 mod setup;
 mod snapshot;
-mod stats;
 #[cfg(test)]
 mod test_support;
 mod updater;
@@ -270,7 +269,7 @@ async fn run() -> anyhow::Result<()> {
     let result = tokio::try_join!(
         dns::server::run(Arc::new(state.dns_ctx())),
         api::serve(state.clone()),
-        stats::writer::run(state.writer_ctx(), query_rx),
+        ferrite_stats::writer::run(state.writer_ctx(), query_rx),
         updater::check_loop(state.updater_ctx()),
         periodic_snapshot(
             Arc::clone(&state.inner.dns_cache),
@@ -290,7 +289,7 @@ async fn run() -> anyhow::Result<()> {
 /// Save a snapshot every 5 minutes so a crash loses at most 5 min of cache.
 async fn periodic_snapshot(
     dns_cache: Arc<dns::cache::DnsCache>,
-    live: Arc<stats::live::LiveStats>,
+    live: Arc<ferrite_stats::live::LiveStats>,
     path: std::path::PathBuf,
 ) -> anyhow::Result<()> {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5 * 60));

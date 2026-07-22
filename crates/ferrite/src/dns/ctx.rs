@@ -8,11 +8,11 @@ use tokio::sync::{Semaphore, mpsc};
 use crate::dns::cache::DnsCache;
 use crate::dns::custom::CustomRecords;
 use crate::dns::intercept::DnsInterceptor;
-use crate::stats::live::LiveStats;
 use ferrite_blocklist::Blocklist;
 use ferrite_clients::ClientRegistry;
 use ferrite_core::config::DnsConfig;
 use ferrite_core::types::QueryEntry;
+use ferrite_stats::live::LiveStats;
 use ferrite_upstream::ZoneRouter;
 
 /// Everything the DNS servers and the per-query pipeline need. Built once at

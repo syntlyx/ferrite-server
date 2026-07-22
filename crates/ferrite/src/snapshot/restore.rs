@@ -3,8 +3,8 @@ use std::sync::atomic::Ordering;
 
 use crate::dns::cache::DnsCache;
 use crate::snapshot::{SNAPSHOT_MAGIC, SNAPSHOT_VERSION, StateSnapshot};
-use crate::stats::live::LiveStats;
 use ferrite_core::error::Result;
+use ferrite_stats::live::LiveStats;
 
 /// Deserialize a `StateSnapshot` from `path`.
 /// Returns `Ok(None)` if the file doesn't exist.

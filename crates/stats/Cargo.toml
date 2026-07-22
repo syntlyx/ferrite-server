@@ -1,0 +1,17 @@
+[package]
+name = "ferrite-stats"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ferrite-core.workspace = true
+ferrite-clients.workspace = true
+ferrite-storage.workspace = true
+
+anyhow.workspace = true
+chrono.workspace = true
+parking_lot.workspace = true
+sysinfo.workspace = true
+tokio.workspace = true
+tracing.workspace = true

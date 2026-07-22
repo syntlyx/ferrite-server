@@ -32,6 +32,12 @@ pub struct CpuSampler {
     cached_global_cpu: AtomicU32,
 }
 
+impl Default for CpuSampler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CpuSampler {
     pub fn new() -> Self {
         // sysinfo keeps an open /proc/<pid>/stat handle per refreshed process

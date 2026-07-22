@@ -3,8 +3,8 @@ use std::sync::atomic::Ordering;
 
 use crate::dns::cache::DnsCache;
 use crate::snapshot::{DnsCacheEntry, SNAPSHOT_MAGIC, SNAPSHOT_VERSION, StateSnapshot};
-use crate::stats::live::LiveStats;
 use ferrite_core::error::Result;
+use ferrite_stats::live::LiveStats;
 
 /// Build a `StateSnapshot` from the DNS cache and live stats counters.
 pub fn build_snapshot(dns_cache: &DnsCache, live: &LiveStats) -> StateSnapshot {

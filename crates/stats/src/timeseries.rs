@@ -10,6 +10,12 @@ pub struct InMemoryTimeseries {
     buckets: Mutex<HashMap<u64, TimeseriesBucket>>,
 }
 
+impl Default for InMemoryTimeseries {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InMemoryTimeseries {
     pub fn new() -> Self {
         Self {

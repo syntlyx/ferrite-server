@@ -8,13 +8,13 @@ use tokio::sync::{Notify, Semaphore, mpsc};
 
 use crate::dns::cache::DnsCache;
 use crate::dns::custom::CustomRecords;
-use crate::stats::CpuSampler;
-use crate::stats::live::LiveStats;
 use ferrite_blocklist::Blocklist;
 use ferrite_clients::ClientRegistry;
 use ferrite_core::config::{Config, CustomRecordConfig};
 use ferrite_core::error::Result;
 use ferrite_core::types::QueryEntry;
+use ferrite_stats::CpuSampler;
+use ferrite_stats::live::LiveStats;
 use ferrite_storage::{SqliteStorage, Storage};
 use ferrite_upstream::{UpstreamPool, ZoneRouter};
 
@@ -80,8 +80,8 @@ pub struct AppState {
 impl AppState {
     /// The slice of state the stats writer consumes (everything but the
     /// pipeline receiver, which `main` takes out of `query_rx` once).
-    pub fn writer_ctx(&self) -> crate::stats::writer::WriterCtx {
-        crate::stats::writer::WriterCtx {
+    pub fn writer_ctx(&self) -> ferrite_stats::writer::WriterCtx {
+        ferrite_stats::writer::WriterCtx {
             live_stats: Arc::clone(&self.inner.live_stats),
             client_registry: Arc::clone(&self.inner.client_registry),
             storage: Arc::clone(&self.inner.storage),
