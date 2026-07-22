@@ -6,13 +6,13 @@ use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::{Notify, Semaphore, mpsc};
 
-use crate::dns::cache::DnsCache;
-use crate::dns::custom::CustomRecords;
 use ferrite_blocklist::Blocklist;
 use ferrite_clients::ClientRegistry;
 use ferrite_core::config::{Config, CustomRecordConfig};
 use ferrite_core::error::Result;
 use ferrite_core::types::QueryEntry;
+use ferrite_dns::cache::DnsCache;
+use ferrite_dns::custom::CustomRecords;
 use ferrite_stats::CpuSampler;
 use ferrite_stats::live::LiveStats;
 use ferrite_storage::{SqliteStorage, Storage};
@@ -100,11 +100,11 @@ impl AppState {
 
     /// The slice of state the DNS pipeline consumes (UDP/TCP servers + the
     /// per-query handler).
-    pub fn dns_ctx(&self) -> crate::dns::ctx::DnsCtx {
+    pub fn dns_ctx(&self) -> ferrite_dns::ctx::DnsCtx {
         // Bind as a concrete Arc first so the unsized coercion to the trait
         // object happens at the field, not inside `Arc::clone`'s inference.
         let interceptor = Arc::clone(&self.inner.proxy);
-        crate::dns::ctx::DnsCtx {
+        ferrite_dns::ctx::DnsCtx {
             dns_config: self.inner.config.dns.clone(),
             dns_cache: Arc::clone(&self.inner.dns_cache),
             blocklist: Arc::clone(&self.inner.blocklist),
@@ -268,7 +268,7 @@ impl AppState {
             Ok(mut entries) => {
                 tracing::info!("seeded recent_queries with {} entries", entries.len());
                 if let Some(max_id) = entries.iter().map(|e| e.id).max() {
-                    crate::dns::handler::seed_query_counter(max_id);
+                    ferrite_dns::handler::seed_query_counter(max_id);
                 }
                 entries.reverse(); // query_range returns newest-first; ring buffer needs oldest-first
                 live_stats.recent_queries.seed(entries);

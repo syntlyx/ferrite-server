@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
-use crate::dns::ctx::DnsCtx;
+use crate::ctx::DnsCtx;
 use ferrite_core::error::FeriteError;
 
 /// Maximum DNS UDP payload (EDNS0).
@@ -27,7 +27,7 @@ pub async fn run(ctx: Arc<DnsCtx>) -> anyhow::Result<()> {
     tracing::info!("DNS server listening on {}", bind_addr);
 
     // Cache janitor.
-    tokio::spawn(crate::dns::cache::janitor(Arc::clone(&ctx.dns_cache)));
+    tokio::spawn(crate::cache::janitor(Arc::clone(&ctx.dns_cache)));
 
     tokio::try_join!(udp_loop(udp, Arc::clone(&ctx)), tcp_loop(tcp, ctx))?;
 
@@ -94,7 +94,7 @@ async fn udp_loop(socket: UdpSocket, ctx: Arc<DnsCtx>) -> anyhow::Result<()> {
             // Capture the client's advertised UDP buffer size before `raw` is
             // moved into the handler (512 without EDNS0, larger if advertised).
             let max_udp = client_udp_payload(&raw);
-            match crate::dns::handler::handle_query(raw, src, Arc::clone(&ctx)).await {
+            match crate::handler::handle_query(raw, src, Arc::clone(&ctx)).await {
                 Ok(resp) if !resp.is_empty() => {
                     // If the answer is larger than the client can accept over
                     // UDP, send a truncated (TC=1) reply so it retries over TCP
@@ -230,7 +230,7 @@ async fn handle_tcp_connection(
             }
         };
 
-        let response = match crate::dns::handler::handle_query(raw, src, Arc::clone(&ctx)).await {
+        let response = match crate::handler::handle_query(raw, src, Arc::clone(&ctx)).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("handle_query (TCP) for {}: {}", src, e);

@@ -8,7 +8,7 @@
 
 use hickory_proto::op::Message;
 
-use crate::dns::types::DnsResponse;
+use crate::types::DnsResponse;
 
 /// A decision to route a query: the synthetic DNS answer plus which egress the
 /// connection will eventually be sent through (for logging).

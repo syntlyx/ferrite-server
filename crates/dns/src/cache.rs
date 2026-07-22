@@ -4,7 +4,7 @@ use lru::LruCache;
 use parking_lot::RwLock;
 use std::num::NonZeroUsize;
 
-use crate::dns::types::DnsResponse;
+use crate::types::DnsResponse;
 
 pub const MIN_TTL: u64 = 60;
 pub const MAX_TTL: u64 = 3600;

@@ -1,9 +1,9 @@
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
-use crate::dns::cache::DnsCache;
 use crate::snapshot::{SNAPSHOT_MAGIC, SNAPSHOT_VERSION, StateSnapshot};
 use ferrite_core::error::Result;
+use ferrite_dns::cache::DnsCache;
 use ferrite_stats::live::LiveStats;
 
 /// Deserialize a `StateSnapshot` from `path`.

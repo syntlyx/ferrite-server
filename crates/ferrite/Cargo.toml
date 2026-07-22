@@ -12,6 +12,7 @@ path = "src/main.rs"
 ferrite-blocklist.workspace = true
 ferrite-clients.workspace = true
 ferrite-core.workspace = true
+ferrite-dns.workspace = true
 ferrite-stats.workspace = true
 ferrite-storage.workspace = true
 ferrite-upstream.workspace = true

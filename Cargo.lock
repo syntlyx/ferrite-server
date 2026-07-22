@@ -750,6 +750,7 @@ dependencies = [
  "ferrite-blocklist",
  "ferrite-clients",
  "ferrite-core",
+ "ferrite-dns",
  "ferrite-stats",
  "ferrite-storage",
  "ferrite-upstream",
@@ -845,6 +846,27 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "ferrite-dns"
+version = "0.1.7"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "chrono",
+ "ferrite-blocklist",
+ "ferrite-clients",
+ "ferrite-core",
+ "ferrite-stats",
+ "ferrite-storage",
+ "ferrite-upstream",
+ "hickory-proto",
+ "hickory-resolver",
+ "lru",
+ "parking_lot",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

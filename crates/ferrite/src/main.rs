@@ -1,6 +1,5 @@
 mod api;
 mod app;
-mod dns;
 mod proxy;
 mod setup;
 mod snapshot;
@@ -267,7 +266,7 @@ async fn run() -> anyhow::Result<()> {
         .take()
         .ok_or_else(|| anyhow::anyhow!("stats writer: query_rx already consumed"))?;
     let result = tokio::try_join!(
-        dns::server::run(Arc::new(state.dns_ctx())),
+        ferrite_dns::server::run(Arc::new(state.dns_ctx())),
         api::serve(state.clone()),
         ferrite_stats::writer::run(state.writer_ctx(), query_rx),
         updater::check_loop(state.updater_ctx()),
@@ -288,7 +287,7 @@ async fn run() -> anyhow::Result<()> {
 
 /// Save a snapshot every 5 minutes so a crash loses at most 5 min of cache.
 async fn periodic_snapshot(
-    dns_cache: Arc<dns::cache::DnsCache>,
+    dns_cache: Arc<ferrite_dns::cache::DnsCache>,
     live: Arc<ferrite_stats::live::LiveStats>,
     path: std::path::PathBuf,
 ) -> anyhow::Result<()> {

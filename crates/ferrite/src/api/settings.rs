@@ -8,10 +8,10 @@ use std::collections::BTreeSet;
 use crate::api::ApiError;
 use crate::api::auth::hash_password;
 use crate::app::AppState;
-use crate::dns::cache::{MAX_TTL, MIN_TTL};
 use ferrite_core::config::{UpstreamConfig, ZoneConfig};
 use ferrite_core::error::FeriteError;
 use ferrite_core::net::normalize_client_key;
+use ferrite_dns::cache::{MAX_TTL, MIN_TTL};
 
 /// GET /api/settings — return the current live configuration.
 /// `api_key` and `password_hash`: `"***"` if non-empty, `null` if not — always present.

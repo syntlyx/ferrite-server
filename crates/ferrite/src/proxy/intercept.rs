@@ -14,7 +14,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
-use crate::dns::intercept::DnsInterceptor;
+use ferrite_dns::intercept::DnsInterceptor;
 
 use super::ProxyCtx;
 use super::egress::{

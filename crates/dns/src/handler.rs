@@ -10,8 +10,8 @@ use hickory_proto::rr::rdata::opt::EdnsCode;
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use tokio::sync::mpsc;
 
-use crate::dns::ctx::DnsCtx;
-use crate::dns::types::DnsResponse;
+use crate::ctx::DnsCtx;
+use crate::types::DnsResponse;
 use ferrite_core::error::Result;
 use ferrite_core::net::unmap_v4;
 use ferrite_core::types::{QueryEntry, QueryStatus};
@@ -576,10 +576,146 @@ mod tests {
     use hickory_proto::op::{MessageType, Query};
     use hickory_proto::rr::rdata::{A, CNAME};
     use hickory_proto::rr::{Name, RData, Record, RecordType};
+    use parking_lot::RwLock;
+    use tokio::sync::Semaphore;
 
-    use crate::test_support;
+    use crate::cache::DnsCache;
+    use crate::ctx::DnsCtx;
+    use crate::custom::CustomRecords;
+    use crate::intercept::{DnsInterceptor, Intercept};
+    use crate::types::DnsResponse;
     use ferrite_blocklist::Blocklist;
-    use ferrite_core::config::{BlocklistConfig, CustomRecordConfig};
+    use ferrite_clients::ClientRegistry;
+    use ferrite_core::config::{BlocklistConfig, CustomRecordConfig, DnsConfig};
+    use ferrite_stats::live::LiveStats;
+    use ferrite_storage::SqliteStorage;
+    use ferrite_upstream::{UpstreamPool, ZoneRouter, no_proxy};
+
+    /// A stand-in for the proxy's routing hook, so the handler's step-2 behaviour
+    /// (answer with the advertise IP, log `Routed`/`proxy:<egress>`) is testable
+    /// here without depending on the proxy crate. The proxy's real rule-matching
+    /// and answer synthesis are covered by the proxy crate's own tests.
+    #[derive(Default)]
+    struct StubInterceptor {
+        /// domain → (synthetic response bytes, egress id).
+        routes: RwLock<std::collections::HashMap<String, (Vec<u8>, String)>>,
+    }
+
+    impl StubInterceptor {
+        fn route(&self, domain: &str, response: Vec<u8>, egress_id: &str) {
+            self.routes
+                .write()
+                .insert(domain.to_string(), (response, egress_id.to_string()));
+        }
+    }
+
+    impl DnsInterceptor for StubInterceptor {
+        fn has_client_rules(&self) -> bool {
+            false
+        }
+
+        fn maybe_intercept(
+            &self,
+            _query: &Message,
+            name: &str,
+            _qtype: u16,
+            _client_ip: &str,
+            _client_mac: Option<&str>,
+        ) -> Option<Intercept> {
+            let routes = self.routes.read();
+            let (bytes, egress_id) = routes.get(name)?;
+            Some(Intercept {
+                response: DnsResponse {
+                    bytes: bytes::Bytes::from(bytes.clone()),
+                    ttl: 60,
+                },
+                egress_id: egress_id.clone(),
+            })
+        }
+    }
+
+    /// Assembles a [`DnsCtx`] from real parts (no `AppState`), plus handles to the
+    /// pieces tests assert on. Replaces the former `test_support::app_state`.
+    struct Harness {
+        live_stats: Arc<LiveStats>,
+        blocklist: Arc<Blocklist>,
+        dns_cache: Arc<DnsCache>,
+        custom_records: Arc<CustomRecords>,
+        interceptor: Arc<StubInterceptor>,
+        client_registry: Arc<ClientRegistry>,
+        upstream: Arc<ZoneRouter>,
+        query_tx: mpsc::Sender<QueryEntry>,
+        rx: mpsc::Receiver<QueryEntry>,
+        db_path: PathBuf,
+    }
+
+    impl Harness {
+        async fn new(name: &str) -> Self {
+            let db_path = temp_path(name, "db");
+            let storage = SqliteStorage::open(&db_path).await.unwrap();
+            let upstream = ZoneRouter::new(
+                &[],
+                UpstreamPool::from_config(
+                    &[ferrite_core::config::UpstreamConfig::Plain {
+                        address: "127.0.0.1".to_string(),
+                        port: 53,
+                        egress: None,
+                    }],
+                    no_proxy(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let client_registry =
+                ClientRegistry::new(Arc::clone(&upstream), Arc::clone(&storage) as _).await;
+            let (query_tx, rx) = mpsc::channel(8_192);
+            Self {
+                live_stats: LiveStats::new(),
+                blocklist: Arc::new(blocklist()),
+                dns_cache: Arc::new(DnsCache::new(1024, 0, 0, 86_400)),
+                custom_records: CustomRecords::new(),
+                interceptor: Arc::new(StubInterceptor::default()),
+                client_registry,
+                upstream,
+                query_tx,
+                rx,
+                db_path,
+            }
+        }
+
+        fn ctx(&self) -> DnsCtx {
+            DnsCtx {
+                dns_config: DnsConfig::default(),
+                dns_cache: Arc::clone(&self.dns_cache),
+                blocklist: Arc::clone(&self.blocklist),
+                custom_records: Arc::clone(&self.custom_records),
+                client_registry: Arc::clone(&self.client_registry),
+                upstream_pool: Arc::clone(&self.upstream),
+                interceptor: Arc::clone(&self.interceptor) as Arc<dyn DnsInterceptor>,
+                live_stats: Arc::clone(&self.live_stats),
+                log_ignore: Arc::new(RwLock::new(Vec::new())),
+                query_semaphore: Arc::new(Semaphore::new(256)),
+                query_tx: self.query_tx.clone(),
+            }
+        }
+    }
+
+    fn temp_path(name: &str, extension: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut path =
+            std::env::temp_dir().join(format!("ferrite-{name}-{}-{nanos}", std::process::id()));
+        path.set_extension(extension);
+        path
+    }
+
+    fn cleanup_sqlite(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+    }
 
     #[test]
     fn sanitize_query_strips_ecs_and_sets_do() {
@@ -878,22 +1014,21 @@ mod tests {
 
     #[tokio::test]
     async fn emit_counts_dropped_stats_when_channel_full() {
-        let (state, db_path) = test_support::app_state("dns-emit-drop").await;
+        let h = Harness::new("dns-emit-drop").await;
         // Keep the receiver alive (so try_send sees Full, not Closed) but never drain.
         let (tx, _rx) = mpsc::channel::<QueryEntry>(1);
         let entry = || make_entry("x.test", 1, "192.0.2.1", QueryStatus::Upstream, 0, None, 0);
 
         // Fill the single slot, then two further emits can't enqueue.
         tx.try_send(entry()).unwrap();
-        let mut ctx = state.dns_ctx();
+        let mut ctx = h.ctx();
         ctx.query_tx = tx.clone();
         emit(&ctx, entry());
         emit(&ctx, entry());
 
-        assert_eq!(state.inner.live_stats.dropped(), 2);
+        assert_eq!(h.live_stats.dropped(), 2);
 
-        drop(state);
-        test_support::cleanup_sqlite(&db_path);
+        cleanup_sqlite(&h.db_path);
     }
 
     #[test]
@@ -931,31 +1066,30 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_wire_query_returns_empty_response() {
-        let (state, db_path) = test_support::app_state("dns-malformed").await;
+        let mut h = Harness::new("dns-malformed").await;
         let response = handle_query(
             vec![0xde, 0xad, 0xbe, 0xef],
             SocketAddr::from(([192, 0, 2, 10], 53_000)),
-            Arc::new(state.dns_ctx()),
+            Arc::new(h.ctx()),
         )
         .await
         .unwrap();
 
         assert!(response.is_empty());
 
-        drop(state);
-        test_support::cleanup_sqlite(&db_path);
+        cleanup_sqlite(&h.db_path);
     }
 
     #[tokio::test]
     async fn unsupported_opcode_returns_servfail() {
-        let (state, db_path) = test_support::app_state("dns-opcode").await;
+        let mut h = Harness::new("dns-opcode").await;
         let mut request = query("status.test", RecordType::A);
         request.metadata.op_code = OpCode::Status;
 
         let response = handle_query(
             request.to_bytes().unwrap(),
             SocketAddr::from(([192, 0, 2, 10], 53_000)),
-            Arc::new(state.dns_ctx()),
+            Arc::new(h.ctx()),
         )
         .await
         .unwrap();
@@ -964,80 +1098,53 @@ mod tests {
         assert_eq!(msg.metadata.response_code, ResponseCode::ServFail);
         assert_eq!(msg.queries[0].name().to_utf8(), "status.test.");
 
-        drop(state);
-        test_support::cleanup_sqlite(&db_path);
+        cleanup_sqlite(&h.db_path);
     }
 
     #[tokio::test]
     async fn blocklisted_domain_returns_nxdomain_and_records_blocked_query() {
-        let (state, db_path) = test_support::app_state("dns-blocked").await;
-        state.inner.blocklist.add_blacklist("ads.test").unwrap();
-        let mut rx = state.query_rx.lock().take().unwrap();
+        let mut h = Harness::new("dns-blocked").await;
+        h.blocklist.add_blacklist("ads.test").unwrap();
 
         let response = handle_query(
             query("ads.test", RecordType::A).to_bytes().unwrap(),
             SocketAddr::from(([192, 0, 2, 10], 53_000)),
-            Arc::new(state.dns_ctx()),
+            Arc::new(h.ctx()),
         )
         .await
         .unwrap();
         let msg = Message::from_bytes(&response).unwrap();
-        let entry = rx.try_recv().unwrap();
+        let entry = h.rx.try_recv().unwrap();
 
         assert_eq!(msg.metadata.response_code, ResponseCode::NXDomain);
         assert_eq!(entry.domain, "ads.test");
         assert_eq!(entry.status, QueryStatus::Blocked);
         assert_eq!(entry.rcode, 3);
-        assert_eq!(state.inner.live_stats.blocked(), 1);
+        assert_eq!(h.live_stats.blocked(), 1);
 
-        drop(rx);
-        drop(state);
-        test_support::cleanup_sqlite(&db_path);
+        cleanup_sqlite(&h.db_path);
     }
 
     #[tokio::test]
     async fn routed_domain_is_logged_with_routed_status_and_egress() {
-        use ferrite_core::config::{EgressConfig, ProxyConfig, RuleConfig};
-
-        let (state, db_path) = test_support::app_state("dns-routed").await;
-        let mut proxy_cfg = ProxyConfig {
-            enabled: true,
-            advertise_ipv4: Some(Ipv4Addr::new(192, 0, 2, 77)),
-            egresses: vec![EgressConfig {
-                id: "t".to_string(),
-                name: "t".to_string(),
-                enabled: true,
-                kind: "direct".to_string(),
-                address: None,
-                port: None,
-                username: None,
-                password: None,
-                config: None,
-                seg_position: None,
-                buffer_kb: None,
-                tx_buffer_kb: None,
-            }],
-            rules: vec![RuleConfig {
-                pattern: "routed.test".to_string(),
-                egress: "t".to_string(),
-                fail_closed: true,
-                clients: Vec::new(),
-            }],
-            ..ProxyConfig::default()
-        };
-        proxy_cfg.normalize();
-        state.inner.proxy.reload(&proxy_cfg);
-        let mut rx = state.query_rx.lock().take().unwrap();
+        let mut h = Harness::new("dns-routed").await;
+        // The interceptor stands in for the proxy: it routes routed.test to an
+        // answer pointing at the advertise IP, tagged with egress "t".
+        h.interceptor.route(
+            "routed.test",
+            a_response(0, "routed.test", Ipv4Addr::new(192, 0, 2, 77), 60),
+            "t",
+        );
 
         let response = handle_query(
             query("routed.test", RecordType::A).to_bytes().unwrap(),
             SocketAddr::from(([192, 0, 2, 10], 53_000)),
-            Arc::new(state.dns_ctx()),
+            Arc::new(h.ctx()),
         )
         .await
         .unwrap();
         let msg = Message::from_bytes(&response).unwrap();
-        let entry = rx.try_recv().unwrap();
+        let entry = h.rx.try_recv().unwrap();
 
         // The synthetic answer points at the advertise IP…
         assert!(matches!(
@@ -1048,16 +1155,14 @@ mod tests {
         assert_eq!(entry.status, QueryStatus::Routed);
         assert_eq!(entry.upstream.as_deref(), Some("proxy:t"));
 
-        drop(rx);
-        drop(state);
-        test_support::cleanup_sqlite(&db_path);
+        cleanup_sqlite(&h.db_path);
     }
 
     #[tokio::test]
     async fn blocklist_check_precedes_cached_response_for_filtered_clients() {
-        let (state, db_path) = test_support::app_state("dns-blocked-cache").await;
-        state.inner.blocklist.add_blacklist("ads.test").unwrap();
-        state.inner.dns_cache.insert(
+        let mut h = Harness::new("dns-blocked-cache").await;
+        h.blocklist.add_blacklist("ads.test").unwrap();
+        h.dns_cache.insert(
             "ads.test",
             1,
             false,
@@ -1071,35 +1176,29 @@ mod tests {
                 ttl: 120,
             },
         );
-        let mut rx = state.query_rx.lock().take().unwrap();
 
         let response = handle_query(
             query("ads.test", RecordType::A).to_bytes().unwrap(),
             SocketAddr::from(([192, 0, 2, 10], 53_000)),
-            Arc::new(state.dns_ctx()),
+            Arc::new(h.ctx()),
         )
         .await
         .unwrap();
         let msg = Message::from_bytes(&response).unwrap();
-        let entry = rx.try_recv().unwrap();
+        let entry = h.rx.try_recv().unwrap();
 
         assert_eq!(msg.metadata.response_code, ResponseCode::NXDomain);
         assert_eq!(entry.status, QueryStatus::Blocked);
 
-        drop(rx);
-        drop(state);
-        test_support::cleanup_sqlite(&db_path);
+        cleanup_sqlite(&h.db_path);
     }
 
     #[tokio::test]
     async fn client_bypass_allows_cached_blacklisted_domain() {
-        let (state, db_path) = test_support::app_state("dns-client-bypass").await;
-        state.inner.blocklist.add_blacklist("ads.test").unwrap();
-        state
-            .inner
-            .blocklist
-            .set_client_bypass(&["192.0.2.10".to_string()]);
-        state.inner.dns_cache.insert(
+        let mut h = Harness::new("dns-client-bypass").await;
+        h.blocklist.add_blacklist("ads.test").unwrap();
+        h.blocklist.set_client_bypass(&["192.0.2.10".to_string()]);
+        h.dns_cache.insert(
             "ads.test",
             1,
             false,
@@ -1113,36 +1212,31 @@ mod tests {
                 ttl: 120,
             },
         );
-        let mut rx = state.query_rx.lock().take().unwrap();
 
         let response = handle_query(
             query_with_id(0x2222, "ads.test", RecordType::A)
                 .to_bytes()
                 .unwrap(),
             SocketAddr::from(([192, 0, 2, 10], 53_000)),
-            Arc::new(state.dns_ctx()),
+            Arc::new(h.ctx()),
         )
         .await
         .unwrap();
         let msg = Message::from_bytes(&response).unwrap();
-        let entry = rx.try_recv().unwrap();
+        let entry = h.rx.try_recv().unwrap();
 
         assert_eq!(msg.metadata.response_code, ResponseCode::NoError);
         assert_eq!(msg.metadata.id, 0x2222);
         assert_eq!(entry.status, QueryStatus::Cached);
 
-        drop(rx);
-        drop(state);
-        test_support::cleanup_sqlite(&db_path);
+        cleanup_sqlite(&h.db_path);
     }
 
     #[tokio::test]
     async fn custom_record_beats_blocklist_and_records_allowed_query() {
-        let (state, db_path) = test_support::app_state("dns-custom-beats-block").await;
-        state.inner.blocklist.add_blacklist("panel.test").unwrap();
-        state
-            .inner
-            .custom_records
+        let mut h = Harness::new("dns-custom-beats-block").await;
+        h.blocklist.add_blacklist("panel.test").unwrap();
+        h.custom_records
             .add(&CustomRecordConfig {
                 domain: "panel.test".to_string(),
                 record_type: "A".to_string(),
@@ -1150,17 +1244,16 @@ mod tests {
                 ttl: 120,
             })
             .unwrap();
-        let mut rx = state.query_rx.lock().take().unwrap();
 
         let response = handle_query(
             query("panel.test", RecordType::A).to_bytes().unwrap(),
             SocketAddr::from(([192, 0, 2, 10], 53_000)),
-            Arc::new(state.dns_ctx()),
+            Arc::new(h.ctx()),
         )
         .await
         .unwrap();
         let msg = Message::from_bytes(&response).unwrap();
-        let entry = rx.try_recv().unwrap();
+        let entry = h.rx.try_recv().unwrap();
 
         assert_eq!(msg.metadata.response_code, ResponseCode::NoError);
         assert!(matches!(
@@ -1169,19 +1262,17 @@ mod tests {
         ));
         assert_eq!(entry.status, QueryStatus::Allowed);
         assert_eq!(entry.upstream.as_deref(), Some("custom"));
-        assert_eq!(state.inner.live_stats.total(), 1);
-        assert_eq!(state.inner.live_stats.blocked(), 0);
+        assert_eq!(h.live_stats.total(), 1);
+        assert_eq!(h.live_stats.blocked(), 0);
 
-        drop(rx);
-        drop(state);
-        test_support::cleanup_sqlite(&db_path);
+        cleanup_sqlite(&h.db_path);
     }
 
     #[tokio::test]
     async fn cache_hit_patches_response_id_and_records_cached_query() {
-        let (state, db_path) = test_support::app_state("dns-cache-hit").await;
+        let mut h = Harness::new("dns-cache-hit").await;
         let cached_bytes = a_response(0x1111, "cache.test", Ipv4Addr::new(192, 0, 2, 9), 120);
-        state.inner.dns_cache.insert(
+        h.dns_cache.insert(
             "cache.test",
             1,
             false,
@@ -1190,19 +1281,18 @@ mod tests {
                 ttl: 120,
             },
         );
-        let mut rx = state.query_rx.lock().take().unwrap();
 
         let response = handle_query(
             query_with_id(0x2222, "cache.test", RecordType::A)
                 .to_bytes()
                 .unwrap(),
             SocketAddr::from(([192, 0, 2, 10], 53_000)),
-            Arc::new(state.dns_ctx()),
+            Arc::new(h.ctx()),
         )
         .await
         .unwrap();
         let msg = Message::from_bytes(&response).unwrap();
-        let entry = rx.try_recv().unwrap();
+        let entry = h.rx.try_recv().unwrap();
 
         assert_eq!(msg.metadata.id, 0x2222);
         // The answer is preserved, but its TTL is rewritten down to the entry's
@@ -1214,10 +1304,8 @@ mod tests {
         assert!(msg.answers[0].ttl <= 120);
         assert_eq!(entry.status, QueryStatus::Cached);
         assert_eq!(entry.domain, "cache.test");
-        assert_eq!(state.inner.live_stats.total(), 1);
+        assert_eq!(h.live_stats.total(), 1);
 
-        drop(rx);
-        drop(state);
-        test_support::cleanup_sqlite(&db_path);
+        cleanup_sqlite(&h.db_path);
     }
 }

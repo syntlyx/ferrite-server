@@ -38,10 +38,10 @@ use hickory_proto::serialize::binary::BinEncodable;
 use parking_lot::RwLock;
 use tokio::sync::Notify;
 
-use crate::dns::intercept::{DnsInterceptor, Intercept};
-use crate::dns::types::{DnsResponse, qtype as qt};
 use ferrite_clients::ClientRegistry;
 use ferrite_core::config::{Config, EgressConfig, ProxyConfig};
+use ferrite_dns::intercept::{DnsInterceptor, Intercept};
+use ferrite_dns::types::{DnsResponse, qtype as qt};
 use ferrite_upstream::{EgressConnectError, EgressConnectFuture, EgressConnector, ZoneRouter};
 
 pub(crate) use egress::direct_connect;
@@ -523,8 +523,8 @@ mod tests {
     use hickory_proto::rr::{Name, RecordType};
     use hickory_proto::serialize::binary::BinDecodable;
 
-    use crate::dns::types::qtype;
     use ferrite_core::config::{EgressConfig, ProxyConfig, RuleConfig, UpstreamConfig};
+    use ferrite_dns::types::qtype;
     use ferrite_upstream::{UpstreamPool, ZoneRouter, no_proxy};
 
     fn upstream() -> Arc<ZoneRouter> {

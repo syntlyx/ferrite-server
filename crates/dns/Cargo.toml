@@ -1,0 +1,25 @@
+[package]
+name = "ferrite-dns"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ferrite-core.workspace = true
+ferrite-blocklist.workspace = true
+ferrite-clients.workspace = true
+ferrite-stats.workspace = true
+ferrite-upstream.workspace = true
+
+anyhow.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+hickory-proto.workspace = true
+hickory-resolver.workspace = true
+lru.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+ferrite-storage.workspace = true
