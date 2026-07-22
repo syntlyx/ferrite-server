@@ -926,7 +926,7 @@ mod tests {
 
     #[test]
     fn config_toml_example_parses() {
-        let raw = include_str!("../config.toml.example");
+        let raw = include_str!("../../../config.toml.example");
         let cfg = toml::from_str::<Config>(raw).unwrap().normalized();
         // The example ships with everything in [allowlist] commented out.
         assert!(cfg.allowlist.domains.is_empty());
