@@ -6,8 +6,9 @@
 //! resolves via the upstream pool and routes the connection through the tunnel.
 //! That makes "no DNS leak" a property of the design rather than extra plumbing.
 //!
-//! [`EgressConn`] is an enum over the concrete stream types (a plain TCP stream
-//! for Direct/SOCKS5, an in-memory pipe for WireGuard) so it stays usable with
+//! [`EgressConn`] (owned by the upstream layer, see [`crate::upstream::egress`])
+//! is an enum over the concrete stream types (a plain TCP stream for
+//! Direct/SOCKS5, an in-memory pipe for WireGuard) so it stays usable with
 //! `tokio::io::copy_bidirectional`.
 
 mod direct;
@@ -18,65 +19,17 @@ mod wireguard;
 pub use direct::{DirectEgress, direct_connect};
 pub use evasion::{EvasionParams, write_split};
 
-use std::io;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use socket2::{SockRef, TcpKeepalive};
-use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::net::TcpStream;
 
 use crate::config::EgressConfig;
 use crate::error::{FeriteError, Result};
 use crate::upstream::ZoneRouter;
 
-/// A bidirectional connection to a real destination, ready for splicing.
-pub enum EgressConn {
-    /// Direct / SOCKS5 — a real TCP stream.
-    Tcp(TcpStream),
-    /// WireGuard — the caller's end of an in-memory pipe to the tunnel task.
-    Wg(DuplexStream),
-}
-
-impl AsyncRead for EgressConn {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            EgressConn::Tcp(s) => Pin::new(s).poll_read(cx, buf),
-            EgressConn::Wg(s) => Pin::new(s).poll_read(cx, buf),
-        }
-    }
-}
-
-impl AsyncWrite for EgressConn {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            EgressConn::Tcp(s) => Pin::new(s).poll_write(cx, buf),
-            EgressConn::Wg(s) => Pin::new(s).poll_write(cx, buf),
-        }
-    }
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            EgressConn::Tcp(s) => Pin::new(s).poll_flush(cx),
-            EgressConn::Wg(s) => Pin::new(s).poll_flush(cx),
-        }
-    }
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            EgressConn::Tcp(s) => Pin::new(s).poll_shutdown(cx),
-            EgressConn::Wg(s) => Pin::new(s).poll_shutdown(cx),
-        }
-    }
-}
+pub use crate::upstream::EgressConn;
 
 /// Why an egress connect failed — determines whether the circuit breaker counts
 /// it. Getting a reply from the proxy/tunnel proves the transport works, so a

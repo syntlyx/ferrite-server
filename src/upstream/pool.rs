@@ -5,7 +5,8 @@ use tokio_rustls::rustls::ClientConfig;
 
 use crate::config::UpstreamConfig;
 use crate::error::{FeriteError, Result};
-use crate::upstream::tunneled::{ProxyHandle, TunneledResolver, client_config};
+use crate::upstream::egress::ProxyHandle;
+use crate::upstream::tunneled::{TunneledResolver, client_config};
 use crate::upstream::{
     doh::DohResolver, doq::DoqResolver, plain::PlainResolver, stream::StreamResolver,
 };

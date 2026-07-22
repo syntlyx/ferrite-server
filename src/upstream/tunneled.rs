@@ -20,7 +20,6 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arc_swap::ArcSwapOption;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -29,19 +28,7 @@ use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
 use crate::error::{FeriteError, Result};
-use crate::proxy::{EgressConn, ProxyState};
-
-/// Late-bound handle to the proxy registry. The upstream pool is built *before*
-/// `ProxyState` exists (the proxy resolves through this same pool), so the handle
-/// starts empty and is filled in once the proxy is constructed. An empty handle
-/// just means "no egress available" → direct.
-pub type ProxyHandle = Arc<ArcSwapOption<ProxyState>>;
-
-/// An empty proxy handle (egress lookups always miss → direct). Used to seed the
-/// handle at startup and in tests that don't exercise tunneling.
-pub fn no_proxy() -> ProxyHandle {
-    Arc::new(ArcSwapOption::empty())
-}
+use crate::upstream::egress::{EgressConn, EgressConnectError, ProxyHandle};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -135,42 +122,29 @@ impl TunneledResolver {
     /// Open a byte stream to the resolver through the egress, or directly when the
     /// egress is unavailable. Returns the stream and whether the egress was used.
     async fn open(&self) -> Result<(EgressConn, bool)> {
-        if let Some(proxy) = self.proxy.load_full() {
-            // Only attempt the tunnel when it's actually up; a down tunnel goes
-            // straight to direct (no connect-timeout stall on every query).
-            if proxy.is_egress_healthy(&self.egress_id) {
-                match proxy.egress(&self.egress_id) {
-                    Some(eg) => {
-                        // Box the connect future: a WireGuard egress may resolve
-                        // its own hostnames through the upstream pool, which can
-                        // contain this very resolver — an async-recursion cycle
-                        // that needs heap indirection to have a finite size.
-                        let ip = self.ip.to_string();
-                        let connect = Box::pin(eg.connect(&ip, self.port));
-                        match timeout(IO_TIMEOUT, connect).await {
-                            Ok(Ok(c)) => return Ok((c, true)),
-                            Ok(Err(e)) => tracing::debug!(
-                                "upstream {}: egress connect failed ({e}); falling back to direct",
-                                self.label
-                            ),
-                            Err(_) => tracing::debug!(
-                                "upstream {}: egress connect timed out; falling back to direct",
-                                self.label
-                            ),
-                        }
-                    }
-                    None => tracing::debug!(
-                        "upstream {}: egress '{}' not configured; direct",
-                        self.label,
-                        self.egress_id
-                    ),
-                }
-            } else {
-                tracing::debug!(
+        if let Some(connector) = self.proxy.get() {
+            let ip = self.ip.to_string();
+            let connect = connector.connect_via(&self.egress_id, &ip, self.port);
+            match timeout(IO_TIMEOUT, connect).await {
+                Ok(Ok(c)) => return Ok((c, true)),
+                Ok(Err(EgressConnectError::Unhealthy)) => tracing::debug!(
                     "upstream {}: egress '{}' is down; direct",
                     self.label,
                     self.egress_id
-                );
+                ),
+                Ok(Err(EgressConnectError::NotConfigured)) => tracing::debug!(
+                    "upstream {}: egress '{}' not configured; direct",
+                    self.label,
+                    self.egress_id
+                ),
+                Ok(Err(EgressConnectError::Failed(e))) => tracing::debug!(
+                    "upstream {}: egress connect failed ({e}); falling back to direct",
+                    self.label
+                ),
+                Err(_) => tracing::debug!(
+                    "upstream {}: egress connect timed out; falling back to direct",
+                    self.label
+                ),
             }
         }
         let tcp = timeout(IO_TIMEOUT, TcpStream::connect((self.ip, self.port)))
@@ -238,6 +212,8 @@ fn io_dns(e: std::io::Error) -> FeriteError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::upstream::egress::{EgressConnector, no_proxy};
+    use std::net::SocketAddr;
 
     #[test]
     fn plain_rejects_non_ip_address() {
@@ -305,6 +281,91 @@ mod tests {
             .unwrap();
         let (resp, label) = r.resolve_raw(vec![0xab, 0xcd, 0x01, 0x02]).await.unwrap();
         assert_eq!(resp, vec![0xab, 0xcd, 0x01, 0x02]);
+        assert!(label.contains("direct fallback"), "label was {label}");
+    }
+
+    /// Length-prefixed echo server; returns its address.
+    async fn spawn_echo() -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut len = [0u8; 2];
+            s.read_exact(&mut len).await.unwrap();
+            let mut buf = vec![0u8; u16::from_be_bytes(len) as usize];
+            s.read_exact(&mut buf).await.unwrap();
+            let mut out = (buf.len() as u16).to_be_bytes().to_vec();
+            out.extend_from_slice(&buf);
+            s.write_all(&out).await.unwrap();
+            s.flush().await.unwrap();
+        });
+        addr
+    }
+
+    /// A connector that ignores the requested destination and always opens a
+    /// TCP stream to a fixed address (stands in for "through the tunnel").
+    struct FixedConnector(SocketAddr);
+
+    impl EgressConnector for FixedConnector {
+        fn connect_via<'a>(
+            &'a self,
+            _egress_id: &'a str,
+            _host: &'a str,
+            _port: u16,
+        ) -> crate::upstream::egress::EgressConnectFuture<'a> {
+            let addr = self.0;
+            Box::pin(async move {
+                TcpStream::connect(addr)
+                    .await
+                    .map(EgressConn::Tcp)
+                    .map_err(|e| EgressConnectError::Failed(FeriteError::Dns(e.to_string())))
+            })
+        }
+    }
+
+    /// A connector whose egress is always down — must never be dialed.
+    struct DownConnector;
+
+    impl EgressConnector for DownConnector {
+        fn connect_via<'a>(
+            &'a self,
+            _egress_id: &'a str,
+            _host: &'a str,
+            _port: u16,
+        ) -> crate::upstream::egress::EgressConnectFuture<'a> {
+            Box::pin(async { Err(EgressConnectError::Unhealthy) })
+        }
+    }
+
+    /// The connector path end-to-end: the resolver points at an unroutable
+    /// TEST-NET-1 address, so a response can only have come through the
+    /// connector's stream — and the label must NOT claim a direct fallback.
+    #[tokio::test]
+    async fn resolves_through_the_egress_connector() {
+        let echo = spawn_echo().await;
+        let handle = no_proxy();
+        let _ = handle.set(Arc::new(FixedConnector(echo)));
+
+        let r = TunneledResolver::plain(handle, "proton", "192.0.2.1", 53).unwrap();
+        let (resp, label) = r.resolve_raw(vec![0xde, 0xad, 0xbe, 0xef]).await.unwrap();
+        assert_eq!(resp, vec![0xde, 0xad, 0xbe, 0xef]);
+        assert!(!label.contains("direct fallback"), "label was {label}");
+    }
+
+    /// An unhealthy egress falls back to a direct connection (and says so).
+    #[tokio::test]
+    async fn unhealthy_egress_falls_back_to_direct() {
+        let echo = spawn_echo().await;
+        let handle = no_proxy();
+        let _ = handle.set(Arc::new(DownConnector));
+
+        let r =
+            TunneledResolver::plain(handle, "proton", &echo.ip().to_string(), echo.port()).unwrap();
+        let (resp, label) = r.resolve_raw(vec![0x01, 0x02]).await.unwrap();
+        assert_eq!(resp, vec![0x01, 0x02]);
         assert!(label.contains("direct fallback"), "label was {label}");
     }
 }

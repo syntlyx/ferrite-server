@@ -39,7 +39,7 @@ use tokio::sync::Notify;
 
 use crate::config::{EgressConfig, ProxyConfig};
 use crate::dns::types::{DnsResponse, qtype as qt};
-use crate::upstream::ZoneRouter;
+use crate::upstream::{EgressConnectError, EgressConnectFuture, EgressConnector, ZoneRouter};
 
 pub(crate) use egress::direct_connect;
 pub(crate) use egress::usable_rcvbuf_bytes;
@@ -344,6 +344,31 @@ impl ProxyState {
             .entry(id.to_string())
             .or_default()
             .record_failure();
+    }
+}
+
+/// The egress surface tunneled upstream DNS sees (late-bound into the pool's
+/// `ProxyHandle` at startup — the pool is built before the proxy exists).
+impl EgressConnector for ProxyState {
+    fn connect_via<'a>(
+        &'a self,
+        egress_id: &'a str,
+        host: &'a str,
+        port: u16,
+    ) -> EgressConnectFuture<'a> {
+        Box::pin(async move {
+            // Only attempt the tunnel when it's actually up; a down tunnel goes
+            // straight to direct fallback (no connect-timeout stall per query).
+            if !self.is_egress_healthy(egress_id) {
+                return Err(EgressConnectError::Unhealthy);
+            }
+            let Some(eg) = self.egress(egress_id) else {
+                return Err(EgressConnectError::NotConfigured);
+            };
+            eg.connect(host, port)
+                .await
+                .map_err(|e| EgressConnectError::Failed(e.into_inner()))
+        })
     }
 }
 

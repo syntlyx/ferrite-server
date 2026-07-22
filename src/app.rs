@@ -283,7 +283,10 @@ impl AppState {
         let proxy =
             crate::proxy::ProxyState::from_config(&config.proxy, Arc::clone(&upstream_pool));
         // Now that the proxy exists, let tunneled upstreams reach its egresses.
-        proxy_handle.store(Some(Arc::clone(&proxy)));
+        // (`set` only fails when already set — impossible for a handle created
+        // a few lines above.)
+        let connector = Arc::clone(&proxy);
+        let _ = proxy_handle.set(connector);
 
         // Query channel
         let (query_tx, query_rx) = mpsc::channel(QUERY_CHANNEL_CAPACITY);
