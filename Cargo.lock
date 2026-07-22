@@ -747,6 +747,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "dirs",
+ "ferrite-blocklist",
  "ferrite-core",
  "ferrite-storage",
  "flate2",
@@ -784,6 +785,25 @@ dependencies = [
  "tracing-subscriber",
  "webpki-roots",
  "x509-parser",
+]
+
+[[package]]
+name = "ferrite-blocklist"
+version = "0.1.7"
+dependencies = [
+ "arc-swap",
+ "ferrite-core",
+ "fst",
+ "lru",
+ "memmap2",
+ "parking_lot",
+ "psl",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

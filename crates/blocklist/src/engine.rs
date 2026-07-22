@@ -8,9 +8,9 @@ use fst::{Map, MapBuilder};
 use parking_lot::RwLock;
 use regex::Regex;
 
-use crate::blocklist::cache::BlocklistCache;
-use crate::blocklist::loader::{self, FstMap};
-use crate::blocklist::{AdblockStats, ListPolarity, refresh};
+use crate::cache::BlocklistCache;
+use crate::loader::{self, FstMap};
+use crate::{AdblockStats, ListPolarity, refresh};
 use ferrite_core::config::{AllowlistConfig, BlocklistConfig, ListConfig};
 use ferrite_core::error::{FeriteError, Result};
 use ferrite_core::net::normalize_client_key;
@@ -736,7 +736,7 @@ impl Blocklist {
     /// Returns `true` if `domain` is explicitly whitelisted (exact or wildcard
     /// match). Convenience wrapper that normalises first; the hot path uses
     /// [`Self::is_whitelisted_normalized`]. Kept as a test helper.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testutil"))]
     pub fn is_whitelisted(&self, domain: &str) -> bool {
         let domain = normalise(domain);
         self.is_whitelisted_normalized(&domain)
@@ -744,7 +744,7 @@ impl Blocklist {
 
     /// Global-tier wrapper around [`Self::is_whitelisted_for_normalized`].
     /// Production callers are profile-aware; kept as a test helper.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testutil"))]
     pub fn is_whitelisted_normalized(&self, domain: &str) -> bool {
         self.is_whitelisted_for_normalized(domain, None)
     }
@@ -1511,7 +1511,7 @@ fn compile_wildcards(patterns: &[String]) -> Vec<Regex> {
 /// Compile a domain wildcard pattern (`*.example.com`) into an anchored regex.
 /// Exposed to the crate so the proxy routing engine can reuse the exact same
 /// wildcard semantics as the blocklist (`\*` → `.*`, anchored `^…$`).
-pub(crate) fn wildcard_to_regex(pattern: &str) -> Result<Regex> {
+pub fn wildcard_to_regex(pattern: &str) -> Result<Regex> {
     if pattern == "*" || pattern.trim_matches('*').is_empty() {
         return Err(FeriteError::Config(
             "wildcard pattern cannot match everything".into(),
@@ -1571,14 +1571,14 @@ mod tests {
         let domains = vec!["a.ads.test".to_string(), "b.ads.test".to_string()];
         std::fs::write(
             &fst_path,
-            crate::blocklist::loader::build_fst(domains.clone()).unwrap(),
+            crate::loader::build_fst(domains.clone()).unwrap(),
         )
         .unwrap();
 
         let safe = refresh::sanitize_name("My List");
         std::fs::write(
             cache_dir.join(format!("{safe}.fst")),
-            crate::blocklist::loader::build_fst(domains).unwrap(),
+            crate::loader::build_fst(domains).unwrap(),
         )
         .unwrap();
         let stats = AdblockStats {
@@ -1805,8 +1805,7 @@ mod tests {
     async fn refresh_keeps_existing_fst_when_enabled_lists_all_fail() {
         let fst_path = temp_fst_path("ferrite-blocklist-all-fail");
         std::fs::create_dir_all(fst_path.parent().unwrap()).unwrap();
-        let original =
-            crate::blocklist::loader::build_fst(vec!["blocked.test".to_string()]).unwrap();
+        let original = crate::loader::build_fst(vec!["blocked.test".to_string()]).unwrap();
         std::fs::write(&fst_path, original).unwrap();
 
         let blocklist = Blocklist::new(
@@ -2433,8 +2432,7 @@ mod tests {
         // must exempt them too.
         let fst_path = temp_fst_path("ferrite-blocklist-wl-over-block");
         std::fs::create_dir_all(fst_path.parent().unwrap()).unwrap();
-        let fst_bytes =
-            crate::blocklist::loader::build_fst(vec!["google.com".to_string()]).unwrap();
+        let fst_bytes = crate::loader::build_fst(vec!["google.com".to_string()]).unwrap();
         std::fs::write(&fst_path, fst_bytes).unwrap();
 
         let blocklist = Blocklist::new(

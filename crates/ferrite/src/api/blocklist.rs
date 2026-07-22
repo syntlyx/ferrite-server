@@ -29,7 +29,7 @@ pub async fn add_blacklist(
     // Normalise once, identically to the engine, so the persisted key matches
     // the engine key and the value returned by list_* (otherwise a UI-listed
     // entry can't delete its DB row and reappears on restart).
-    let domain = crate::blocklist::normalise_domain(&payload.domain);
+    let domain = ferrite_blocklist::normalise_domain(&payload.domain);
     state.inner.blocklist.add_blacklist(&domain)?;
     if let Err(e) = state
         .inner
@@ -58,7 +58,7 @@ pub async fn del_blacklist(
     State(state): State<AppState>,
     Path(domain): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let domain = crate::blocklist::normalise_domain(&domain);
+    let domain = ferrite_blocklist::normalise_domain(&domain);
     state.inner.blocklist.remove_blacklist(&domain);
     if let Err(e) = state.inner.storage.remove_custom_entry(&domain).await {
         // Restore the engine entry so it stays in sync with the surviving row.
@@ -75,7 +75,7 @@ pub async fn add_whitelist(
     State(state): State<AppState>,
     Json(payload): Json<DomainPayload>,
 ) -> Result<(StatusCode, Json<DomainResponse>), ApiError> {
-    let domain = crate::blocklist::normalise_domain(&payload.domain);
+    let domain = ferrite_blocklist::normalise_domain(&payload.domain);
     state.inner.blocklist.add_whitelist(&domain)?;
     if let Err(e) = state
         .inner
@@ -113,7 +113,7 @@ pub async fn del_whitelist(
     State(state): State<AppState>,
     Path(domain): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let domain = crate::blocklist::normalise_domain(&domain);
+    let domain = ferrite_blocklist::normalise_domain(&domain);
     state.inner.blocklist.remove_whitelist(&domain);
     if let Err(e) = state.inner.storage.remove_custom_entry(&domain).await {
         let _ = state.inner.blocklist.add_whitelist(&domain);

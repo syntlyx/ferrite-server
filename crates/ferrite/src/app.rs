@@ -6,13 +6,13 @@ use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::{Notify, Semaphore, mpsc};
 
-use crate::blocklist::Blocklist;
 use crate::clients::ClientRegistry;
 use crate::dns::cache::DnsCache;
 use crate::dns::custom::CustomRecords;
 use crate::stats::CpuSampler;
 use crate::stats::live::LiveStats;
 use crate::upstream::{UpstreamPool, ZoneRouter};
+use ferrite_blocklist::Blocklist;
 use ferrite_core::config::{Config, CustomRecordConfig};
 use ferrite_core::error::Result;
 use ferrite_core::types::QueryEntry;

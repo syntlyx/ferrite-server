@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use fst::Map;
 
-use crate::blocklist::{AdblockStats, ListPolarity, loader};
+use crate::{AdblockStats, ListPolarity, loader};
 
 /// Per-list domain cache is considered fresh for 12 hours.
 pub(super) const LIST_CACHE_TTL: Duration = Duration::from_secs(12 * 3600);

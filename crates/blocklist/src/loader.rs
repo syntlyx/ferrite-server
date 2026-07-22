@@ -5,8 +5,8 @@ use fst::map::OpBuilder;
 use fst::{Map, MapBuilder, Streamer};
 use reqwest::{Client, Url};
 
-use crate::blocklist::ListPolarity;
-use crate::blocklist::parser::{self, AdblockStats};
+use crate::ListPolarity;
+use crate::parser::{self, AdblockStats};
 use ferrite_core::error::{FeriteError, Result};
 
 /// Standard error message returned when a user-submitted blocklist URL fails

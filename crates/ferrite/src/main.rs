@@ -1,6 +1,5 @@
 mod api;
 mod app;
-mod blocklist;
 mod clients;
 mod dns;
 mod proxy;

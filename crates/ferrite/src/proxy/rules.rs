@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use regex::Regex;
 
-use crate::blocklist::engine::wildcard_to_regex;
+use ferrite_blocklist::engine::wildcard_to_regex;
 use ferrite_core::config::RuleConfig;
 
 pub enum Matcher {

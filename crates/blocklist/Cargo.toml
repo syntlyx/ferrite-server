@@ -1,0 +1,25 @@
+[package]
+name = "ferrite-blocklist"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ferrite-core.workspace = true
+
+arc-swap.workspace = true
+fst.workspace = true
+lru.workspace = true
+memmap2.workspace = true
+parking_lot.workspace = true
+psl.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[features]
+# Un-gates in-crate test helpers (is_whitelisted*) so other crates' tests can use them.
+testutil = []

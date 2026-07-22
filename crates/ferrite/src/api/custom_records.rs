@@ -22,7 +22,7 @@ pub async fn add_record(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     // Normalise to the same key the engine and `list()` use, so the persisted
     // row matches and `dns_cache.evict` targets the key the resolver caches under.
-    cfg.domain = crate::blocklist::normalise_domain(&cfg.domain);
+    cfg.domain = ferrite_blocklist::normalise_domain(&cfg.domain);
     // Snapshot existing records for this domain so we can restore on DB failure.
     let prior: Vec<CustomRecordConfig> = state
         .inner
@@ -62,7 +62,7 @@ pub async fn delete_record(
     State(state): State<AppState>,
     Path(domain): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let domain = crate::blocklist::normalise_domain(&domain);
+    let domain = ferrite_blocklist::normalise_domain(&domain);
     let prior: Vec<CustomRecordConfig> = state
         .inner
         .custom_records

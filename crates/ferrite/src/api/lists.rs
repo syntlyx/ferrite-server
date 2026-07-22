@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::api::ApiError;
 use crate::app::AppState;
-use crate::blocklist::{AdblockStats, Blocklist};
+use ferrite_blocklist::{AdblockStats, Blocklist};
 use ferrite_core::config::ListConfig;
 use ferrite_core::error::FeriteError;
 
@@ -74,7 +74,7 @@ pub async fn add_list(
     // SSRF / local-file-read guard: validate the user-supplied URL before it is
     // persisted or fetched. Config-defined lists (incl. file://) bypass this by
     // loading through the loader directly, so trusted local lists keep working.
-    crate::blocklist::loader::validate_remote_list_url(&payload.url).await?;
+    ferrite_blocklist::loader::validate_remote_list_url(&payload.url).await?;
 
     let cfg = ListConfig {
         url: payload.url.clone(),
@@ -275,7 +275,7 @@ pub async fn add_allowlist(
     Json(payload): Json<AddListPayload>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     // Same SSRF / local-file-read guard as blocklist subscriptions.
-    crate::blocklist::loader::validate_remote_list_url(&payload.url).await?;
+    ferrite_blocklist::loader::validate_remote_list_url(&payload.url).await?;
 
     let cfg = ListConfig {
         url: payload.url.clone(),

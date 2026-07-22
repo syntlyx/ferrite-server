@@ -390,8 +390,8 @@ fn build_servfail(query: &Message) -> Vec<u8> {
 fn cname_blocked_target(
     response_bytes: &[u8],
     queried_name: &str,
-    blocklist: &crate::blocklist::Blocklist,
-    profile: Option<&crate::blocklist::CompiledProfile>,
+    blocklist: &ferrite_blocklist::Blocklist,
+    profile: Option<&ferrite_blocklist::CompiledProfile>,
 ) -> Option<String> {
     // If the queried name is *explicitly* allowed for this client (global
     // whitelist or a profile allow), trust its whole resolution path. Note this
@@ -577,8 +577,8 @@ mod tests {
     use hickory_proto::rr::rdata::{A, CNAME};
     use hickory_proto::rr::{Name, RData, Record, RecordType};
 
-    use crate::blocklist::Blocklist;
     use crate::test_support;
+    use ferrite_blocklist::Blocklist;
     use ferrite_core::config::{BlocklistConfig, CustomRecordConfig};
 
     #[test]
