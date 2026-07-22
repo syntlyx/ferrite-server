@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use crate::storage::Storage;
 use crate::upstream::ZoneRouter;
 use ferrite_core::error::Result;
+use ferrite_storage::Storage;
 
 use ferrite_core::net::{format_mac, parse_ip, parse_mac, unmap_v4};
 

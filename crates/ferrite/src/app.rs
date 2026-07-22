@@ -12,11 +12,11 @@ use crate::dns::cache::DnsCache;
 use crate::dns::custom::CustomRecords;
 use crate::stats::CpuSampler;
 use crate::stats::live::LiveStats;
-use crate::storage::{SqliteStorage, Storage};
 use crate::upstream::{UpstreamPool, ZoneRouter};
 use ferrite_core::config::{Config, CustomRecordConfig};
 use ferrite_core::error::Result;
 use ferrite_core::types::QueryEntry;
+use ferrite_storage::{SqliteStorage, Storage};
 
 /// Capacity of the query channel (DNS handler → stats writer).
 const QUERY_CHANNEL_CAPACITY: usize = 8_192;
@@ -259,7 +259,7 @@ impl AppState {
         }
 
         match storage
-            .query_range(&crate::storage::QueryFilter {
+            .query_range(&ferrite_storage::QueryFilter {
                 limit: Some(2_000),
                 ..Default::default()
             })
@@ -494,9 +494,9 @@ fn trim_env(key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{SqliteStorage, Storage};
     use ferrite_core::config::UpstreamConfig;
     use ferrite_core::types::{QueryEntry, QueryStatus};
+    use ferrite_storage::{SqliteStorage, Storage};
 
     #[test]
     fn panel_record_uses_configured_ipv4_and_domain() {

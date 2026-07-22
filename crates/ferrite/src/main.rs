@@ -7,7 +7,6 @@ mod proxy;
 mod setup;
 mod snapshot;
 mod stats;
-mod storage;
 #[cfg(test)]
 mod test_support;
 mod updater;

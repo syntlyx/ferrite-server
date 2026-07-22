@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 use tokio_rusqlite::Connection;
 
-use crate::storage::schema::SCHEMA;
-use crate::storage::{ClientStats, QueryFilter, Storage, SummaryStats};
+use crate::schema::SCHEMA;
+use crate::{ClientStats, QueryFilter, Storage, SummaryStats};
 use ferrite_core::error::{FeriteError, Result};
 use ferrite_core::types::TimeseriesBucket;
 use ferrite_core::types::{QueryEntry, QueryStatus};

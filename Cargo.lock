@@ -748,6 +748,7 @@ dependencies = [
  "dashmap",
  "dirs",
  "ferrite-core",
+ "ferrite-storage",
  "flate2",
  "fst",
  "hickory-proto",
@@ -805,6 +806,20 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "ferrite-storage"
+version = "0.1.7"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "ferrite-core",
+ "rusqlite",
+ "serde",
+ "tokio",
+ "tokio-rusqlite",
+ "tracing",
 ]
 
 [[package]]
