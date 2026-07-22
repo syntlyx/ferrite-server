@@ -274,7 +274,7 @@ async fn run() -> anyhow::Result<()> {
         .take()
         .ok_or_else(|| anyhow::anyhow!("stats writer: query_rx already consumed"))?;
     let result = tokio::try_join!(
-        dns::server::run(state.clone()),
+        dns::server::run(Arc::new(state.dns_ctx())),
         api::serve(state.clone()),
         stats::writer::run(state.writer_ctx(), query_rx),
         updater::check_loop(state.updater_ctx()),

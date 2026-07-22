@@ -98,6 +98,27 @@ impl AppState {
         }
     }
 
+    /// The slice of state the DNS pipeline consumes (UDP/TCP servers + the
+    /// per-query handler).
+    pub fn dns_ctx(&self) -> crate::dns::ctx::DnsCtx {
+        // Bind as a concrete Arc first so the unsized coercion to the trait
+        // object happens at the field, not inside `Arc::clone`'s inference.
+        let interceptor = Arc::clone(&self.inner.proxy);
+        crate::dns::ctx::DnsCtx {
+            dns_config: self.inner.config.dns.clone(),
+            dns_cache: Arc::clone(&self.inner.dns_cache),
+            blocklist: Arc::clone(&self.inner.blocklist),
+            custom_records: Arc::clone(&self.inner.custom_records),
+            client_registry: Arc::clone(&self.inner.client_registry),
+            upstream_pool: Arc::clone(&self.inner.upstream_pool),
+            interceptor,
+            live_stats: Arc::clone(&self.inner.live_stats),
+            log_ignore: Arc::clone(&self.inner.log_ignore),
+            query_semaphore: Arc::clone(&self.inner.query_semaphore),
+            query_tx: self.query_tx.clone(),
+        }
+    }
+
     /// The slice of state the proxy subsystem's tasks consume (listener
     /// supervisor, alert watcher, active prober, panel :80 demux).
     pub fn proxy_ctx(&self) -> crate::proxy::ProxyCtx {

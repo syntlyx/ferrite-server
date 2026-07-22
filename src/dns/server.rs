@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
-use crate::app::AppState;
+use crate::dns::ctx::DnsCtx;
 use crate::error::FeriteError;
 
 /// Maximum DNS UDP payload (EDNS0).
@@ -13,8 +13,8 @@ const MAX_TCP_PAYLOAD: usize = 65535;
 
 /// Start UDP and TCP DNS listeners, plus the cache janitor.
 /// Runs until a fatal error or the process exits.
-pub async fn run(state: AppState) -> anyhow::Result<()> {
-    let bind_addr = state.inner.config.dns.bind_addr;
+pub async fn run(ctx: Arc<DnsCtx>) -> anyhow::Result<()> {
+    let bind_addr = ctx.dns_config.bind_addr;
 
     let udp = UdpSocket::bind(bind_addr)
         .await
@@ -27,11 +27,9 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
     tracing::info!("DNS server listening on {}", bind_addr);
 
     // Cache janitor.
-    tokio::spawn(crate::dns::cache::janitor(Arc::clone(
-        &state.inner.dns_cache,
-    )));
+    tokio::spawn(crate::dns::cache::janitor(Arc::clone(&ctx.dns_cache)));
 
-    tokio::try_join!(udp_loop(udp, state.clone()), tcp_loop(tcp, state))?;
+    tokio::try_join!(udp_loop(udp, Arc::clone(&ctx)), tcp_loop(tcp, ctx))?;
 
     Ok(())
 }
@@ -40,7 +38,7 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
 // UDP
 // ---------------------------------------------------------------------------
 
-async fn udp_loop(socket: UdpSocket, state: AppState) -> anyhow::Result<()> {
+async fn udp_loop(socket: UdpSocket, ctx: Arc<DnsCtx>) -> anyhow::Result<()> {
     let socket = Arc::new(socket);
     let mut buf = vec![0u8; MAX_UDP_PAYLOAD];
 
@@ -54,12 +52,12 @@ async fn udp_loop(socket: UdpSocket, state: AppState) -> anyhow::Result<()> {
         };
 
         let raw = buf[..len].to_vec();
-        let state = state.clone();
+        let ctx = Arc::clone(&ctx);
         let socket = Arc::clone(&socket);
 
         // Shed load immediately if too many queries are in-flight: prevents
         // memory exhaustion when upstream is slow (unbounded spawn otherwise).
-        let permit = match state.inner.query_semaphore.clone().try_acquire_owned() {
+        let permit = match ctx.query_semaphore.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
                 tracing::warn!(
@@ -96,14 +94,7 @@ async fn udp_loop(socket: UdpSocket, state: AppState) -> anyhow::Result<()> {
             // Capture the client's advertised UDP buffer size before `raw` is
             // moved into the handler (512 without EDNS0, larger if advertised).
             let max_udp = client_udp_payload(&raw);
-            match crate::dns::handler::handle_query(
-                raw,
-                src,
-                Arc::clone(&state.inner),
-                state.query_tx.clone(),
-            )
-            .await
-            {
+            match crate::dns::handler::handle_query(raw, src, Arc::clone(&ctx)).await {
                 Ok(resp) if !resp.is_empty() => {
                     // If the answer is larger than the client can accept over
                     // UDP, send a truncated (TC=1) reply so it retries over TCP
@@ -169,7 +160,7 @@ fn truncate_response(resp: &[u8]) -> Vec<u8> {
 // TCP
 // ---------------------------------------------------------------------------
 
-async fn tcp_loop(listener: TcpListener, state: AppState) -> anyhow::Result<()> {
+async fn tcp_loop(listener: TcpListener, ctx: Arc<DnsCtx>) -> anyhow::Result<()> {
     loop {
         let (stream, src) = match listener.accept().await {
             Ok(v) => v,
@@ -179,9 +170,9 @@ async fn tcp_loop(listener: TcpListener, state: AppState) -> anyhow::Result<()> 
             }
         };
 
-        let state = state.clone();
+        let ctx = Arc::clone(&ctx);
         tokio::spawn(async move {
-            if let Err(e) = handle_tcp_connection(stream, src, state).await {
+            if let Err(e) = handle_tcp_connection(stream, src, ctx).await {
                 tracing::warn!("TCP connection {} closed: {}", src, e);
             }
         });
@@ -193,7 +184,7 @@ async fn tcp_loop(listener: TcpListener, state: AppState) -> anyhow::Result<()> 
 async fn handle_tcp_connection(
     mut stream: tokio::net::TcpStream,
     src: std::net::SocketAddr,
-    state: AppState,
+    ctx: Arc<DnsCtx>,
 ) -> anyhow::Result<()> {
     use tokio::time::{Duration, timeout};
     const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -228,7 +219,7 @@ async fn handle_tcp_connection(
             }
         }
 
-        let _permit = match state.inner.query_semaphore.try_acquire() {
+        let _permit = match ctx.query_semaphore.try_acquire() {
             Ok(p) => p,
             Err(_) => {
                 tracing::warn!(
@@ -239,14 +230,7 @@ async fn handle_tcp_connection(
             }
         };
 
-        let response = match crate::dns::handler::handle_query(
-            raw,
-            src,
-            Arc::clone(&state.inner),
-            state.query_tx.clone(),
-        )
-        .await
-        {
+        let response = match crate::dns::handler::handle_query(raw, src, Arc::clone(&ctx)).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("handle_query (TCP) for {}: {}", src, e);

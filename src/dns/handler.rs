@@ -10,9 +10,8 @@ use hickory_proto::rr::rdata::opt::EdnsCode;
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use tokio::sync::mpsc;
 
-use crate::app::AppStateInner;
 use crate::clients::unmap_v4;
-use crate::dns::intercept::DnsInterceptor;
+use crate::dns::ctx::DnsCtx;
 use crate::dns::types::{DnsResponse, QueryEntry, QueryStatus};
 use crate::error::Result;
 
@@ -34,12 +33,7 @@ pub fn seed_query_counter(max_persisted_id: u64) {
 ///  5. CNAME inspection — walk answer section, block if any CNAME target is blocked.
 ///  6. Cache successful response.
 ///  7. Send QueryEntry to stats writer (non-blocking).
-pub async fn handle_query(
-    raw: Vec<u8>,
-    src: SocketAddr,
-    state: Arc<AppStateInner>,
-    query_tx: mpsc::Sender<QueryEntry>,
-) -> Result<Vec<u8>> {
+pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Result<Vec<u8>> {
     let start = Instant::now();
 
     let query = match Message::from_bytes(&raw) {
@@ -66,28 +60,26 @@ pub async fn handle_query(
     // stores clean addresses and PTR grouping works correctly.
     let client_addr = unmap_v4(src.ip());
     let client_ip = client_addr.to_string();
-    let blocking_enabled = state.blocklist.blocking_enabled();
+    let blocking_enabled = ctx.blocklist.blocking_enabled();
     // Resolve the client MAC when something keys on it: blocklist client-bypass,
     // a per-device blocking profile, or a proxy rule scoped to specific clients.
     // All are cheap in-memory lookups.
     let client_mac = if (blocking_enabled
-        && (state.blocklist.has_client_bypass() || state.blocklist.has_profiles()))
-        || state.proxy.has_client_rules()
+        && (ctx.blocklist.has_client_bypass() || ctx.blocklist.has_profiles()))
+        || ctx.interceptor.has_client_rules()
     {
-        state.client_registry.get_mac(client_addr)
+        ctx.client_registry.get_mac(client_addr)
     } else {
         None
     };
     let filtering_enabled = blocking_enabled
-        && !state
+        && !ctx
             .blocklist
             .client_bypasses_blocking_normalized(&client_ip, client_mac.as_deref());
     // The per-device profile (subset of lists) for this client, if any. When
     // present it replaces the default all-lists FST for every block check below.
     let profile = if filtering_enabled {
-        state
-            .blocklist
-            .profile_for(&client_ip, client_mac.as_deref())
+        ctx.blocklist.profile_for(&client_ip, client_mac.as_deref())
     } else {
         None
     };
@@ -99,21 +91,19 @@ pub async fn handle_query(
     // DNSSEC feel slow. This flag also keys the cache so a DO client never gets
     // a stale unsigned answer (nor a non-DO client the bulky signed one).
     let want_dnssec =
-        state.config.dns.dnssec && query.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok);
-    let log_ignored = is_log_ignored(&name, &state.log_ignore.read());
+        ctx.dns_config.dnssec && query.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok);
+    let log_ignored = is_log_ignored(&name, &ctx.log_ignore.read());
 
     tracing::debug!("query {:?} {} from {}", question.query_type(), name, src);
 
     // ── Step 1: Custom DNS records (local overrides, beat blocklist) ──────
-    if let Some(custom_resp) = state.custom_records.lookup(&query, &name, qtype) {
-        state
-            .dns_cache
+    if let Some(custom_resp) = ctx.custom_records.lookup(&query, &name, qtype) {
+        ctx.dns_cache
             .insert(&name, qtype, want_dnssec, custom_resp.clone());
         if !log_ignored {
             let elapsed = start.elapsed().as_millis() as u32;
             emit(
-                &state,
-                &query_tx,
+                &ctx,
                 make_entry(
                     &name,
                     qtype,
@@ -135,15 +125,13 @@ pub async fn handle_query(
     // early (NOT cached): routing rules are runtime-mutable, so a cached redirect
     // could outlive a deletion.
     if let Some(intercept) =
-        state
-            .proxy
+        ctx.interceptor
             .maybe_intercept(&query, &name, qtype, &client_ip, client_mac.as_deref())
     {
         if !log_ignored {
             let elapsed = start.elapsed().as_millis() as u32;
             emit(
-                &state,
-                &query_tx,
+                &ctx,
                 make_entry(
                     &name,
                     qtype,
@@ -159,13 +147,12 @@ pub async fn handle_query(
     }
 
     // ── Step 3: Blocklist (skipped when globally disabled or client bypasses filtering) ──
-    if filtering_enabled && state.blocklist.should_block_for(&name, profile.as_deref()) {
+    if filtering_enabled && ctx.blocklist.should_block_for(&name, profile.as_deref()) {
         tracing::debug!("blocked: {}", name);
         if !log_ignored {
             let elapsed = start.elapsed().as_millis() as u32;
             emit(
-                &state,
-                &query_tx,
+                &ctx,
                 make_entry(
                     &name,
                     qtype,
@@ -182,20 +169,17 @@ pub async fn handle_query(
 
     // ── Step 3: DNS response cache ────────────────────────────────────────
     if let Some((cached, remaining_ttl)) =
-        state
-            .dns_cache
-            .get_with_remaining(&name, qtype, want_dnssec)
+        ctx.dns_cache.get_with_remaining(&name, qtype, want_dnssec)
     {
         if filtering_enabled
             && let Some(blocked_cname) =
-                cname_blocked_target(&cached.bytes, &name, &state.blocklist, profile.as_deref())
+                cname_blocked_target(&cached.bytes, &name, &ctx.blocklist, profile.as_deref())
         {
             tracing::debug!("CNAME-blocked from cache: {} → {}", name, blocked_cname);
             if !log_ignored {
                 let elapsed = start.elapsed().as_millis() as u32;
                 emit(
-                    &state,
-                    &query_tx,
+                    &ctx,
                     make_entry(
                         &name,
                         qtype,
@@ -213,8 +197,7 @@ pub async fn handle_query(
         if !log_ignored {
             let elapsed = start.elapsed().as_millis() as u32;
             emit(
-                &state,
-                &query_tx,
+                &ctx,
                 make_entry(
                     &name,
                     qtype,
@@ -237,9 +220,9 @@ pub async fn handle_query(
     // Harden the outbound query: drop EDNS Client Subnet (so the resolver never
     // learns the client's subnet) and set the upstream DO bit to `want_dnssec`
     // (honor this client's request, or strip it when the feature is off).
-    let upstream_query = sanitize_query(&raw, state.config.dns.strip_ecs, want_dnssec);
+    let upstream_query = sanitize_query(&raw, ctx.dns_config.strip_ecs, want_dnssec);
     let (response_bytes, rcode, upstream_label) =
-        match state.upstream_pool.resolve_raw(upstream_query).await {
+        match ctx.upstream_pool.resolve_raw(upstream_query).await {
             // Only trust a response we can actually decode. Unparseable bytes
             // are turned into SERVFAIL so they're never cached (step 6 caches
             // rcode==0 only) or served as if they were a valid NOERROR answer.
@@ -262,14 +245,13 @@ pub async fn handle_query(
     if rcode == 0
         && filtering_enabled
         && let Some(blocked_cname) =
-            cname_blocked_target(&response_bytes, &name, &state.blocklist, profile.as_deref())
+            cname_blocked_target(&response_bytes, &name, &ctx.blocklist, profile.as_deref())
     {
         tracing::debug!("CNAME-blocked: {} → {}", name, blocked_cname);
         if !log_ignored {
             let elapsed = start.elapsed().as_millis() as u32;
             emit(
-                &state,
-                &query_tx,
+                &ctx,
                 make_entry(
                     &name,
                     qtype,
@@ -292,7 +274,7 @@ pub async fn handle_query(
     if rcode == 0 && !response_bytes.is_empty() {
         match cache_ttl(&response_bytes) {
             Some(ttl) => {
-                state.dns_cache.insert(
+                ctx.dns_cache.insert(
                     &name,
                     qtype,
                     want_dnssec,
@@ -309,8 +291,7 @@ pub async fn handle_query(
     if !log_ignored {
         let elapsed = start.elapsed().as_millis() as u32;
         emit(
-            &state,
-            &query_tx,
+            &ctx,
             make_entry(
                 &name,
                 qtype,
@@ -330,7 +311,7 @@ pub async fn handle_query(
     // before re-querying and getting routed.
     Ok(cap_ttls(
         response_bytes,
-        state.dns_cache.max_ttl_secs() as u32,
+        ctx.dns_cache.max_ttl_secs() as u32,
     ))
 }
 
@@ -338,17 +319,13 @@ pub async fn handle_query(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn emit(state: &AppStateInner, tx: &mpsc::Sender<QueryEntry>, entry: QueryEntry) {
-    state.live_stats.record_query(&entry);
+fn emit(ctx: &DnsCtx, entry: QueryEntry) {
+    ctx.live_stats.record_query(&entry);
     // try_send: if the channel is full we drop the stat rather than block DNS,
     // but count the drop and warn (rate-limited) so a stalled writer surfaces
     // instead of silently diverging the persisted log from the live counters.
-    if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(entry) {
-        let dropped = state
-            .live_stats
-            .total_dropped
-            .fetch_add(1, Ordering::Relaxed)
-            + 1;
+    if let Err(mpsc::error::TrySendError::Full(_)) = ctx.query_tx.try_send(entry) {
+        let dropped = ctx.live_stats.total_dropped.fetch_add(1, Ordering::Relaxed) + 1;
         if dropped.is_power_of_two() {
             tracing::warn!(
                 "stats writer back-pressure: {} query stats dropped (channel full)",
@@ -907,8 +884,10 @@ mod tests {
 
         // Fill the single slot, then two further emits can't enqueue.
         tx.try_send(entry()).unwrap();
-        emit(&state.inner, &tx, entry());
-        emit(&state.inner, &tx, entry());
+        let mut ctx = state.dns_ctx();
+        ctx.query_tx = tx.clone();
+        emit(&ctx, entry());
+        emit(&ctx, entry());
 
         assert_eq!(state.inner.live_stats.dropped(), 2);
 
@@ -955,8 +934,7 @@ mod tests {
         let response = handle_query(
             vec![0xde, 0xad, 0xbe, 0xef],
             SocketAddr::from(([192, 0, 2, 10], 53_000)),
-            Arc::clone(&state.inner),
-            state.query_tx.clone(),
+            Arc::new(state.dns_ctx()),
         )
         .await
         .unwrap();
@@ -976,8 +954,7 @@ mod tests {
         let response = handle_query(
             request.to_bytes().unwrap(),
             SocketAddr::from(([192, 0, 2, 10], 53_000)),
-            Arc::clone(&state.inner),
-            state.query_tx.clone(),
+            Arc::new(state.dns_ctx()),
         )
         .await
         .unwrap();
@@ -999,8 +976,7 @@ mod tests {
         let response = handle_query(
             query("ads.test", RecordType::A).to_bytes().unwrap(),
             SocketAddr::from(([192, 0, 2, 10], 53_000)),
-            Arc::clone(&state.inner),
-            state.query_tx.clone(),
+            Arc::new(state.dns_ctx()),
         )
         .await
         .unwrap();
@@ -1055,8 +1031,7 @@ mod tests {
         let response = handle_query(
             query("routed.test", RecordType::A).to_bytes().unwrap(),
             SocketAddr::from(([192, 0, 2, 10], 53_000)),
-            Arc::clone(&state.inner),
-            state.query_tx.clone(),
+            Arc::new(state.dns_ctx()),
         )
         .await
         .unwrap();
@@ -1100,8 +1075,7 @@ mod tests {
         let response = handle_query(
             query("ads.test", RecordType::A).to_bytes().unwrap(),
             SocketAddr::from(([192, 0, 2, 10], 53_000)),
-            Arc::clone(&state.inner),
-            state.query_tx.clone(),
+            Arc::new(state.dns_ctx()),
         )
         .await
         .unwrap();
@@ -1145,8 +1119,7 @@ mod tests {
                 .to_bytes()
                 .unwrap(),
             SocketAddr::from(([192, 0, 2, 10], 53_000)),
-            Arc::clone(&state.inner),
-            state.query_tx.clone(),
+            Arc::new(state.dns_ctx()),
         )
         .await
         .unwrap();
@@ -1181,8 +1154,7 @@ mod tests {
         let response = handle_query(
             query("panel.test", RecordType::A).to_bytes().unwrap(),
             SocketAddr::from(([192, 0, 2, 10], 53_000)),
-            Arc::clone(&state.inner),
-            state.query_tx.clone(),
+            Arc::new(state.dns_ctx()),
         )
         .await
         .unwrap();
@@ -1224,8 +1196,7 @@ mod tests {
                 .to_bytes()
                 .unwrap(),
             SocketAddr::from(([192, 0, 2, 10], 53_000)),
-            Arc::clone(&state.inner),
-            state.query_tx.clone(),
+            Arc::new(state.dns_ctx()),
         )
         .await
         .unwrap();
