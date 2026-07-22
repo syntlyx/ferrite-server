@@ -9,13 +9,46 @@ cargo build --release
 cp target/release/ferrite /usr/local/bin/ferrite
 ```
 
-Requires **Rust 1.88+**. Key dependencies: `tokio`, `axum`, `hickory-resolver`
+Requires **Rust 1.96+**. Key dependencies: `tokio`, `axum`, `hickory-resolver`
 (DoT/DoH/DoQ), `boringtun` + `smoltcp` (userspace WireGuard), `tokio-rustls`
 (tunneled DoT), `fst` (blocklist), `rusqlite` (storage), `argon2` (password
 hashing).
 
 The single binary contains the DNS server, blocklist engine, selective-routing /
 tunnel egresses, REST API, and the static web UI.
+
+## Workspace layout
+
+The code is a Cargo workspace under `crates/`. `cargo build` at the root builds
+the binary (`default-members = ["crates/ferrite"]`); `cargo test --all` covers
+every crate. Dependencies point strictly downward — a crate may only use the
+ones above it in this list:
+
+```
+ferrite            bin: main.rs + setup.rs; wires everything together
+├── ferrite-api    axum REST API + static web-UI handler
+└── ferrite-app    AppState, init(), per-subsystem ctx builders, warm-restart snapshot
+    ├── ferrite-proxy     egress backends (direct/evasion/socks5/wireguard), SNI/Host
+    │                     splice, routing rules, breakers, alerts, probes
+    ├── ferrite-dns       cache, custom records, query pipeline, UDP/TCP servers
+    ├── ferrite-updater   GitHub release checks + self-update
+    ├── ferrite-stats     live counters, timeseries, top-lists, stats writer
+    ├── ferrite-clients   IP↔MAC registry, PTR/mDNS resolution, aliases
+    ├── ferrite-blocklist FST engine, adblock parser, list refresh, decision cache
+    ├── ferrite-upstream  resolver pool, DoT/DoH/DoQ, tunneled resolver
+    ├── ferrite-storage   SQLite query log + rollups
+    └── ferrite-core      errors, config, shared record types, IP/MAC utils, log ring
+```
+
+Two former in-crate cycles are now trait seams: `ferrite-proxy` implements
+`ferrite-upstream`'s `EgressConnector` (so upstream DNS can ride a tunnel without
+depending on the proxy) and `ferrite-dns`'s `DnsInterceptor` (so the DNS pipeline
+can route without depending on the proxy). Each subsystem takes a small context
+struct (`DnsCtx`, `ProxyCtx`, `WriterCtx`, `UpdaterCtx`) built by `ferrite-app`,
+rather than the whole `AppState`.
+
+Third-party version and feature choices live once in `[workspace.dependencies]`
+in the root `Cargo.toml`; member crates opt in with `<name>.workspace = true`.
 
 ## Local gate (run before pushing)
 
