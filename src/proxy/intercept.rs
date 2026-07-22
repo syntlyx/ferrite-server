@@ -15,6 +15,7 @@ use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 use crate::app::AppState;
+use crate::dns::intercept::DnsInterceptor;
 
 use super::egress::{
     ConnectErrorKind, EgressConn, EvasionParams, direct_connect, enable_keepalive, write_split,

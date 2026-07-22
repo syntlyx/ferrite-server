@@ -1,7 +1,7 @@
 //! Selective per-domain routing through tunnels/proxies.
 //!
 //! For a domain that matches a routing rule, the DNS pipeline answers with
-//! ferrite's own advertise IP (see [`ProxyState::maybe_intercept`]) so the
+//! ferrite's own advertise IP (see [`DnsInterceptor::maybe_intercept`]) so the
 //! client connects to us. The listeners in [`intercept`] then read the SNI
 //! (:443) or Host (:80), re-match the rule on the real host, and splice the
 //! connection through the chosen [`Egress`] — without terminating TLS, so the
@@ -38,6 +38,7 @@ use hickory_proto::serialize::binary::BinEncodable;
 use tokio::sync::Notify;
 
 use crate::config::{EgressConfig, ProxyConfig};
+use crate::dns::intercept::{DnsInterceptor, Intercept};
 use crate::dns::types::{DnsResponse, qtype as qt};
 use crate::upstream::{EgressConnectError, EgressConnectFuture, EgressConnector, ZoneRouter};
 
@@ -51,13 +52,6 @@ pub use stats::ProxyStats;
 /// TTL for synthesized routing answers. Short so disabling a rule recovers
 /// within a minute instead of being pinned by downstream caches.
 const SYNTH_TTL: u32 = 60;
-
-/// A decision to route a query: the synthetic DNS answer plus which egress the
-/// connection will eventually be sent through (for logging).
-pub struct Intercept {
-    pub response: DnsResponse,
-    pub egress_id: String,
-}
 
 /// Shared proxy state: a hot-swappable routing snapshot, per-egress circuit
 /// breakers, and the live listener settings (rebound by the supervisor on change,
@@ -245,44 +239,6 @@ impl ProxyState {
         self.registry.load().enabled
     }
 
-    /// Does any rule restrict to specific clients? The DNS handler resolves the
-    /// client MAC for routing only when this is true (otherwise it's free).
-    pub fn has_client_rules(&self) -> bool {
-        self.registry
-            .load()
-            .rules
-            .iter()
-            .any(|r| !r.clients.is_empty())
-    }
-
-    /// DNS hot-path hook: returns an answer pointing at our advertise IP when
-    /// `name` should be routed for this client, else `None`. One ArcSwap load, no
-    /// lock held across an `.await`.
-    pub fn maybe_intercept(
-        &self,
-        query: &Message,
-        name: &str,
-        qtype: u16,
-        client_ip: &str,
-        client_mac: Option<&str>,
-    ) -> Option<Intercept> {
-        let snap = self.registry.load();
-        if !snap.enabled {
-            return None;
-        }
-        // Routing is independent of the whitelist: the whitelist means "never
-        // block this", not "never route this". An explicit rule wins regardless
-        // (to exclude a subdomain from a broad rule, point it at a Direct egress).
-        // A rule may also be scoped to specific clients (by IP/MAC).
-        let rule = snap.route(name, client_ip, client_mac)?;
-        let egress_id = snap.egresses[rule.egress_idx].id().to_string();
-        let response = synth_response(query, qtype, snap.advertise_ipv4, snap.advertise_ipv6);
-        Some(Intercept {
-            response,
-            egress_id,
-        })
-    }
-
     /// Look up a live egress by id from the current snapshot. Used by upstream
     /// resolvers configured to tunnel their DNS through a named egress; the lookup
     /// is by-value (cloned `Arc`) so it follows hot config swaps without a restart.
@@ -344,6 +300,43 @@ impl ProxyState {
             .entry(id.to_string())
             .or_default()
             .record_failure();
+    }
+}
+
+/// The routing hook the DNS pipeline sees (step 2 of the query pipeline).
+impl DnsInterceptor for ProxyState {
+    fn has_client_rules(&self) -> bool {
+        self.registry
+            .load()
+            .rules
+            .iter()
+            .any(|r| !r.clients.is_empty())
+    }
+
+    /// One ArcSwap load, no lock held across an `.await`.
+    fn maybe_intercept(
+        &self,
+        query: &Message,
+        name: &str,
+        qtype: u16,
+        client_ip: &str,
+        client_mac: Option<&str>,
+    ) -> Option<Intercept> {
+        let snap = self.registry.load();
+        if !snap.enabled {
+            return None;
+        }
+        // Routing is independent of the whitelist: the whitelist means "never
+        // block this", not "never route this". An explicit rule wins regardless
+        // (to exclude a subdomain from a broad rule, point it at a Direct egress).
+        // A rule may also be scoped to specific clients (by IP/MAC).
+        let rule = snap.route(name, client_ip, client_mac)?;
+        let egress_id = snap.egresses[rule.egress_idx].id().to_string();
+        let response = synth_response(query, qtype, snap.advertise_ipv4, snap.advertise_ipv6);
+        Some(Intercept {
+            response,
+            egress_id,
+        })
     }
 }
 

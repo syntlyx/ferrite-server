@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::app::AppStateInner;
 use crate::clients::unmap_v4;
+use crate::dns::intercept::DnsInterceptor;
 use crate::dns::types::{DnsResponse, QueryEntry, QueryStatus};
 use crate::error::Result;
 
