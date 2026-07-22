@@ -14,9 +14,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
-use crate::app::AppState;
 use crate::dns::intercept::DnsInterceptor;
 
+use super::ProxyCtx;
 use super::egress::{
     ConnectErrorKind, EgressConn, EvasionParams, direct_connect, enable_keepalive, write_split,
 };
@@ -59,8 +59,8 @@ impl Protocol {
 /// those take effect without a process restart. Runs for the life of the process;
 /// a bind failure is logged and retried on the next change (DNS/API run in other
 /// tasks, so the proxy never takes the server down).
-pub async fn run(state: AppState) {
-    let reload = state.inner.proxy.listener_reload();
+pub async fn run(ctx: ProxyCtx) {
+    let reload = ctx.proxy.listener_reload();
     loop {
         // Arm the wake-up BEFORE reading config so a change that lands while we're
         // binding isn't lost (a `Notified` holds one permit once enabled).
@@ -68,7 +68,7 @@ pub async fn run(state: AppState) {
         tokio::pin!(wait);
         wait.as_mut().enable();
 
-        let session = start_session(&state).await;
+        let session = start_session(&ctx).await;
 
         wait.await; // a listener-affecting field changed → rebind
         for h in &session {
@@ -86,8 +86,8 @@ pub async fn run(state: AppState) {
 /// Bind the listeners for the current settings and spawn their accept loops,
 /// returning the loop handles (empty when disabled or nothing bound). The
 /// connection-cap semaphore is session-local, so a changed cap applies on rebind.
-async fn start_session(state: &AppState) -> Vec<tokio::task::JoinHandle<()>> {
-    let cfg = state.inner.proxy.listener_cfg();
+async fn start_session(ctx: &ProxyCtx) -> Vec<tokio::task::JoinHandle<()>> {
+    let cfg = ctx.proxy.listener_cfg();
     if !cfg.enabled {
         tracing::info!("proxy: selective routing disabled");
         return Vec::new();
@@ -97,7 +97,7 @@ async fn start_session(state: &AppState) -> Vec<tokio::task::JoinHandle<()>> {
     // When the panel already owns the HTTP port, don't bind a second :80 — the
     // panel's listener demuxes by Host and forwards non-panel hosts here via
     // `forward_http`. Otherwise the proxy binds its own HTTP listener.
-    let http = if cfg.http_port == state.inner.config.api.bind_addr.port() {
+    let http = if cfg.http_port == ctx.api_port {
         tracing::info!(
             "proxy: HTTP routing shared with the panel listener on :{}",
             cfg.http_port
@@ -116,7 +116,7 @@ async fn start_session(state: &AppState) -> Vec<tokio::task::JoinHandle<()>> {
         tracing::info!("proxy: TLS/SNI listener on 0.0.0.0:{}", cfg.https_port);
         handles.push(tokio::spawn(accept_loop(
             listener,
-            state.clone(),
+            ctx.clone(),
             Protocol::Tls,
             Arc::clone(&semaphore),
         )));
@@ -125,7 +125,7 @@ async fn start_session(state: &AppState) -> Vec<tokio::task::JoinHandle<()>> {
         tracing::info!("proxy: HTTP listener on 0.0.0.0:{}", cfg.http_port);
         handles.push(tokio::spawn(accept_loop(
             listener,
-            state.clone(),
+            ctx.clone(),
             Protocol::Http,
             Arc::clone(&semaphore),
         )));
@@ -145,7 +145,7 @@ async fn bind(port: u16) -> Option<TcpListener> {
 
 async fn accept_loop(
     listener: TcpListener,
-    state: AppState,
+    ctx: ProxyCtx,
     proto: Protocol,
     semaphore: Arc<Semaphore>,
 ) {
@@ -169,17 +169,17 @@ async fn accept_loop(
                 continue;
             }
         };
-        let state = state.clone();
+        let ctx = ctx.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = handle(stream, state, proto).await {
+            if let Err(e) = handle(stream, ctx, proto).await {
                 tracing::debug!("proxy connection {src} ended: {e}");
             }
         });
     }
 }
 
-async fn handle(mut client: TcpStream, state: AppState, proto: Protocol) -> std::io::Result<()> {
+async fn handle(mut client: TcpStream, ctx: ProxyCtx, proto: Protocol) -> std::io::Result<()> {
     let _live = crate::memstats::PROXY_CONNS.guard();
     enable_keepalive(&client);
 
@@ -211,15 +211,15 @@ async fn handle(mut client: TcpStream, state: AppState, proto: Protocol) -> std:
         }
     };
 
-    splice_through(client, state, proto, host, buf).await
+    splice_through(client, ctx, proto, host, buf).await
 }
 
 /// Forward an already-peeked HTTP connection through the proxy. Used by the shared
 /// :80 listener (the panel) for non-panel hosts, so plain-HTTP routing works even
 /// though the proxy itself doesn't bind :80 when the panel owns it.
-pub(crate) async fn forward_http(state: AppState, client: TcpStream, buf: Vec<u8>, host: String) {
+pub(crate) async fn forward_http(ctx: ProxyCtx, client: TcpStream, buf: Vec<u8>, host: String) {
     enable_keepalive(&client);
-    if let Err(e) = splice_through(client, state, Protocol::Http, host, buf).await {
+    if let Err(e) = splice_through(client, ctx, Protocol::Http, host, buf).await {
         tracing::debug!("proxy: http forward ended: {e}");
     }
 }
@@ -229,7 +229,7 @@ pub(crate) async fn forward_http(state: AppState, client: TcpStream, buf: Vec<u8
 /// :80 demux.
 async fn splice_through(
     mut client: TcpStream,
-    state: AppState,
+    ctx: ProxyCtx,
     proto: Protocol,
     host: String,
     buf: Vec<u8>,
@@ -240,8 +240,8 @@ async fn splice_through(
     // IPv4-mapped IPv6 peer matches the registry's plain IPv4).
     let client_addr = client.peer_addr().ok().map(|a| a.ip().to_canonical());
     let client_ip = client_addr.map(|ip| ip.to_string()).unwrap_or_default();
-    let client_mac = if state.inner.proxy.has_client_rules() {
-        client_addr.and_then(|ip| state.inner.client_registry.get_mac(ip))
+    let client_mac = if ctx.proxy.has_client_rules() {
+        client_addr.and_then(|ip| ctx.client_registry.get_mac(ip))
     } else {
         None
     };
@@ -250,7 +250,7 @@ async fn splice_through(
     // egress Arc out of the snapshot so the ArcSwap guard isn't held across the
     // connect await.
     let decision = {
-        let snap = state.inner.proxy.registry.load();
+        let snap = ctx.proxy.registry.load();
         snap.route(&host, &client_ip, client_mac.as_deref())
             .map(|r| {
                 (
@@ -271,16 +271,16 @@ async fn splice_through(
     let conn: EgressConn = match decision {
         Some((egress, fail_closed, pattern)) => {
             let id = egress.id().to_string();
-            state.inner.proxy.stats.record_rule_hit(&pattern, &id);
-            let egress_stats = state.inner.proxy.stats.egress(&id);
-            if fail_closed && !state.inner.proxy.is_egress_healthy(&id) {
+            ctx.proxy.stats.record_rule_hit(&pattern, &id);
+            let egress_stats = ctx.proxy.stats.egress(&id);
+            if fail_closed && !ctx.proxy.is_egress_healthy(&id) {
                 egress_stats.record_fail_closed_drop();
                 tracing::debug!("proxy: egress '{id}' unhealthy → fail-closed drop of {host}");
                 return Ok(());
             }
             match egress.connect(&host, port).await {
                 Ok(c) => {
-                    state.inner.proxy.note_success(&id);
+                    ctx.proxy.note_success(&id);
                     frag = egress.evasion_params();
                     stats = Some(egress_stats);
                     c
@@ -293,7 +293,7 @@ async fn splice_through(
                     // fail-close every *other* site for the cooldown (one dead domain
                     // taking the whole egress down). Leave the breaker untouched then.
                     match e.kind() {
-                        ConnectErrorKind::Egress => state.inner.proxy.note_failure(&id),
+                        ConnectErrorKind::Egress => ctx.proxy.note_failure(&id),
                         ConnectErrorKind::Destination => {}
                     }
                     if fail_closed {
@@ -306,7 +306,7 @@ async fn splice_through(
                     tracing::debug!(
                         "proxy: egress '{id}' failed ({e}) → falling back to direct for {host}"
                     );
-                    match direct_connect(&state.inner.upstream_pool, &host, port).await {
+                    match direct_connect(&ctx.upstream_pool, &host, port).await {
                         Ok(c) => EgressConn::Tcp(c),
                         Err(_) => return Ok(()),
                     }
@@ -316,7 +316,7 @@ async fn splice_through(
         None => {
             // The client reached us for a host we don't route (it used its own
             // resolver, or a stale cache entry). Act as a plain forwarder.
-            match direct_connect(&state.inner.upstream_pool, &host, port).await {
+            match direct_connect(&ctx.upstream_pool, &host, port).await {
                 Ok(c) => EgressConn::Tcp(c),
                 Err(e) => {
                     tracing::debug!("proxy: forward-direct to {host} failed: {e}");

@@ -52,7 +52,7 @@ pub(super) async fn dispatch(mut stream: TcpStream, state: AppState, router: Rou
     // panel hosts, no-Host requests, proxy disabled — is served the panel.
     match host {
         Some(h) if state.inner.proxy.is_enabled() && !state.inner.panel_hosts.contains(&h) => {
-            crate::proxy::forward_http(state, stream, buf, h).await;
+            crate::proxy::forward_http(state.proxy_ctx(), stream, buf, h).await;
         }
         _ => serve_panel(stream, buf, router).await,
     }

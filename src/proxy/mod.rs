@@ -35,9 +35,11 @@ use hickory_proto::op::{Message, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{RData, Record};
 use hickory_proto::serialize::binary::BinEncodable;
+use parking_lot::RwLock;
 use tokio::sync::Notify;
 
-use crate::config::{EgressConfig, ProxyConfig};
+use crate::clients::ClientRegistry;
+use crate::config::{Config, EgressConfig, ProxyConfig};
 use crate::dns::intercept::{DnsInterceptor, Intercept};
 use crate::dns::types::{DnsResponse, qtype as qt};
 use crate::upstream::{EgressConnectError, EgressConnectFuture, EgressConnector, ZoneRouter};
@@ -52,6 +54,24 @@ pub use stats::ProxyStats;
 /// TTL for synthesized routing answers. Short so disabling a rule recovers
 /// within a minute instead of being pinned by downstream caches.
 const SYNTH_TTL: u32 = 60;
+
+/// The slice of app state the proxy subsystem's tasks need: the listener
+/// supervisor and connection handlers ([`intercept`]), the alert watcher
+/// ([`alerts`]) and the active prober ([`probe`]).
+#[derive(Clone)]
+pub struct ProxyCtx {
+    pub proxy: Arc<ProxyState>,
+    /// IP→MAC lookups for client-scoped rules.
+    pub client_registry: Arc<ClientRegistry>,
+    /// Resolver for direct (unrouted / fail-open) connects.
+    pub upstream_pool: Arc<ZoneRouter>,
+    /// Mutable runtime config — egress edits, the alert webhook and the probe
+    /// target apply without a restart.
+    pub live_config: Arc<RwLock<Config>>,
+    /// The API listener port: when the proxy's HTTP port equals it, the panel
+    /// listener owns :80 and demuxes to the proxy instead of a second bind.
+    pub api_port: u16,
+}
 
 /// Shared proxy state: a hot-swappable routing snapshot, per-egress circuit
 /// breakers, and the live listener settings (rebound by the supervisor on change,

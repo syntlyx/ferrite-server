@@ -98,6 +98,18 @@ impl AppState {
         }
     }
 
+    /// The slice of state the proxy subsystem's tasks consume (listener
+    /// supervisor, alert watcher, active prober, panel :80 demux).
+    pub fn proxy_ctx(&self) -> crate::proxy::ProxyCtx {
+        crate::proxy::ProxyCtx {
+            proxy: Arc::clone(&self.inner.proxy),
+            client_registry: Arc::clone(&self.inner.client_registry),
+            upstream_pool: Arc::clone(&self.inner.upstream_pool),
+            live_config: Arc::clone(&self.live_config),
+            api_port: self.inner.config.api.bind_addr.port(),
+        }
+    }
+
     /// Construct the full application state from configuration.
     pub async fn init(config: &Config, persistent_config: Config) -> Result<Self> {
         // Storage

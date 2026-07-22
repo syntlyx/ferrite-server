@@ -15,7 +15,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::app::AppState;
+use super::ProxyCtx;
 use crate::config::DEFAULT_PROBE_TARGET;
 
 /// How often each egress is probed.
@@ -27,7 +27,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The probe loop. Spawned at startup; reads the live config each tick so egress
 /// edits and a changed probe target apply without a restart. Runs for the life
 /// of the process.
-pub async fn run(state: AppState) {
+pub async fn run(ctx: ProxyCtx) {
     let mut interval = tokio::time::interval(PROBE_INTERVAL);
     loop {
         interval.tick().await;
@@ -36,7 +36,7 @@ pub async fn run(state: AppState) {
         // disabled → egresses are intentionally idle, so don't probe (and don't
         // let a stale probe result gate anything).
         let (enabled, target, egress_ids): (bool, String, Vec<String>) = {
-            let cfg = &state.live_config.read().proxy;
+            let cfg = &ctx.live_config.read().proxy;
             (
                 cfg.enabled,
                 cfg.probe_target
@@ -57,7 +57,7 @@ pub async fn run(state: AppState) {
             continue;
         };
 
-        let proxy = &state.inner.proxy;
+        let proxy = &ctx.proxy;
         for id in &egress_ids {
             let Some(egress) = proxy.egress(id) else {
                 continue; // built lazily / mid-reload — skip this tick

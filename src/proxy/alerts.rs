@@ -16,8 +16,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use super::AlertEvent;
-use crate::app::AppState;
+use super::{AlertEvent, ProxyCtx};
 
 /// How long an egress must stay unhealthy before a down alert fires. Recovery
 /// is reported immediately (but only if the down alert fired).
@@ -48,7 +47,7 @@ struct WebhookPayload<'a> {
 /// The watcher loop. Spawned at startup; reads the live config each tick so
 /// egress edits and webhook changes apply without a restart. Runs for the life
 /// of the process.
-pub async fn watch(state: AppState) {
+pub async fn watch(ctx: ProxyCtx) {
     let mut interval = tokio::time::interval(WATCH_INTERVAL);
     // One lazily-built client reused for every delivery.
     let mut client: Option<reqwest::Client> = None;
@@ -58,7 +57,7 @@ pub async fn watch(state: AppState) {
         // Snapshot the bits of config we need, never holding the lock across
         // an await. Proxy disabled → tunnels are intentionally idle: no alerts.
         let (enabled, webhook, egresses): (bool, Option<String>, Vec<(String, String)>) = {
-            let cfg = &state.live_config.read().proxy;
+            let cfg = &ctx.live_config.read().proxy;
             (
                 cfg.enabled,
                 cfg.alert_webhook.clone(),
@@ -69,7 +68,7 @@ pub async fn watch(state: AppState) {
                     .collect(),
             )
         };
-        let proxy = &state.inner.proxy;
+        let proxy = &ctx.proxy;
         if !enabled {
             proxy.clear_health_watch();
             continue;

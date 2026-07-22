@@ -237,18 +237,18 @@ async fn run() -> anyhow::Result<()> {
     // Detached (not in the try_join! below) so a listener bind failure — :80/:443
     // already in use, or no privilege to bind them — degrades gracefully instead
     // of taking down DNS/API. No-op when proxy is disabled.
-    tokio::spawn(proxy::run(state.clone()));
+    tokio::spawn(proxy::run(state.proxy_ctx()));
 
     // ── Egress-down alert watcher ─────────────────────────────────────────────
     // Turns sustained egress outages into WARN logs + optional webhook events,
     // and feeds down_since/alerting to /api/proxy/stats. Reads live config each
     // tick, so it needs no restart on proxy changes.
-    tokio::spawn(proxy::watch(state.clone()));
+    tokio::spawn(proxy::watch(state.proxy_ctx()));
 
     // ── Active egress probe ───────────────────────────────────────────────────
     // Periodically connects through each egress to measure latency/reachability,
     // catching an idle path that silently died (which the breaker can't see).
-    tokio::spawn(proxy::probe(state.clone()));
+    tokio::spawn(proxy::probe(state.proxy_ctx()));
 
     // ── CPU sampling ────────────────────────────────────────────────────────
     let sampler = state.cpu_sampler.clone();
