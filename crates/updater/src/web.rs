@@ -2,8 +2,8 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::updater::checksum;
-use crate::updater::github::{
+use crate::checksum;
+use crate::github::{
     HTTP_CLIENT, RELEASE_OWNER, RELEASE_REPO_WEB, fetch_asset_text, fetch_releases, parse_semver,
     resolve_asset_sha256, update_available, with_release_auth,
 };
@@ -216,7 +216,7 @@ fn require_verified_checksum(sha256: Option<&str>) -> Result<String> {
 }
 
 async fn fetch_release_manifest(
-    release: &crate::updater::github::Release,
+    release: &crate::github::Release,
 ) -> Result<Option<WebReleaseManifest>> {
     let Some(raw) = fetch_asset_text(release, WEB_MANIFEST_ASSET).await? else {
         return Ok(None);

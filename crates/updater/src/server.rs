@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use crate::updater::checksum;
-use crate::updater::github::{
+use crate::checksum;
+use crate::github::{
     HTTP_CLIENT, RELEASE_OWNER, RELEASE_REPO_SERVER, current_platform_target, fetch_latest_release,
     resolve_asset_sha256, update_available, with_release_auth,
 };
@@ -221,9 +221,20 @@ fn preflight_update_target(current_exe: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn temp_path(name: &str, extension: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut path =
+            std::env::temp_dir().join(format!("ferrite-{name}-{}-{nanos}", std::process::id()));
+        path.set_extension(extension);
+        path
+    }
+
     #[test]
     fn update_preflight_allows_writable_executable_directory() {
-        let path = crate::test_support::temp_path("server-update-writable", "bin");
+        let path = temp_path("server-update-writable", "bin");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
 
         preflight_update_target(&path).unwrap();
@@ -269,7 +280,7 @@ mod tests {
     fn update_preflight_reports_unwritable_executable_directory_as_update_error() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = crate::test_support::temp_path("server-update-readonly", "dir");
+        let dir = temp_path("server-update-readonly", "dir");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let path = dir.join("ferrite");

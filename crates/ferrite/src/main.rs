@@ -4,7 +4,6 @@ mod setup;
 mod snapshot;
 #[cfg(test)]
 mod test_support;
-mod updater;
 mod web;
 
 use std::{sync::Arc, time::Duration};
@@ -268,7 +267,7 @@ async fn run() -> anyhow::Result<()> {
         ferrite_dns::server::run(Arc::new(state.dns_ctx())),
         api::serve(state.clone()),
         ferrite_stats::writer::run(state.writer_ctx(), query_rx),
-        updater::check_loop(state.updater_ctx()),
+        ferrite_updater::check_loop(state.updater_ctx()),
         periodic_snapshot(
             Arc::clone(&state.inner.dns_cache),
             Arc::clone(&state.inner.live_stats),

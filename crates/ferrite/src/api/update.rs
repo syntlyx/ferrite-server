@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 
 use crate::api::ApiError;
 use crate::app::AppState;
-use crate::updater;
 use ferrite_core::error::FeriteError;
+use ferrite_updater as updater;
 
 #[derive(Debug, Deserialize, Default)]
 pub struct UpdateCheckQuery {

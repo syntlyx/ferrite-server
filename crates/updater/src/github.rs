@@ -1,7 +1,7 @@
 use reqwest::{Client, RequestBuilder, redirect::Policy};
 use serde::Deserialize;
 
-use crate::updater::checksum;
+use crate::checksum;
 use ferrite_core::error::{FeriteError, Result};
 
 pub const RELEASE_API_BASE: &str = "https://api.github.com";

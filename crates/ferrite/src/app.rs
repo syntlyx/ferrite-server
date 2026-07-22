@@ -74,7 +74,7 @@ pub struct AppState {
     pub system_stats_cache: Arc<Mutex<Option<(Instant, serde_json::Value)>>>,
     /// Cached result of update checks. Prevents the web UI from hitting GitHub
     /// every time a user opens the app.
-    pub update_check_cache: Arc<tokio::sync::Mutex<crate::updater::UpdateCheckCache>>,
+    pub update_check_cache: Arc<tokio::sync::Mutex<ferrite_updater::UpdateCheckCache>>,
 }
 
 impl AppState {
@@ -91,8 +91,8 @@ impl AppState {
     }
 
     /// The slice of state the updater consumes.
-    pub fn updater_ctx(&self) -> crate::updater::UpdaterCtx {
-        crate::updater::UpdaterCtx {
+    pub fn updater_ctx(&self) -> ferrite_updater::UpdaterCtx {
+        ferrite_updater::UpdaterCtx {
             cache: Arc::clone(&self.update_check_cache),
             live_config: Arc::clone(&self.live_config),
         }
@@ -377,7 +377,7 @@ impl AppState {
             cpu_sampler: Arc::new(CpuSampler::new()),
             system_stats_cache: Arc::new(Mutex::new(None)),
             update_check_cache: Arc::new(tokio::sync::Mutex::new(
-                crate::updater::UpdateCheckCache::new(),
+                ferrite_updater::UpdateCheckCache::new(),
             )),
         })
     }

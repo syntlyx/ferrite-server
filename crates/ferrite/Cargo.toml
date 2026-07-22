@@ -16,6 +16,7 @@ ferrite-dns.workspace = true
 ferrite-proxy.workspace = true
 ferrite-stats.workspace = true
 ferrite-storage.workspace = true
+ferrite-updater.workspace = true
 ferrite-upstream.workspace = true
 
 tokio.workspace = true

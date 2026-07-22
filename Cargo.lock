@@ -754,6 +754,7 @@ dependencies = [
  "ferrite-proxy",
  "ferrite-stats",
  "ferrite-storage",
+ "ferrite-updater",
  "ferrite-upstream",
  "flate2",
  "fst",
@@ -922,6 +923,24 @@ dependencies = [
  "serde",
  "tokio",
  "tokio-rusqlite",
+ "tracing",
+]
+
+[[package]]
+name = "ferrite-updater"
+version = "0.1.7"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "ferrite-core",
+ "flate2",
+ "parking_lot",
+ "reqwest",
+ "ring",
+ "serde",
+ "serde_json",
+ "tar",
+ "tokio",
  "tracing",
 ]
 
