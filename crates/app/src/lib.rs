@@ -1,3 +1,12 @@
+//! Composition layer: the shared `AppState`, its construction from config, the
+//! warm-restart snapshot, and the per-subsystem context builders that hand each
+//! task exactly the state it needs.
+
+pub mod snapshot;
+
+#[cfg(any(test, feature = "testutil"))]
+pub mod test_support;
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;

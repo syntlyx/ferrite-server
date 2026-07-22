@@ -14,8 +14,8 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::api::ApiError;
-use crate::app::AppState;
+use crate::ApiError;
+use ferrite_app::AppState;
 use ferrite_core::error::FeriteError;
 
 /// Session TTL — 24 hours.
@@ -246,7 +246,7 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
 
-    use crate::test_support;
+    use ferrite_app::test_support;
 
     #[test]
     fn login_rate_limiter_allows_a_burst_then_rejects() {

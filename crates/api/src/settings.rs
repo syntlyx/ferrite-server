@@ -5,9 +5,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
-use crate::api::ApiError;
-use crate::api::auth::hash_password;
-use crate::app::AppState;
+use crate::ApiError;
+use crate::auth::hash_password;
+use ferrite_app::AppState;
 use ferrite_core::config::{UpstreamConfig, ZoneConfig};
 use ferrite_core::error::FeriteError;
 use ferrite_core::net::normalize_client_key;
@@ -390,7 +390,7 @@ pub async fn update_settings(
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             let path = snap_state.inner.snapshot_path.clone();
-            if let Err(e) = crate::snapshot::save::save(
+            if let Err(e) = ferrite_app::snapshot::save::save(
                 &snap_state.inner.dns_cache,
                 &snap_state.inner.live_stats,
                 &path,
@@ -455,7 +455,7 @@ async fn persist_config(state: &AppState) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support;
+    use ferrite_app::test_support;
     use ferrite_core::config::Config;
 
     #[tokio::test]

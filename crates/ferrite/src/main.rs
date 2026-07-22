@@ -1,10 +1,4 @@
-mod api;
-mod app;
 mod setup;
-mod snapshot;
-#[cfg(test)]
-mod test_support;
-mod web;
 
 use std::{sync::Arc, time::Duration};
 
@@ -68,7 +62,7 @@ fn cmd_passwd() -> anyhow::Result<()> {
         cfg.api.password_hash = None;
         println!("Password cleared — authentication disabled.");
     } else {
-        let hash = api::auth::hash_password(&password)?;
+        let hash = ferrite_api::auth::hash_password(&password)?;
         cfg.api.password_hash = Some(hash);
         println!("Password set.");
     }
@@ -147,14 +141,14 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
-    let state = app::AppState::init(&runtime_config, persistent_config).await?;
+    let state = ferrite_app::AppState::init(&runtime_config, persistent_config).await?;
 
     // ── Warm restart: restore snapshot ───────────────────────────────────────
     {
         let snap_path = state.inner.snapshot_path.clone();
-        match snapshot::restore::load_snapshot(&snap_path) {
+        match ferrite_app::snapshot::restore::load_snapshot(&snap_path) {
             Ok(Some(snap)) => {
-                snapshot::restore::apply_snapshot(
+                ferrite_app::snapshot::restore::apply_snapshot(
                     &state.inner.dns_cache,
                     &state.inner.live_stats,
                     &snap,
@@ -201,8 +195,9 @@ async fn run() -> anyhow::Result<()> {
             let path = state_for_shutdown.inner.snapshot_path.clone();
             let dns_cache = Arc::clone(&state_for_shutdown.inner.dns_cache);
             let live = Arc::clone(&state_for_shutdown.inner.live_stats);
-            let save_task =
-                tokio::task::spawn_blocking(move || snapshot::save::save(&dns_cache, &live, &path));
+            let save_task = tokio::task::spawn_blocking(move || {
+                ferrite_app::snapshot::save::save(&dns_cache, &live, &path)
+            });
             match tokio::time::timeout(std::time::Duration::from_secs(10), save_task).await {
                 Ok(Ok(Ok(()))) => tracing::info!("snapshot saved, exiting"),
                 Ok(Ok(Err(e))) => tracing::error!("failed to save snapshot: {}", e),
@@ -265,7 +260,7 @@ async fn run() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("stats writer: query_rx already consumed"))?;
     let result = tokio::try_join!(
         ferrite_dns::server::run(Arc::new(state.dns_ctx())),
-        api::serve(state.clone()),
+        ferrite_api::serve(state.clone()),
         ferrite_stats::writer::run(state.writer_ctx(), query_rx),
         ferrite_updater::check_loop(state.updater_ctx()),
         periodic_snapshot(
@@ -299,9 +294,10 @@ async fn periodic_snapshot(
         // Use spawn_blocking: std::fs::write inside save() is a blocking syscall.
         // Calling it directly on a tokio worker thread would stall the runtime,
         // especially on slow storage (SD card, NFS).
-        let result =
-            tokio::task::spawn_blocking(move || snapshot::save::save(&dns_cache, &live, &path))
-                .await;
+        let result = tokio::task::spawn_blocking(move || {
+            ferrite_app::snapshot::save::save(&dns_cache, &live, &path)
+        })
+        .await;
 
         match result {
             Ok(Ok(())) => {}
@@ -315,7 +311,7 @@ async fn periodic_snapshot(
 /// Runs once shortly after startup, then every 24 hours.
 /// Reads `log_retention_days` from `live_config` on each iteration — changes
 /// made via PATCH /api/settings take effect without restart.
-async fn log_retention_loop(state: app::AppState) {
+async fn log_retention_loop(state: ferrite_app::AppState) {
     // Small initial delay so startup I/O settles first.
     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
@@ -342,7 +338,7 @@ async fn log_retention_loop(state: app::AppState) {
     }
 }
 
-async fn neighbor_mirror_loop(state: app::AppState) {
+async fn neighbor_mirror_loop(state: ferrite_app::AppState) {
     // Small initial delay so startup I/O settles first.
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 

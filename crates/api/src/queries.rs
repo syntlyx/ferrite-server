@@ -6,8 +6,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::api::ApiError;
-use crate::app::AppState;
+use crate::ApiError;
+use ferrite_app::AppState;
 use ferrite_clients::ClientRegistry;
 use ferrite_core::net::parse_ip;
 use ferrite_core::types::QueryEntry;

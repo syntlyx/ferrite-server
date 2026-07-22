@@ -22,8 +22,8 @@ use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::ServerName;
 
-use crate::api::ApiError;
-use crate::app::AppState;
+use crate::ApiError;
+use ferrite_app::AppState;
 use ferrite_core::error::FeriteError;
 use ferrite_proxy::{EgressConn, direct_connect};
 use ferrite_upstream::tunneled::client_config;

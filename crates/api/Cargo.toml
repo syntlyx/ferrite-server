@@ -1,0 +1,43 @@
+[package]
+name = "ferrite-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ferrite-app.workspace = true
+ferrite-blocklist.workspace = true
+ferrite-clients.workspace = true
+ferrite-core.workspace = true
+ferrite-dns.workspace = true
+ferrite-proxy.workspace = true
+ferrite-storage.workspace = true
+ferrite-updater.workspace = true
+ferrite-upstream.workspace = true
+
+anyhow.workspace = true
+argon2.workspace = true
+axum.workspace = true
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+hickory-proto.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+parking_lot.workspace = true
+ring.workspace = true
+serde.workspace = true
+socket2.workspace = true
+toml.workspace = true
+tokio-rustls.workspace = true
+serde_json.workspace = true
+subtle.workspace = true
+sysinfo.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+x509-parser.workspace = true
+
+[dev-dependencies]
+ferrite-app = { workspace = true, features = ["testutil"] }
+tower.workspace = true

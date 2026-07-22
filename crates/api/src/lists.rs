@@ -8,8 +8,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::api::ApiError;
-use crate::app::AppState;
+use crate::ApiError;
+use ferrite_app::AppState;
 use ferrite_blocklist::{AdblockStats, Blocklist};
 use ferrite_core::config::ListConfig;
 use ferrite_core::error::FeriteError;
@@ -425,7 +425,7 @@ pub async fn refresh_allowlist(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support;
+    use ferrite_app::test_support;
 
     #[tokio::test]
     async fn add_allowlist_rejects_non_public_urls() {

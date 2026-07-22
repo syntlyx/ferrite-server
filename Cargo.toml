@@ -17,6 +17,8 @@ license = "MIT"
 # with `<name>.workspace = true`.
 [workspace.dependencies]
 # ── Internal crates ───────────────────────────────────────────────────────────
+ferrite-api = { path = "crates/api" }
+ferrite-app = { path = "crates/app" }
 ferrite-blocklist = { path = "crates/blocklist" }
 ferrite-clients = { path = "crates/clients" }
 ferrite-core = { path = "crates/core" }

@@ -20,7 +20,7 @@ use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 
-use crate::app::AppState;
+use ferrite_app::AppState;
 use ferrite_core::memstats;
 
 const CONTENT_TYPE_PROM: &str = "text/plain; version=0.0.4; charset=utf-8";
@@ -422,7 +422,7 @@ fn escape_label(v: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support;
+    use ferrite_app::test_support;
     use ferrite_core::config::{EgressConfig, ProxyConfig, RuleConfig};
 
     #[test]

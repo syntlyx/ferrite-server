@@ -11,8 +11,8 @@ use std::collections::HashSet;
 use axum::{Json, extract::State};
 use serde_json::{Value, json};
 
-use crate::api::ApiError;
-use crate::app::AppState;
+use crate::ApiError;
+use ferrite_app::AppState;
 use ferrite_core::config::BlocklistProfileConfig;
 use ferrite_core::error::FeriteError;
 
@@ -178,7 +178,7 @@ fn bad(msg: &str) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support;
+    use ferrite_app::test_support;
 
     #[test]
     fn slugify_matches_web_convention() {

@@ -5,8 +5,8 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::api::ApiError;
-use crate::app::AppState;
+use crate::ApiError;
+use ferrite_app::AppState;
 use ferrite_core::error::FeriteError;
 use ferrite_updater as updater;
 
@@ -55,9 +55,11 @@ fn restart_after_response(state: AppState) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let path = state.inner.snapshot_path.clone();
-        if let Err(e) =
-            crate::snapshot::save::save(&state.inner.dns_cache, &state.inner.live_stats, &path)
-        {
+        if let Err(e) = ferrite_app::snapshot::save::save(
+            &state.inner.dns_cache,
+            &state.inner.live_stats,
+            &path,
+        ) {
             tracing::error!("snapshot save before server update restart failed: {}", e);
         }
         std::process::exit(0);

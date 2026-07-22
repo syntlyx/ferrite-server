@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::app::AppState;
+use crate::AppState;
 use ferrite_core::config::{Config, UpstreamConfig};
 
 pub fn temp_path(name: &str, extension: &str) -> PathBuf {

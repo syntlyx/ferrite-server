@@ -6,8 +6,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::api::ApiError;
-use crate::app::AppState;
+use crate::ApiError;
+use ferrite_app::AppState;
 use ferrite_core::error::FeriteError;
 
 #[derive(Deserialize)]
@@ -173,7 +173,7 @@ pub async fn list_whitelist(State(state): State<AppState>) -> Result<Json<Value>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support;
+    use ferrite_app::test_support;
 
     #[tokio::test]
     async fn whitelist_add_normalizes_so_delete_clears_storage() {

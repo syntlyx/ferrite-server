@@ -1,0 +1,30 @@
+[package]
+name = "ferrite-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+# Un-gates the AppState test builder (test_support) for other crates' tests.
+testutil = []
+
+[dependencies]
+ferrite-core.workspace = true
+ferrite-blocklist.workspace = true
+ferrite-clients.workspace = true
+ferrite-dns.workspace = true
+ferrite-proxy.workspace = true
+ferrite-stats.workspace = true
+ferrite-storage.workspace = true
+ferrite-updater.workspace = true
+ferrite-upstream.workspace = true
+
+bytes.workspace = true
+chrono.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+postcard.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true

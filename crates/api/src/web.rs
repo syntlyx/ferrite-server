@@ -6,7 +6,7 @@ use axum::{
 };
 use tokio::fs;
 
-use crate::app::AppState;
+use ferrite_app::AppState;
 
 /// Axum fallback handler — serves static files from the local web dir.
 /// API routes are matched before this, so everything here is UI traffic.

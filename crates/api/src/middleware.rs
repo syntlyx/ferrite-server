@@ -9,8 +9,8 @@ use axum::{
 use serde_json::json;
 use subtle::ConstantTimeEq;
 
-use crate::api::auth;
-use crate::app::AppState;
+use crate::auth;
+use ferrite_app::AppState;
 
 /// Axum middleware that enforces authentication when a password or API key is configured.
 ///

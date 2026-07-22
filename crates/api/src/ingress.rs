@@ -19,7 +19,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-use crate::app::AppState;
+use ferrite_app::AppState;
 use ferrite_proxy::http_host::{HostResult, parse_http_host};
 
 const PEEK_TIMEOUT: Duration = Duration::from_secs(5);

@@ -9,6 +9,8 @@ name = "ferrite"
 path = "src/main.rs"
 
 [dependencies]
+ferrite-api.workspace = true
+ferrite-app.workspace = true
 ferrite-blocklist.workspace = true
 ferrite-clients.workspace = true
 ferrite-core.workspace = true

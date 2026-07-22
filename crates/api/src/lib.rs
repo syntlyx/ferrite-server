@@ -16,6 +16,7 @@ pub mod stats;
 pub mod system;
 pub mod tools;
 pub mod update;
+mod web;
 
 pub use error::ApiError;
 
@@ -25,7 +26,7 @@ use axum::{
 };
 use tower_http::trace::TraceLayer;
 
-use crate::app::AppState;
+use ferrite_app::AppState;
 
 /// Build the full Axum router with all API routes.
 pub fn build_router(state: AppState) -> Router {
@@ -178,8 +179,8 @@ mod tests {
     use std::time::{Duration, Instant};
     use tower::ServiceExt;
 
-    use crate::api::auth::hash_password;
-    use crate::test_support;
+    use crate::auth::hash_password;
+    use ferrite_app::test_support;
 
     fn request(uri: &str) -> Request<Body> {
         Request::builder().uri(uri).body(Body::empty()).unwrap()

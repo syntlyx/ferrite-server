@@ -10,8 +10,8 @@ use std::collections::HashSet;
 use axum::{Json, extract::State};
 use serde_json::{Value, json};
 
-use crate::api::ApiError;
-use crate::app::AppState;
+use crate::ApiError;
+use ferrite_app::AppState;
 use ferrite_core::config::{EgressConfig, ProxyConfig};
 use ferrite_core::error::FeriteError;
 use ferrite_proxy::usable_rcvbuf_bytes;
@@ -364,9 +364,9 @@ fn bad(msg: &str) -> ApiError {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_support;
     use axum::Json;
     use axum::extract::State;
+    use ferrite_app::test_support;
     use ferrite_core::config::{EgressConfig, RuleConfig};
 
     use super::*;

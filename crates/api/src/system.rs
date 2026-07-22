@@ -4,8 +4,8 @@ use axum::Json;
 use axum::extract::State;
 use serde_json::Value;
 
-use crate::api::ApiError;
-use crate::app::AppState;
+use crate::ApiError;
+use ferrite_app::AppState;
 use ferrite_core::error::FeriteError;
 
 /// Cache TTL for system stats — sysinfo is expensive (200ms sleep + hwmon reads).
