@@ -219,7 +219,7 @@ fn classify_reply(code: u8, host: &str, port: u16) -> ConnectError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proxy::egress::ConnectErrorKind;
+    use crate::egress::ConnectErrorKind;
 
     #[test]
     fn reply_codes_classify_destination_vs_egress() {

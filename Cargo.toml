@@ -21,6 +21,7 @@ ferrite-blocklist = { path = "crates/blocklist" }
 ferrite-clients = { path = "crates/clients" }
 ferrite-core = { path = "crates/core" }
 ferrite-dns = { path = "crates/dns" }
+ferrite-proxy = { path = "crates/proxy" }
 ferrite-stats = { path = "crates/stats" }
 ferrite-storage = { path = "crates/storage" }
 ferrite-upstream = { path = "crates/upstream" }

@@ -217,7 +217,7 @@ async fn handle(mut client: TcpStream, ctx: ProxyCtx, proto: Protocol) -> std::i
 /// Forward an already-peeked HTTP connection through the proxy. Used by the shared
 /// :80 listener (the panel) for non-panel hosts, so plain-HTTP routing works even
 /// though the proxy itself doesn't bind :80 when the panel owns it.
-pub(crate) async fn forward_http(ctx: ProxyCtx, client: TcpStream, buf: Vec<u8>, host: String) {
+pub async fn forward_http(ctx: ProxyCtx, client: TcpStream, buf: Vec<u8>, host: String) {
     enable_keepalive(&client);
     if let Err(e) = splice_through(client, ctx, Protocol::Http, host, buf).await {
         tracing::debug!("proxy: http forward ended: {e}");

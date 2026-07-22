@@ -37,7 +37,7 @@ pub struct AppStateInner {
     pub custom_records: Arc<CustomRecords>,
     pub client_registry: Arc<ClientRegistry>,
     /// Selective per-domain routing (egresses + rules + listeners).
-    pub proxy: Arc<crate::proxy::ProxyState>,
+    pub proxy: Arc<ferrite_proxy::ProxyState>,
     /// Host names that resolve to the local admin panel. The shared HTTP listener
     /// serves the panel for these and hands everything else to the proxy.
     pub panel_hosts: std::collections::HashSet<String>,
@@ -121,8 +121,8 @@ impl AppState {
 
     /// The slice of state the proxy subsystem's tasks consume (listener
     /// supervisor, alert watcher, active prober, panel :80 demux).
-    pub fn proxy_ctx(&self) -> crate::proxy::ProxyCtx {
-        crate::proxy::ProxyCtx {
+    pub fn proxy_ctx(&self) -> ferrite_proxy::ProxyCtx {
+        ferrite_proxy::ProxyCtx {
             proxy: Arc::clone(&self.inner.proxy),
             client_registry: Arc::clone(&self.inner.client_registry),
             upstream_pool: Arc::clone(&self.inner.upstream_pool),
@@ -334,7 +334,7 @@ impl AppState {
         // same upstream pool (never the OS resolver, which would loop back into
         // ferrite's own DNS for routed names).
         let proxy =
-            crate::proxy::ProxyState::from_config(&config.proxy, Arc::clone(&upstream_pool));
+            ferrite_proxy::ProxyState::from_config(&config.proxy, Arc::clone(&upstream_pool));
         // Now that the proxy exists, let tunneled upstreams reach its egresses.
         // (`set` only fails when already set — impossible for a handle created
         // a few lines above.)

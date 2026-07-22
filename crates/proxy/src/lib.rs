@@ -10,7 +10,7 @@
 mod alerts;
 mod egress;
 mod health;
-pub(crate) mod http_host;
+pub mod http_host;
 mod intercept;
 mod probe;
 mod rules;
@@ -20,7 +20,7 @@ mod stats;
 pub use alerts::watch;
 pub use probe::run as probe;
 
-pub(crate) use intercept::forward_http;
+pub use intercept::forward_http;
 pub use intercept::run;
 
 use std::collections::HashMap;
@@ -44,8 +44,8 @@ use ferrite_dns::intercept::{DnsInterceptor, Intercept};
 use ferrite_dns::types::{DnsResponse, qtype as qt};
 use ferrite_upstream::{EgressConnectError, EgressConnectFuture, EgressConnector, ZoneRouter};
 
-pub(crate) use egress::direct_connect;
-pub(crate) use egress::usable_rcvbuf_bytes;
+pub use egress::direct_connect;
+pub use egress::usable_rcvbuf_bytes;
 pub use egress::{Egress, EgressConn};
 use health::Breaker;
 use rules::CompiledRule;

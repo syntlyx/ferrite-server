@@ -2,7 +2,7 @@
 //!
 //! The panel owns its bind address (typically `:80`). For each connection we peek
 //! the HTTP `Host` and either serve the admin panel (axum, via hyper) or hand the
-//! connection to the proxy ([`crate::proxy::forward_http`]). That lets one port do
+//! connection to the proxy ([`ferrite_proxy::forward_http`]). That lets one port do
 //! both — `fe.te` / the panel IP reach the web UI, every other host is routed by
 //! the proxy — instead of the panel and proxy fighting over `:80`.
 
@@ -20,7 +20,7 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::app::AppState;
-use crate::proxy::http_host::{HostResult, parse_http_host};
+use ferrite_proxy::http_host::{HostResult, parse_http_host};
 
 const PEEK_TIMEOUT: Duration = Duration::from_secs(5);
 const PEEK_CAP: usize = 16 * 1024;
@@ -52,7 +52,7 @@ pub(super) async fn dispatch(mut stream: TcpStream, state: AppState, router: Rou
     // panel hosts, no-Host requests, proxy disabled — is served the panel.
     match host {
         Some(h) if state.inner.proxy.is_enabled() && !state.inner.panel_hosts.contains(&h) => {
-            crate::proxy::forward_http(state.proxy_ctx(), stream, buf, h).await;
+            ferrite_proxy::forward_http(state.proxy_ctx(), stream, buf, h).await;
         }
         _ => serve_panel(stream, buf, router).await,
     }

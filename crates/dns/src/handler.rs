@@ -1066,7 +1066,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_wire_query_returns_empty_response() {
-        let mut h = Harness::new("dns-malformed").await;
+        let h = Harness::new("dns-malformed").await;
         let response = handle_query(
             vec![0xde, 0xad, 0xbe, 0xef],
             SocketAddr::from(([192, 0, 2, 10], 53_000)),
@@ -1082,7 +1082,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_opcode_returns_servfail() {
-        let mut h = Harness::new("dns-opcode").await;
+        let h = Harness::new("dns-opcode").await;
         let mut request = query("status.test", RecordType::A);
         request.metadata.op_code = OpCode::Status;
 

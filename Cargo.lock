@@ -751,6 +751,7 @@ dependencies = [
  "ferrite-clients",
  "ferrite-core",
  "ferrite-dns",
+ "ferrite-proxy",
  "ferrite-stats",
  "ferrite-storage",
  "ferrite-upstream",
@@ -865,6 +866,32 @@ dependencies = [
  "hickory-resolver",
  "lru",
  "parking_lot",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ferrite-proxy"
+version = "0.1.7"
+dependencies = [
+ "arc-swap",
+ "base64",
+ "boringtun",
+ "bytes",
+ "chrono",
+ "dashmap",
+ "ferrite-blocklist",
+ "ferrite-clients",
+ "ferrite-core",
+ "ferrite-dns",
+ "ferrite-upstream",
+ "hickory-proto",
+ "parking_lot",
+ "regex",
+ "reqwest",
+ "serde",
+ "smoltcp",
+ "socket2",
  "tokio",
  "tracing",
 ]

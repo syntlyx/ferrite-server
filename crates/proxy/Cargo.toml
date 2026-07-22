@@ -1,0 +1,28 @@
+[package]
+name = "ferrite-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ferrite-core.workspace = true
+ferrite-blocklist.workspace = true
+ferrite-clients.workspace = true
+ferrite-dns.workspace = true
+ferrite-upstream.workspace = true
+
+arc-swap.workspace = true
+base64.workspace = true
+boringtun.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+dashmap.workspace = true
+hickory-proto.workspace = true
+parking_lot.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+smoltcp.workspace = true
+socket2.workspace = true
+tokio.workspace = true
+tracing.workspace = true

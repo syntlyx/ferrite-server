@@ -12,9 +12,9 @@ use serde_json::{Value, json};
 
 use crate::api::ApiError;
 use crate::app::AppState;
-use crate::proxy::usable_rcvbuf_bytes;
 use ferrite_core::config::{EgressConfig, ProxyConfig};
 use ferrite_core::error::FeriteError;
+use ferrite_proxy::usable_rcvbuf_bytes;
 
 /// GET /api/proxy — current config (socks5 passwords redacted) + egress health.
 pub async fn get_proxy(State(state): State<AppState>) -> Json<Value> {
@@ -211,7 +211,7 @@ fn validate(cfg: &ProxyConfig) -> Result<(), ApiError> {
                         e.id
                     )));
                 }
-                crate::proxy::validate_wireguard_conf(text).map_err(ApiError)?;
+                ferrite_proxy::validate_wireguard_conf(text).map_err(ApiError)?;
             }
             // DirectEvasion needs no required fields; seg_position is optional and
             // any u16 offset is valid (out-of-range is ignored at runtime).
