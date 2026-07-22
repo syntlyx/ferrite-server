@@ -1,9 +1,10 @@
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
-use crate::app::AppState;
+use crate::dns::cache::DnsCache;
 use crate::error::Result;
 use crate::snapshot::{SNAPSHOT_MAGIC, SNAPSHOT_VERSION, StateSnapshot};
+use crate::stats::live::LiveStats;
 
 /// Deserialize a `StateSnapshot` from `path`.
 /// Returns `Ok(None)` if the file doesn't exist.
@@ -44,19 +45,19 @@ pub fn load_snapshot(path: &Path) -> Result<Option<StateSnapshot>> {
     Ok(Some(snapshot))
 }
 
-/// Apply a snapshot to the running application state.
+/// Apply a snapshot to the running DNS cache and live stats.
 ///
 /// - DNS cache entries are restored (expired ones are skipped by `DnsCache::restore`).
 /// - Live stats counters are increased from a same-day snapshot when it has
 ///   values newer than the storage seed.
-pub fn apply_snapshot(state: &AppState, snapshot: &StateSnapshot) {
+pub fn apply_snapshot(dns_cache: &DnsCache, live: &LiveStats, snapshot: &StateSnapshot) {
     // Restore DNS cache.
     let entries: Vec<(String, Vec<u8>, u32, i64)> = snapshot
         .dns_cache
         .iter()
         .map(|e| (e.key.clone(), e.bytes.clone(), e.ttl, e.expires_at))
         .collect();
-    state.inner.dns_cache.restore(&entries);
+    dns_cache.restore(&entries);
 
     // Restore live stats (only if snapshot was from the same day).
     let snapshot_day = chrono::DateTime::from_timestamp(snapshot.created_at, 0)
@@ -64,7 +65,6 @@ pub fn apply_snapshot(state: &AppState, snapshot: &StateSnapshot) {
     let today = chrono::Utc::now().date_naive();
 
     if snapshot_day == Some(today) {
-        let live = &state.inner.live_stats;
         store_max(&live.total_queries, snapshot.total_queries);
         store_max(&live.total_blocked, snapshot.total_blocked);
         store_max(&live.total_cached, snapshot.total_cached);
@@ -83,10 +83,16 @@ fn store_max(counter: &std::sync::atomic::AtomicU64, snapshot_value: u64) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use crate::config::{Config, UpstreamConfig};
     use crate::snapshot::save::save_snapshot;
     use crate::snapshot::{DnsCacheEntry, SNAPSHOT_MAGIC, SNAPSHOT_VERSION};
+
+    /// A DNS cache + live stats pair, as `apply_snapshot` sees them at startup.
+    fn fixture() -> (DnsCache, Arc<LiveStats>) {
+        (DnsCache::new(1024, 0, 0, 86_400), LiveStats::new())
+    }
 
     #[test]
     fn snapshot_save_load_round_trips_postcard_payload() {
@@ -159,9 +165,9 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[tokio::test]
-    async fn apply_snapshot_restores_only_unexpired_dns_cache_entries() {
-        let (state, db_path) = temp_state("restore-cache").await;
+    #[test]
+    fn apply_snapshot_restores_only_unexpired_dns_cache_entries() {
+        let (cache, live) = fixture();
         let now = chrono::Utc::now().timestamp();
         let snapshot = StateSnapshot {
             version: SNAPSHOT_VERSION,
@@ -187,32 +193,18 @@ mod tests {
             total_allowed: 0,
         };
 
-        apply_snapshot(&state, &snapshot);
+        apply_snapshot(&cache, &live, &snapshot);
 
         assert_eq!(
-            state
-                .inner
-                .dns_cache
-                .get("fresh.test", 1, false)
-                .unwrap()
-                .bytes,
+            cache.get("fresh.test", 1, false).unwrap().bytes,
             bytes::Bytes::from_static(b"fresh")
         );
-        assert!(
-            state
-                .inner
-                .dns_cache
-                .get("expired.test", 1, false)
-                .is_none()
-        );
-
-        drop(state);
-        cleanup_sqlite(&db_path);
+        assert!(cache.get("expired.test", 1, false).is_none());
     }
 
-    #[tokio::test]
-    async fn same_day_snapshot_restores_live_counters() {
-        let (state, db_path) = temp_state("same-day-stats").await;
+    #[test]
+    fn same_day_snapshot_restores_live_counters() {
+        let (cache, live) = fixture();
         let snapshot = StateSnapshot {
             version: SNAPSHOT_VERSION,
             created_at: chrono::Utc::now().timestamp(),
@@ -224,27 +216,19 @@ mod tests {
             total_allowed: 18,
         };
 
-        apply_snapshot(&state, &snapshot);
+        apply_snapshot(&cache, &live, &snapshot);
 
-        let live = &state.inner.live_stats;
         assert_eq!(live.total_queries.load(Ordering::Relaxed), 42);
         assert_eq!(live.total_blocked.load(Ordering::Relaxed), 7);
         assert_eq!(live.total_cached.load(Ordering::Relaxed), 8);
         assert_eq!(live.total_upstream.load(Ordering::Relaxed), 9);
         assert_eq!(live.total_allowed.load(Ordering::Relaxed), 18);
-
-        drop(state);
-        cleanup_sqlite(&db_path);
     }
 
-    #[tokio::test]
-    async fn same_day_snapshot_does_not_lower_seeded_counters() {
-        let (state, db_path) = temp_state("same-day-stats-max").await;
-        state
-            .inner
-            .live_stats
-            .total_queries
-            .store(100, Ordering::Relaxed);
+    #[test]
+    fn same_day_snapshot_does_not_lower_seeded_counters() {
+        let (cache, live) = fixture();
+        live.total_queries.store(100, Ordering::Relaxed);
         let snapshot = StateSnapshot {
             version: SNAPSHOT_VERSION,
             created_at: chrono::Utc::now().timestamp(),
@@ -256,20 +240,14 @@ mod tests {
             total_allowed: 0,
         };
 
-        apply_snapshot(&state, &snapshot);
+        apply_snapshot(&cache, &live, &snapshot);
 
-        assert_eq!(
-            state.inner.live_stats.total_queries.load(Ordering::Relaxed),
-            100
-        );
-
-        drop(state);
-        cleanup_sqlite(&db_path);
+        assert_eq!(live.total_queries.load(Ordering::Relaxed), 100);
     }
 
-    #[tokio::test]
-    async fn previous_day_snapshot_does_not_restore_live_counters() {
-        let (state, db_path) = temp_state("previous-day-stats").await;
+    #[test]
+    fn previous_day_snapshot_does_not_restore_live_counters() {
+        let (cache, live) = fixture();
         let yesterday = (chrono::Utc::now() - chrono::Duration::days(1)).timestamp();
         let snapshot = StateSnapshot {
             version: SNAPSHOT_VERSION,
@@ -282,17 +260,13 @@ mod tests {
             total_allowed: 18,
         };
 
-        apply_snapshot(&state, &snapshot);
+        apply_snapshot(&cache, &live, &snapshot);
 
-        let live = &state.inner.live_stats;
         assert_eq!(live.total_queries.load(Ordering::Relaxed), 0);
         assert_eq!(live.total_blocked.load(Ordering::Relaxed), 0);
         assert_eq!(live.total_cached.load(Ordering::Relaxed), 0);
         assert_eq!(live.total_upstream.load(Ordering::Relaxed), 0);
         assert_eq!(live.total_allowed.load(Ordering::Relaxed), 0);
-
-        drop(state);
-        cleanup_sqlite(&db_path);
     }
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -304,32 +278,5 @@ mod tests {
             "ferrite-snapshot-{name}-{}-{nanos}.bin",
             std::process::id()
         ))
-    }
-
-    fn temp_db_path(name: &str) -> std::path::PathBuf {
-        let mut path = temp_path(name);
-        path.set_extension("db");
-        path
-    }
-
-    async fn temp_state(name: &str) -> (AppState, std::path::PathBuf) {
-        let db_path = temp_db_path(name);
-        let mut config = Config::default();
-        config.storage.path = db_path.clone();
-        config.blocklist.lists.clear();
-        config.upstream = vec![UpstreamConfig::Plain {
-            address: "127.0.0.1".to_string(),
-            port: 53,
-            egress: None,
-        }];
-
-        let state = AppState::init(&config, config.clone()).await.unwrap();
-        (state, db_path)
-    }
-
-    fn cleanup_sqlite(path: &std::path::Path) {
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(path.with_extension("db-shm"));
-        let _ = std::fs::remove_file(path.with_extension("db-wal"));
     }
 }

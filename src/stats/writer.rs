@@ -1,26 +1,34 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::{Notify, mpsc};
 use tokio::time::timeout;
 
-use crate::app::AppState;
 use crate::clients::{ClientRegistry, parse_ip};
 use crate::dns::types::QueryEntry;
+use crate::stats::live::LiveStats;
+use crate::storage::Storage;
 
 const BATCH_SIZE: usize = 500;
 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
-pub async fn run(state: AppState) -> anyhow::Result<()> {
-    let mut rx = state
-        .query_rx
-        .lock()
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("stats writer: query_rx already consumed"))?;
+/// The slice of app state the stats writer needs.
+pub struct WriterCtx {
+    pub live_stats: Arc<LiveStats>,
+    pub client_registry: Arc<ClientRegistry>,
+    pub storage: Arc<dyn Storage>,
+    /// Signals the writer to flush its current batch immediately (shutdown).
+    pub flush_notify: Arc<Notify>,
+    /// Signalled by the writer once its final flush is complete.
+    pub flush_done: Arc<Notify>,
+}
 
+pub async fn run(ctx: WriterCtx, mut rx: mpsc::Receiver<QueryEntry>) -> anyhow::Result<()> {
     tracing::info!("stats writer started");
 
     let mut batch: Vec<QueryEntry> = Vec::with_capacity(BATCH_SIZE);
-    let flush_notify = state.flush_notify.clone();
+    let flush_notify = ctx.flush_notify.clone();
 
     loop {
         tokio::select! {
@@ -28,14 +36,14 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
             _ = flush_notify.notified() => {
                 // Drain any remaining entries queued before the signal.
                 while let Ok(mut entry) = rx.try_recv() {
-                    tag_device(&state, &mut entry);
-                    state.inner.live_stats.push_entry(entry.clone());
+                    tag_device(&ctx, &mut entry);
+                    ctx.live_stats.push_entry(entry.clone());
                     batch.push(entry);
                 }
                 tracing::info!("stats writer flush requested, writing {} entries", batch.len());
-                flush_batch(&state, &mut batch).await;
+                flush_batch(&ctx, &mut batch).await;
                 // Signal shutdown handler that the flush is done.
-                state.flush_done.notify_one();
+                ctx.flush_done.notify_one();
                 return Ok(());
             }
 
@@ -44,8 +52,8 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
                 loop {
                     match timeout(FLUSH_INTERVAL, rx.recv()).await {
                         Ok(Some(mut entry)) => {
-                            tag_device(&state, &mut entry);
-                            state.inner.live_stats.push_entry(entry.clone());
+                            tag_device(&ctx, &mut entry);
+                            ctx.live_stats.push_entry(entry.clone());
                             batch.push(entry);
                             if batch.len() >= BATCH_SIZE {
                                 break true; // flush now
@@ -61,11 +69,11 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
             } => {
                 if !result {
                     tracing::info!("query channel closed, flushing final batch");
-                    flush_batch(&state, &mut batch).await;
+                    flush_batch(&ctx, &mut batch).await;
                     return Ok(());
                 }
                 if !batch.is_empty() {
-                    flush_batch(&state, &mut batch).await;
+                    flush_batch(&ctx, &mut batch).await;
                     batch = Vec::with_capacity(BATCH_SIZE);
                 }
             }
@@ -79,16 +87,16 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
 /// the neighbour-table mirror a few seconds to warm the IP→MAC cache, so a query
 /// from a freshly-rotated address (e.g. an Apple privacy IPv6) lands on its device
 /// MAC instead of fragmenting per IP. Falls back to the IP when no MAC is known.
-fn tag_device(state: &AppState, entry: &mut QueryEntry) {
+fn tag_device(ctx: &WriterCtx, entry: &mut QueryEntry) {
     if !entry.device.is_empty() {
         return;
     }
     entry.device = parse_ip(&entry.client_ip)
-        .and_then(|ip| state.inner.client_registry.get_mac(ip))
+        .and_then(|ip| ctx.client_registry.get_mac(ip))
         .unwrap_or_else(|| entry.client_ip.clone());
 }
 
-async fn flush_batch(state: &AppState, batch: &mut Vec<QueryEntry>) {
+async fn flush_batch(ctx: &WriterCtx, batch: &mut Vec<QueryEntry>) {
     if batch.is_empty() {
         return;
     }
@@ -102,11 +110,11 @@ async fn flush_batch(state: &AppState, batch: &mut Vec<QueryEntry>) {
         if seen.insert(entry.client_ip.as_str())
             && let Some(ip) = parse_ip(&entry.client_ip)
         {
-            ClientRegistry::trigger_resolve(&state.inner.client_registry, ip);
+            ClientRegistry::trigger_resolve(&ctx.client_registry, ip);
         }
     }
 
-    match state.inner.storage.write_batch(&to_write).await {
+    match ctx.storage.write_batch(&to_write).await {
         Err(e) => {
             tracing::error!(
                 "failed to write query batch ({} entries): {}",

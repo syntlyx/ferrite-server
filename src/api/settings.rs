@@ -390,7 +390,11 @@ pub async fn update_settings(
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             let path = snap_state.inner.snapshot_path.clone();
-            if let Err(e) = crate::snapshot::save::save(&snap_state, &path) {
+            if let Err(e) = crate::snapshot::save::save(
+                &snap_state.inner.dns_cache,
+                &snap_state.inner.live_stats,
+                &path,
+            ) {
                 tracing::error!("snapshot save before restart failed: {}", e);
             }
             std::process::exit(0);

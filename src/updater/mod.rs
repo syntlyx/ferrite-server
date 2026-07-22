@@ -3,12 +3,22 @@ pub mod github;
 pub mod server;
 pub mod web;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use parking_lot::RwLock;
 use serde::Serialize;
 
-use crate::app::AppState;
+use crate::config::Config;
 use crate::error::Result;
+
+/// The slice of app state the updater needs: the shared check cache plus the
+/// live config (`web_dir` is hot-patchable via the settings API).
+#[derive(Clone)]
+pub struct UpdaterCtx {
+    pub cache: Arc<tokio::sync::Mutex<UpdateCheckCache>>,
+    pub live_config: Arc<RwLock<Config>>,
+}
 
 /// How often to poll for updates.
 const CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60); // 1 hour
@@ -124,20 +134,20 @@ impl CachedUpdateCheck {
 }
 
 /// Return the cached update state without contacting GitHub unless `force` is set.
-pub async fn cached_update_check(state: &AppState, force: bool) -> Result<UpdateCheckSnapshot> {
+pub async fn cached_update_check(ctx: &UpdaterCtx, force: bool) -> Result<UpdateCheckSnapshot> {
     if force {
-        return refresh_update_check_cache(state).await;
+        return refresh_update_check_cache(ctx).await;
     }
 
-    if let Some(snapshot) = state.update_check_cache.lock().await.fresh(CHECK_CACHE_TTL) {
+    if let Some(snapshot) = ctx.cache.lock().await.fresh(CHECK_CACHE_TTL) {
         return Ok(snapshot);
     }
 
-    if let Some(snapshot) = state.update_check_cache.lock().await.latest() {
+    if let Some(snapshot) = ctx.cache.lock().await.latest() {
         return Ok(snapshot);
     }
 
-    Ok(installed_versions_snapshot(state, None, true).await)
+    Ok(installed_versions_snapshot(ctx, None, true).await)
 }
 
 pub fn normalize_release_version(version: &str) -> String {
@@ -145,27 +155,23 @@ pub fn normalize_release_version(version: &str) -> String {
 }
 
 /// Perform a network update check, store it in the shared cache, and return it.
-pub async fn refresh_update_check_cache(state: &AppState) -> Result<UpdateCheckSnapshot> {
-    match live_update_check(state).await {
+pub async fn refresh_update_check_cache(ctx: &UpdaterCtx) -> Result<UpdateCheckSnapshot> {
+    match live_update_check(ctx).await {
         Ok(snapshot) => {
-            state
-                .update_check_cache
-                .lock()
-                .await
-                .store(snapshot.clone());
+            ctx.cache.lock().await.store(snapshot.clone());
             Ok(snapshot)
         }
         Err(err) => {
             let error = err.to_string();
-            let snapshot = installed_versions_snapshot(state, Some(error), false).await;
-            state.update_check_cache.lock().await.store_error(snapshot);
+            let snapshot = installed_versions_snapshot(ctx, Some(error), false).await;
+            ctx.cache.lock().await.store_error(snapshot);
             Err(err)
         }
     }
 }
 
-async fn live_update_check(state: &AppState) -> Result<UpdateCheckSnapshot> {
-    let current = installed_versions_snapshot(state, None, false).await;
+async fn live_update_check(ctx: &UpdaterCtx) -> Result<UpdateCheckSnapshot> {
+    let current = installed_versions_snapshot(ctx, None, false).await;
 
     let (server_info, web_info) = tokio::join!(
         server::check(&current.current_server_version),
@@ -191,14 +197,14 @@ async fn live_update_check(state: &AppState) -> Result<UpdateCheckSnapshot> {
 }
 
 async fn installed_versions_snapshot(
-    state: &AppState,
+    ctx: &UpdaterCtx,
     last_error: Option<String>,
     check_pending: bool,
 ) -> UpdateCheckSnapshot {
     let current_server_version = env!("CARGO_PKG_VERSION").to_string();
     let current_server_sha256 = server::installed_sha256().await.ok().flatten();
 
-    let web_dir = state
+    let web_dir = ctx
         .live_config
         .read()
         .web_dir
@@ -268,7 +274,7 @@ fn now_ts() -> i64 {
 }
 
 /// Background task that periodically checks for server and web UI updates.
-pub async fn check_loop(state: AppState) -> anyhow::Result<()> {
+pub async fn check_loop(ctx: UpdaterCtx) -> anyhow::Result<()> {
     tracing::info!(
         "updater check loop started (interval: {:?})",
         CHECK_INTERVAL
@@ -280,7 +286,7 @@ pub async fn check_loop(state: AppState) -> anyhow::Result<()> {
         ticker.tick().await;
         tracing::debug!("running update check");
 
-        match refresh_update_check_cache(&state).await {
+        match refresh_update_check_cache(&ctx).await {
             Ok(snapshot) => {
                 if let Some(info) = snapshot.server_update {
                     tracing::info!(

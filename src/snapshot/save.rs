@@ -1,18 +1,17 @@
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
-use crate::app::AppState;
+use crate::dns::cache::DnsCache;
 use crate::error::Result;
 use crate::snapshot::{DnsCacheEntry, SNAPSHOT_MAGIC, SNAPSHOT_VERSION, StateSnapshot};
+use crate::stats::live::LiveStats;
 
-/// Build a `StateSnapshot` from the current application state.
-pub fn build_snapshot(state: &AppState) -> StateSnapshot {
+/// Build a `StateSnapshot` from the DNS cache and live stats counters.
+pub fn build_snapshot(dns_cache: &DnsCache, live: &LiveStats) -> StateSnapshot {
     let now_unix = chrono::Utc::now().timestamp();
 
     // Snapshot the DNS response cache.
-    let dns_cache: Vec<DnsCacheEntry> = state
-        .inner
-        .dns_cache
+    let dns_cache: Vec<DnsCacheEntry> = dns_cache
         .snapshot()
         .into_iter()
         .map(|(key, response, expires_at)| {
@@ -32,8 +31,6 @@ pub fn build_snapshot(state: &AppState) -> StateSnapshot {
             }
         })
         .collect();
-
-    let live = &state.inner.live_stats;
 
     StateSnapshot {
         version: SNAPSHOT_VERSION,
@@ -74,7 +71,7 @@ pub fn save_snapshot(snapshot: &StateSnapshot, path: &Path) -> Result<()> {
 }
 
 /// Convenience: build and save the snapshot in one call.
-pub fn save(state: &AppState, path: &Path) -> Result<()> {
-    let snapshot = build_snapshot(state);
+pub fn save(dns_cache: &DnsCache, live: &LiveStats, path: &Path) -> Result<()> {
+    let snapshot = build_snapshot(dns_cache, live);
     save_snapshot(&snapshot, path)
 }

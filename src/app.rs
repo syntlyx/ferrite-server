@@ -78,6 +78,26 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// The slice of state the stats writer consumes (everything but the
+    /// pipeline receiver, which `main` takes out of `query_rx` once).
+    pub fn writer_ctx(&self) -> crate::stats::writer::WriterCtx {
+        crate::stats::writer::WriterCtx {
+            live_stats: Arc::clone(&self.inner.live_stats),
+            client_registry: Arc::clone(&self.inner.client_registry),
+            storage: Arc::clone(&self.inner.storage),
+            flush_notify: Arc::clone(&self.flush_notify),
+            flush_done: Arc::clone(&self.flush_done),
+        }
+    }
+
+    /// The slice of state the updater consumes.
+    pub fn updater_ctx(&self) -> crate::updater::UpdaterCtx {
+        crate::updater::UpdaterCtx {
+            cache: Arc::clone(&self.update_check_cache),
+            live_config: Arc::clone(&self.live_config),
+        }
+    }
+
     /// Construct the full application state from configuration.
     pub async fn init(config: &Config, persistent_config: Config) -> Result<Self> {
         // Storage

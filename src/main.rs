@@ -164,7 +164,11 @@ async fn run() -> anyhow::Result<()> {
         let snap_path = state.inner.snapshot_path.clone();
         match snapshot::restore::load_snapshot(&snap_path) {
             Ok(Some(snap)) => {
-                snapshot::restore::apply_snapshot(&state, &snap);
+                snapshot::restore::apply_snapshot(
+                    &state.inner.dns_cache,
+                    &state.inner.live_stats,
+                    &snap,
+                );
                 // Remove snapshot after applying so stale data isn't re-applied.
                 let _ = std::fs::remove_file(&snap_path);
             }
@@ -205,9 +209,10 @@ async fn run() -> anyhow::Result<()> {
             }
             tracing::info!("saving snapshot…");
             let path = state_for_shutdown.inner.snapshot_path.clone();
-            let save_task = tokio::task::spawn_blocking(move || {
-                snapshot::save::save(&state_for_shutdown, &path)
-            });
+            let dns_cache = Arc::clone(&state_for_shutdown.inner.dns_cache);
+            let live = Arc::clone(&state_for_shutdown.inner.live_stats);
+            let save_task =
+                tokio::task::spawn_blocking(move || snapshot::save::save(&dns_cache, &live, &path));
             match tokio::time::timeout(std::time::Duration::from_secs(10), save_task).await {
                 Ok(Ok(Ok(()))) => tracing::info!("snapshot saved, exiting"),
                 Ok(Ok(Err(e))) => tracing::error!("failed to save snapshot: {}", e),
@@ -262,12 +267,22 @@ async fn run() -> anyhow::Result<()> {
     });
 
     // ── Main services ────────────────────────────────────────────────────────
+    // The stats writer owns the receiving end of the query pipeline.
+    let query_rx = state
+        .query_rx
+        .lock()
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("stats writer: query_rx already consumed"))?;
     let result = tokio::try_join!(
         dns::server::run(state.clone()),
         api::serve(state.clone()),
-        stats::writer::run(state.clone()),
-        updater::check_loop(state.clone()),
-        periodic_snapshot(state.clone()),
+        stats::writer::run(state.writer_ctx(), query_rx),
+        updater::check_loop(state.updater_ctx()),
+        periodic_snapshot(
+            Arc::clone(&state.inner.dns_cache),
+            Arc::clone(&state.inner.live_stats),
+            state.inner.snapshot_path.clone(),
+        ),
     );
 
     // try_join returns on the first Err — log which service caused the exit.
@@ -279,18 +294,24 @@ async fn run() -> anyhow::Result<()> {
 }
 
 /// Save a snapshot every 5 minutes so a crash loses at most 5 min of cache.
-async fn periodic_snapshot(state: app::AppState) -> anyhow::Result<()> {
+async fn periodic_snapshot(
+    dns_cache: Arc<dns::cache::DnsCache>,
+    live: Arc<stats::live::LiveStats>,
+    path: std::path::PathBuf,
+) -> anyhow::Result<()> {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
     interval.tick().await; // skip the immediate first tick
     loop {
         interval.tick().await;
-        let state_clone = state.clone();
-        let path = state.inner.snapshot_path.clone();
+        let dns_cache = Arc::clone(&dns_cache);
+        let live = Arc::clone(&live);
+        let path = path.clone();
         // Use spawn_blocking: std::fs::write inside save() is a blocking syscall.
         // Calling it directly on a tokio worker thread would stall the runtime,
         // especially on slow storage (SD card, NFS).
         let result =
-            tokio::task::spawn_blocking(move || snapshot::save::save(&state_clone, &path)).await;
+            tokio::task::spawn_blocking(move || snapshot::save::save(&dns_cache, &live, &path))
+                .await;
 
         match result {
             Ok(Ok(())) => {}
