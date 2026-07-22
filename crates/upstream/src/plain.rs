@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
-use crate::upstream::stream::StreamPool;
+use crate::stream::StreamPool;
 use ferrite_core::error::{FeriteError, Result};
 
 const UDP_TIMEOUT: Duration = Duration::from_secs(5);

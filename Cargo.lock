@@ -750,6 +750,7 @@ dependencies = [
  "ferrite-blocklist",
  "ferrite-core",
  "ferrite-storage",
+ "ferrite-upstream",
  "flate2",
  "fst",
  "hickory-proto",
@@ -840,6 +841,23 @@ dependencies = [
  "tokio",
  "tokio-rusqlite",
  "tracing",
+]
+
+[[package]]
+name = "ferrite-upstream"
+version = "0.1.7"
+dependencies = [
+ "base64",
+ "ferrite-core",
+ "hickory-proto",
+ "hickory-resolver",
+ "reqwest",
+ "ring",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "webpki-roots",
 ]
 
 [[package]]

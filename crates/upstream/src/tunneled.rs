@@ -27,7 +27,7 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
-use crate::upstream::egress::{EgressConn, EgressConnectError, ProxyHandle};
+use crate::egress::{EgressConn, EgressConnectError, ProxyHandle};
 use ferrite_core::error::{FeriteError, Result};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(8);
@@ -212,7 +212,7 @@ fn io_dns(e: std::io::Error) -> FeriteError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::upstream::egress::{EgressConnector, no_proxy};
+    use crate::egress::{EgressConnector, no_proxy};
     use std::net::SocketAddr;
 
     #[test]
@@ -315,7 +315,7 @@ mod tests {
             _egress_id: &'a str,
             _host: &'a str,
             _port: u16,
-        ) -> crate::upstream::egress::EgressConnectFuture<'a> {
+        ) -> crate::egress::EgressConnectFuture<'a> {
             let addr = self.0;
             Box::pin(async move {
                 TcpStream::connect(addr)
@@ -335,7 +335,7 @@ mod tests {
             _egress_id: &'a str,
             _host: &'a str,
             _port: u16,
-        ) -> crate::upstream::egress::EgressConnectFuture<'a> {
+        ) -> crate::egress::EgressConnectFuture<'a> {
             Box::pin(async { Err(EgressConnectError::Unhealthy) })
         }
     }

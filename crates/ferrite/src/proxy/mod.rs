@@ -41,8 +41,8 @@ use tokio::sync::Notify;
 use crate::clients::ClientRegistry;
 use crate::dns::intercept::{DnsInterceptor, Intercept};
 use crate::dns::types::{DnsResponse, qtype as qt};
-use crate::upstream::{EgressConnectError, EgressConnectFuture, EgressConnector, ZoneRouter};
 use ferrite_core::config::{Config, EgressConfig, ProxyConfig};
+use ferrite_upstream::{EgressConnectError, EgressConnectFuture, EgressConnector, ZoneRouter};
 
 pub(crate) use egress::direct_connect;
 pub(crate) use egress::usable_rcvbuf_bytes;
@@ -524,8 +524,8 @@ mod tests {
     use hickory_proto::serialize::binary::BinDecodable;
 
     use crate::dns::types::qtype;
-    use crate::upstream::{UpstreamPool, ZoneRouter, no_proxy};
     use ferrite_core::config::{EgressConfig, ProxyConfig, RuleConfig, UpstreamConfig};
+    use ferrite_upstream::{UpstreamPool, ZoneRouter, no_proxy};
 
     fn upstream() -> Arc<ZoneRouter> {
         let pool = UpstreamPool::from_config(

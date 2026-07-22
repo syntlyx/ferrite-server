@@ -20,6 +20,7 @@ license = "MIT"
 ferrite-blocklist = { path = "crates/blocklist" }
 ferrite-core = { path = "crates/core" }
 ferrite-storage = { path = "crates/storage" }
+ferrite-upstream = { path = "crates/upstream" }
 
 # ── Async runtime ─────────────────────────────────────────────────────────────
 tokio = { version = "1", features = ["full"] }

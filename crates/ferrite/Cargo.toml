@@ -12,6 +12,7 @@ path = "src/main.rs"
 ferrite-blocklist.workspace = true
 ferrite-core.workspace = true
 ferrite-storage.workspace = true
+ferrite-upstream.workspace = true
 
 tokio.workspace = true
 hickory-resolver.workspace = true

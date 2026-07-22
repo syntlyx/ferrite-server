@@ -17,8 +17,8 @@ use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-use crate::upstream::ZoneRouter;
 use ferrite_core::error::{FeriteError, Result};
+use ferrite_upstream::ZoneRouter;
 
 use super::enable_keepalive;
 

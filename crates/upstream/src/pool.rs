@@ -3,11 +3,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio_rustls::rustls::ClientConfig;
 
-use crate::upstream::egress::ProxyHandle;
-use crate::upstream::tunneled::{TunneledResolver, client_config};
-use crate::upstream::{
-    doh::DohResolver, doq::DoqResolver, plain::PlainResolver, stream::StreamResolver,
-};
+use crate::egress::ProxyHandle;
+use crate::tunneled::{TunneledResolver, client_config};
+use crate::{doh::DohResolver, doq::DoqResolver, plain::PlainResolver, stream::StreamResolver};
 use ferrite_core::config::UpstreamConfig;
 use ferrite_core::error::{FeriteError, Result};
 

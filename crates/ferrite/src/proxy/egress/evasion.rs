@@ -14,8 +14,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::upstream::ZoneRouter;
 use ferrite_core::error::Result;
+use ferrite_upstream::ZoneRouter;
 
 /// Tunables for ClientHello fragmentation.
 #[derive(Clone, Copy)]

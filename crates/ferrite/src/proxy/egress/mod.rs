@@ -6,7 +6,7 @@
 //! resolves via the upstream pool and routes the connection through the tunnel.
 //! That makes "no DNS leak" a property of the design rather than extra plumbing.
 //!
-//! [`EgressConn`] (owned by the upstream layer, see [`crate::upstream::egress`])
+//! [`EgressConn`] (owned by the upstream layer, see [`ferrite_upstream::egress`])
 //! is an enum over the concrete stream types (a plain TCP stream for
 //! Direct/SOCKS5, an in-memory pipe for WireGuard) so it stays usable with
 //! `tokio::io::copy_bidirectional`.
@@ -25,11 +25,11 @@ use std::time::Duration;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
 
-use crate::upstream::ZoneRouter;
 use ferrite_core::config::EgressConfig;
 use ferrite_core::error::{FeriteError, Result};
+use ferrite_upstream::ZoneRouter;
 
-pub use crate::upstream::EgressConn;
+pub use ferrite_upstream::EgressConn;
 
 /// Why an egress connect failed — determines whether the circuit breaker counts
 /// it. Getting a reply from the proxy/tunnel proves the transport works, so a

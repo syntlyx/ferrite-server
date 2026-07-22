@@ -11,12 +11,12 @@ use crate::dns::cache::DnsCache;
 use crate::dns::custom::CustomRecords;
 use crate::stats::CpuSampler;
 use crate::stats::live::LiveStats;
-use crate::upstream::{UpstreamPool, ZoneRouter};
 use ferrite_blocklist::Blocklist;
 use ferrite_core::config::{Config, CustomRecordConfig};
 use ferrite_core::error::Result;
 use ferrite_core::types::QueryEntry;
 use ferrite_storage::{SqliteStorage, Storage};
+use ferrite_upstream::{UpstreamPool, ZoneRouter};
 
 /// Capacity of the query channel (DNS handler → stats writer).
 const QUERY_CHANNEL_CAPACITY: usize = 8_192;
@@ -281,7 +281,7 @@ impl AppState {
         // egress — so the pool gets a late-bound handle to the proxy, filled in
         // once the proxy exists below. Empty until then → such upstreams resolve
         // direct, which is also the steady-state fallback when the tunnel is down.
-        let proxy_handle: crate::upstream::ProxyHandle = crate::upstream::no_proxy();
+        let proxy_handle: ferrite_upstream::ProxyHandle = ferrite_upstream::no_proxy();
         let default_pool = UpstreamPool::from_config(&config.upstream, Arc::clone(&proxy_handle))?;
         let upstream_pool = ZoneRouter::new(&config.zones, default_pool)?;
 

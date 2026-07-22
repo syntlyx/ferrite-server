@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use dashmap::{DashMap, DashSet};
 use ring::rand::{SecureRandom, SystemRandom};
 
-use crate::upstream::ZoneRouter;
 use ferrite_storage::Storage;
+use ferrite_upstream::ZoneRouter;
 
 // ── Constants (visible to registry.rs and resolver.rs) ───────────────────────
 

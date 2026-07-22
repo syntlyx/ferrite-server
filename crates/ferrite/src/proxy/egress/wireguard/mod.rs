@@ -45,9 +45,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::timeout;
 
-use crate::upstream::ZoneRouter;
 use ferrite_core::config::EgressConfig;
 use ferrite_core::error::{FeriteError, Result};
+use ferrite_upstream::ZoneRouter;
 
 use device::WgDevice;
 
@@ -1273,8 +1273,8 @@ mod smoke {
     //! It proves the layers a unit test can't: the boringtun handshake against a
     //! real peer, and a TCP byte exchange routed all the way through the tunnel.
     use super::*;
-    use crate::upstream::{UpstreamPool, ZoneRouter, no_proxy};
     use ferrite_core::config::{EgressConfig, UpstreamConfig};
+    use ferrite_upstream::{UpstreamPool, ZoneRouter, no_proxy};
 
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::{Name, RData, RecordType};

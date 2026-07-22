@@ -5,7 +5,7 @@
 //! verbatim and returns the **raw wire response** untouched — so DNSSEC records
 //! (RRSIG/DNSKEY/NSEC…) ride through unmodified regardless of transport. DNSSEC
 //! is a property of the data, not the channel, so every stream transport must
-//! treat it the same way (see [`crate::upstream::tunneled`], which does the same
+//! treat it the same way (see [`crate::tunneled`], which does the same
 //! over an egress).
 //!
 //! Connections are **pooled**: an idle connection is reused for the next query
@@ -24,7 +24,7 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 
-use crate::upstream::tunneled::client_config;
+use crate::tunneled::client_config;
 use ferrite_core::error::{FeriteError, Result};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);

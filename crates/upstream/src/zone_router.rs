@@ -4,7 +4,7 @@ use std::sync::Arc;
 use hickory_proto::op::Message;
 use hickory_proto::serialize::binary::BinDecodable;
 
-use crate::upstream::{UpstreamPool, plain::PlainResolver};
+use crate::{UpstreamPool, plain::PlainResolver};
 use ferrite_core::config::ZoneConfig;
 use ferrite_core::error::{FeriteError, Result};
 

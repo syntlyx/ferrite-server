@@ -9,7 +9,6 @@ mod stats;
 #[cfg(test)]
 mod test_support;
 mod updater;
-mod upstream;
 mod web;
 
 use std::{sync::Arc, time::Duration};
