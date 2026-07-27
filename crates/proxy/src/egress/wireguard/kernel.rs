@@ -1053,4 +1053,125 @@ mod tests {
             "tear_down must remove the netdev"
         );
     }
+
+    /// Real end-to-end check of the kernel backend against a live WireGuard
+    /// peer: handshake, health, and a DNS-over-TCP exchange routed through the
+    /// netdev. Needs CAP_NET_ADMIN + the wireguard module + network + a real
+    /// `.conf`:
+    ///
+    /// ```text
+    /// docker run --rm --cap-add=NET_ADMIN -v /path/wg.conf:/wg.conf \
+    ///   -e WG_SMOKE_CONF=/wg.conf -v "$PWD":/w -w /w rust:latest \
+    ///   cargo test -p ferrite-proxy kernel::tests::smoke -- --ignored --nocapture
+    /// ```
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs CAP_NET_ADMIN + wireguard module + network + WG_SMOKE_CONF"]
+    async fn smoke_handshake_and_data_path() {
+        use ferrite_core::config::UpstreamConfig;
+        use ferrite_upstream::{UpstreamPool, no_proxy};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        assert!(
+            detect().await,
+            "kernel backend must be detected in this env"
+        );
+        let path =
+            std::env::var("WG_SMOKE_CONF").expect("set WG_SMOKE_CONF=/path/to/wireguard.conf");
+        let text = std::fs::read_to_string(&path).expect("read conf file");
+        let conf = super::super::parse(&text).expect("parse conf");
+
+        let pool = UpstreamPool::from_config(
+            &[UpstreamConfig::Plain {
+                address: "1.1.1.1".into(),
+                port: 53,
+                egress: None,
+            }],
+            no_proxy(),
+        )
+        .expect("upstream pool");
+        let upstream = ZoneRouter::new(&[], pool).expect("zone router");
+        let cfg = EgressConfig {
+            id: "ksmoke".into(),
+            name: "ksmoke".into(),
+            enabled: true,
+            kind: "wireguard".into(),
+            address: None,
+            port: None,
+            username: None,
+            password: None,
+            config: Some(text),
+            seg_position: None,
+            buffer_kb: None,
+            tx_buffer_kb: None,
+            backend: Some("kernel".into()),
+        };
+        let eg = KernelWg::spawn(&cfg, conf, upstream);
+
+        // The first connect both waits out the netdev setup and triggers the
+        // initial handshake (kernel WG handshakes on demand).
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut stream = loop {
+            match eg.connect("1.1.1.1", 53).await {
+                Ok(s) => break s,
+                Err(e) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "no tunneled connect within 30s: {e}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        };
+        println!("[smoke] ✅ TCP through kernel netdev established");
+
+        // DNS-over-TCP through the tunnel proves the full data path.
+        let mut msg = kick_query();
+        let mut framed = Vec::with_capacity(msg.len() + 2);
+        framed.extend_from_slice(&(msg.len() as u16).to_be_bytes());
+        framed.append(&mut msg);
+        stream.write_all(&framed).await.expect("write dns query");
+        let mut len = [0u8; 2];
+        timeout(Duration::from_secs(10), stream.read_exact(&mut len))
+            .await
+            .expect("dns read timed out")
+            .expect("read dns length");
+        let mut resp = vec![0u8; u16::from_be_bytes(len) as usize];
+        timeout(Duration::from_secs(10), stream.read_exact(&mut resp))
+            .await
+            .expect("dns body timed out")
+            .expect("read dns body");
+        assert!(resp.len() > 12, "short dns response");
+        println!(
+            "[smoke] ✅ DNS-over-TCP through the tunnel ({} bytes)",
+            resp.len()
+        );
+
+        // Health follows the handshake the poll observed.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !eg.is_healthy() {
+            assert!(
+                Instant::now() < deadline,
+                "handshake happened but health never flipped"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        println!(
+            "[smoke] ✅ healthy, handshake age {:?}s",
+            eg.handshake_age_secs()
+        );
+
+        // Hostname path: resolve through the tunnel DNS, connect, HTTP GET.
+        let mut http = eg
+            .connect("checkip.amazonaws.com", 80)
+            .await
+            .expect("hostname connect through tunnel");
+        let req = b"GET / HTTP/1.0\r\nHost: checkip.amazonaws.com\r\nConnection: close\r\n\r\n";
+        http.write_all(req).await.expect("write http");
+        let mut body = Vec::new();
+        let _ = timeout(Duration::from_secs(10), http.read_to_end(&mut body)).await;
+        let text = String::from_utf8_lossy(&body);
+        let exit_ip = text.lines().last().unwrap_or("").trim().to_string();
+        println!("[smoke] ✅ exit IP through kernel tunnel (expect the VPN's): {exit_ip}");
+        assert!(!exit_ip.is_empty(), "no exit IP came back");
+    }
 }
