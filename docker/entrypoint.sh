@@ -234,8 +234,18 @@ install_web
 
 if [ "$(id -u)" -eq 0 ]; then
     chown -R ferrite:ferrite "${FERRITE_HOME}"
-    setcap cap_net_bind_service=+ep "${SERVER_BIN}" 2>/dev/null || \
-        warn "could not set cap_net_bind_service on ${SERVER_BIN}; port 53 may require --cap-add=NET_BIND_SERVICE"
+    # File caps marked +e DEMAND the capability at exec — setting one the
+    # container wasn't granted would make the binary unrunnable, not degraded.
+    # So cap_net_admin (kernel-WireGuard tunnels: --cap-add=NET_ADMIN, plus the
+    # wireguard module on the host) is added only when the bounding set has it
+    # (bit 12 of CapBnd); without it tunnels use the userspace backend.
+    caps="cap_net_bind_service"
+    capbnd="$(awk '/^CapBnd:/ {print $2}' /proc/self/status 2>/dev/null)"
+    if [ -n "${capbnd}" ] && [ "$(( 0x${capbnd} >> 12 & 1 ))" -eq 1 ]; then
+        caps="cap_net_admin,cap_net_bind_service"
+    fi
+    setcap "${caps}=+ep" "${SERVER_BIN}" 2>/dev/null || \
+        warn "could not set ${caps} on ${SERVER_BIN}; port 53 may require --cap-add=NET_BIND_SERVICE"
     exec su-exec ferrite:ferrite "${SERVER_BIN}" "$@"
 fi
 

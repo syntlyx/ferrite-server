@@ -15,6 +15,8 @@
 mod conf;
 mod device;
 mod dns;
+#[cfg(target_os = "linux")]
+mod kernel;
 mod user;
 
 pub use conf::parse;
@@ -58,11 +60,69 @@ pub struct WgEgress(Backend);
 
 enum Backend {
     User(user::UserWg),
+    #[cfg(target_os = "linux")]
+    Kernel(kernel::KernelWg),
+}
+
+/// Probe once for kernel-WireGuard support (Linux + `CAP_NET_ADMIN` + the
+/// `wireguard` module) and cache the verdict for every subsequent egress
+/// build. Called by the binary at startup, before the proxy exists — egress
+/// construction is synchronous, so the decision must already be made. Returns
+/// whether the kernel backend is available.
+pub async fn detect_kernel_backend() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        kernel::detect().await
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Whether the kernel backend probe succeeded (Linux-only; see [`detect_kernel_backend`]).
+#[cfg(target_os = "linux")]
+pub fn kernel_available() -> bool {
+    kernel::available()
+}
+
+/// Why the kernel backend is unavailable (Linux-only; empty question on other
+/// targets — the caller answers it without us).
+#[cfg(target_os = "linux")]
+pub fn kernel_unavailable_reason() -> String {
+    kernel::unavailable_reason()
+}
+
+/// Which backend a config asks for (validated here so the API can 400 a typo).
+fn backend_choice(cfg: &EgressConfig) -> Result<&'static str> {
+    match cfg
+        .backend
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("auto")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "auto" => Ok("auto"),
+        "kernel" => Ok("kernel"),
+        "userspace" => Ok("userspace"),
+        other => Err(FeriteError::Config(format!(
+            "wireguard egress '{}': unknown backend '{}' (auto | kernel | userspace)",
+            cfg.id, other
+        ))),
+    }
 }
 
 impl WgEgress {
-    /// Parse `cfg.config` and bring up the tunnel. Must be called within a tokio
-    /// runtime (it is — egresses are built at app init / API reload).
+    /// Parse `cfg.config`, pick a backend, and bring up the tunnel. Must be
+    /// called within a tokio runtime (it is — egresses are built at app init /
+    /// API reload).
+    ///
+    /// Backend selection: `auto` (default) uses the kernel backend when the
+    /// startup probe found it, else userspace; an explicit `kernel` fails
+    /// loudly when unavailable instead of silently degrading — the operator
+    /// asked for line-rate and should know they aren't getting it.
     pub fn from_config(cfg: &EgressConfig, upstream: Arc<ZoneRouter>) -> Result<Self> {
         let text = cfg
             .config
@@ -75,6 +135,39 @@ impl WgEgress {
                 ))
             })?;
         let conf = parse(text)?;
+        let choice = backend_choice(cfg)?;
+
+        #[cfg(target_os = "linux")]
+        {
+            match choice {
+                "kernel" if !kernel::available() => {
+                    return Err(FeriteError::Config(format!(
+                        "wireguard egress '{}': kernel backend requested but unavailable: {}",
+                        cfg.id,
+                        kernel::unavailable_reason()
+                    )));
+                }
+                "kernel" => {
+                    return Ok(Self(Backend::Kernel(kernel::KernelWg::spawn(
+                        cfg, conf, upstream,
+                    ))));
+                }
+                "auto" if kernel::available() => {
+                    return Ok(Self(Backend::Kernel(kernel::KernelWg::spawn(
+                        cfg, conf, upstream,
+                    ))));
+                }
+                _ => {}
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        if choice == "kernel" {
+            return Err(FeriteError::Config(format!(
+                "wireguard egress '{}': the kernel backend requires Linux",
+                cfg.id
+            )));
+        }
+
         Ok(Self(Backend::User(user::UserWg::spawn(
             cfg, conf, upstream,
         ))))
@@ -83,6 +176,8 @@ impl WgEgress {
     pub fn id(&self) -> &str {
         match &self.0 {
             Backend::User(u) => u.id(),
+            #[cfg(target_os = "linux")]
+            Backend::Kernel(k) => k.id(),
         }
     }
 
@@ -90,12 +185,16 @@ impl WgEgress {
     pub fn backend(&self) -> &'static str {
         match &self.0 {
             Backend::User(_) => "userspace",
+            #[cfg(target_os = "linux")]
+            Backend::Kernel(_) => "kernel",
         }
     }
 
     pub fn is_healthy(&self) -> bool {
         match &self.0 {
             Backend::User(u) => u.is_healthy(),
+            #[cfg(target_os = "linux")]
+            Backend::Kernel(k) => k.is_healthy(),
         }
     }
 
@@ -103,6 +202,8 @@ impl WgEgress {
     pub fn handshake_age_secs(&self) -> Option<u64> {
         match &self.0 {
             Backend::User(u) => u.handshake_age_secs(),
+            #[cfg(target_os = "linux")]
+            Backend::Kernel(k) => k.handshake_age_secs(),
         }
     }
 
@@ -115,6 +216,8 @@ impl WgEgress {
     ) -> std::result::Result<EgressConn, ConnectError> {
         match &self.0 {
             Backend::User(u) => u.connect(host, port).await.map(EgressConn::Wg),
+            #[cfg(target_os = "linux")]
+            Backend::Kernel(k) => k.connect(host, port).await.map(EgressConn::Tcp),
         }
     }
 }

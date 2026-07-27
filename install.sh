@@ -534,9 +534,11 @@ Restart=always
 RestartSec=5
 TimeoutStopSec=30
 
-# Allow binding to port 53 without running as root.
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# CAP_NET_BIND_SERVICE: bind port 53 without running as root.
+# CAP_NET_ADMIN: kernel-WireGuard tunnels (netlink wg netdev + policy routing);
+# without it wireguard egresses fall back to the userspace backend.
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
 
 # Hardening
 NoNewPrivileges=true
@@ -559,6 +561,27 @@ EOF
     ok "systemd service installed and enabled"
 }
 
+# ── WireGuard kernel module (kernel-mode tunnels) ─────────────────────────────
+# Best-effort: with the module loaded (and CAP_NET_ADMIN from the service unit)
+# WireGuard egresses use the kernel backend — multicore crypto, line-rate
+# throughput. Without it ferrite still works: tunnels fall back to the
+# userspace backend automatically.
+
+enable_wireguard_module() {
+    [ "$OS" = "linux" ] || return 0
+    if modprobe wireguard 2>/dev/null; then
+        # Persist across reboots. Netdev creation would normally autoload the
+        # module anyway; loading it explicitly gives a clear signal at install
+        # time and survives hardened setups that disable autoload.
+        if [ -d /etc/modules-load.d ]; then
+            printf 'wireguard\n' > /etc/modules-load.d/ferrite.conf
+        fi
+        ok "wireguard kernel module loaded (kernel-mode tunnels available)"
+    else
+        info "wireguard kernel module unavailable — tunnels will use the userspace backend"
+    fi
+}
+
 # ── OpenRC service (Alpine) ───────────────────────────────────────────────────
 
 install_openrc() {
@@ -575,7 +598,7 @@ description="Ferrite DNS ad-blocker"
 supervisor=supervise-daemon
 command="${SERVICE_BIN}"
 command_user="${SERVICE_USER}:${SERVICE_GROUP}"
-capabilities="^cap_net_bind_service"
+capabilities="^cap_net_bind_service,^cap_net_admin"
 respawn_delay=5
 respawn_max=3
 respawn_period=60
@@ -687,6 +710,7 @@ main() {
     fix_resolved
     case "$OS" in
         linux)
+            enable_wireguard_module
             case "$INIT_SYSTEM" in
                 systemd) install_systemd ;;
                 openrc)  install_openrc  ;;

@@ -141,6 +141,10 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
+    // Probe for kernel-WireGuard support once, before any egress is built —
+    // `auto`-backend tunnels pick kernel vs userspace off this cached verdict.
+    ferrite_proxy::detect_kernel_wg_backend().await;
+
     let state = ferrite_app::AppState::init(&runtime_config, persistent_config).await?;
 
     // ── Warm restart: restore snapshot ───────────────────────────────────────

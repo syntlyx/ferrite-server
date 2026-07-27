@@ -984,6 +984,7 @@ mod smoke {
             seg_position: None,
             buffer_kb: None,
             tx_buffer_kb: None,
+            backend: None,
         }
     }
 

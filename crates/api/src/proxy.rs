@@ -73,6 +73,18 @@ pub async fn get_proxy_stats(State(state): State<AppState>) -> Json<Value> {
                             .and_then(|eg| eg.handshake_age_secs())
                     ),
                 );
+                // Which implementation carries a WireGuard tunnel ("kernel" /
+                // "userspace"); null for other kinds and unbuilt egresses.
+                obj.insert(
+                    "backend".to_string(),
+                    json!(
+                        state
+                            .inner
+                            .proxy
+                            .egress(&e.id)
+                            .and_then(|eg| eg.wg_backend())
+                    ),
+                );
                 // Downtime as observed by the alert watcher: how long the
                 // egress has been down, and whether that outage has lasted past
                 // the alert grace (what the UI badges on).
@@ -212,6 +224,26 @@ fn validate(cfg: &ProxyConfig) -> Result<(), ApiError> {
                     )));
                 }
                 ferrite_proxy::validate_wireguard_conf(text).map_err(ApiError)?;
+                match e.backend.as_deref().map(str::trim).unwrap_or("") {
+                    "" | "auto" | "userspace" => {}
+                    // Reject a forced kernel backend the host can't provide now,
+                    // instead of silently persisting an egress that will never
+                    // come up (the runtime skips it with only a log line).
+                    "kernel" if !ferrite_proxy::kernel_wg_available() => {
+                        return Err(bad(&format!(
+                            "wireguard egress '{}': kernel backend unavailable: {}",
+                            e.id,
+                            ferrite_proxy::kernel_wg_unavailable_reason()
+                        )));
+                    }
+                    "kernel" => {}
+                    other => {
+                        return Err(bad(&format!(
+                            "wireguard egress '{}': unknown backend '{}' (auto | kernel | userspace)",
+                            e.id, other
+                        )));
+                    }
+                }
             }
             // DirectEvasion needs no required fields; seg_position is optional and
             // any u16 offset is valid (out-of-range is ignored at runtime).
@@ -389,6 +421,7 @@ mod tests {
             seg_position: None,
             buffer_kb: None,
             tx_buffer_kb: None,
+            backend: None,
         }
     }
 
@@ -531,6 +564,7 @@ mod tests {
             seg_position: None,
             buffer_kb: None,
             tx_buffer_kb: None,
+            backend: None,
         }
     }
 

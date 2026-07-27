@@ -77,7 +77,8 @@ docker build -t ferrite:local .
 symlink. That service binary is writable by the `ferrite` service user, so
 `POST /api/update/server` can replace it from the UI; ferrite then exits and the
 supervisor restarts it on the new binary. OpenRC uses `supervise-daemon` with
-ambient `cap_net_bind_service`, so the bind capability survives a binary replace.
+ambient `cap_net_bind_service` + `cap_net_admin`, so the capabilities survive a
+binary replace.
 
 Re-run the installer to update a source/macOS/root-owned install:
 
@@ -98,9 +99,25 @@ curl -fsSL https://raw.githubusercontent.com/syntlyx/ferrite-server/main/install
 - The server refreshes update state hourly in the background; the UI reads the
   cache, and "Check updates" forces a live refresh.
 
-## Privileged ports
+## Privileged ports & capabilities
 
 Binding `:53` (and `:80`/`:443` for the panel + selective routing) needs
-privilege. Deploy with `CAP_NET_BIND_SERVICE` rather than running as root. The
-WireGuard egress is userspace (boringtun + smoltcp) and needs **no** extra
-network capability or TUN device.
+privilege. Deploy with `CAP_NET_BIND_SERVICE` rather than running as root.
+
+WireGuard egresses have two backends, chosen automatically per host:
+
+- **kernel** (preferred; Linux): ferrite creates a real `wireguard` netdev over
+  netlink plus source-address policy routing — the main routing table is never
+  touched. The kernel does the crypto (multicore, GSO/GRO) and TCP autotuning,
+  so tunnel throughput scales to the link. Requires `CAP_NET_ADMIN` (the
+  installer's service units grant it; in Docker pass `--cap-add=NET_ADMIN`) and
+  the `wireguard` kernel module — in Docker the module must be present on the
+  **host** kernel. The startup log states which backend was picked and why.
+- **userspace** (fallback; everywhere): boringtun + smoltcp, fully in-process,
+  no extra capability or TUN device. Single-core crypto and a static
+  per-connection window (`buffer_kb`) cap its throughput — fine for browsing,
+  not for line-rate media.
+
+An egress can pin a backend with `backend = "kernel" | "userspace"` (default
+`auto`); a pinned `kernel` fails loudly instead of degrading when the host
+can't provide it.

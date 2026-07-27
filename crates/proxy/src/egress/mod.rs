@@ -150,6 +150,15 @@ impl Egress {
         }
     }
 
+    /// Which implementation carries a WireGuard tunnel (`"kernel"` /
+    /// `"userspace"`); `None` for other kinds.
+    pub fn wg_backend(&self) -> Option<&'static str> {
+        match self {
+            Self::Wireguard(w) => Some(w.backend()),
+            _ => None,
+        }
+    }
+
     pub async fn connect(
         &self,
         host: &str,
@@ -182,6 +191,33 @@ impl Egress {
 /// Validate a pasted WireGuard `.conf` (used by the API to 400 a bad paste).
 pub fn validate_wireguard_conf(text: &str) -> Result<()> {
     wireguard::parse(text).map(|_| ())
+}
+
+pub use wireguard::detect_kernel_backend as detect_kernel_wg_backend;
+
+/// Whether the kernel WireGuard backend is usable on this host (probed once at
+/// startup by [`detect_kernel_wg_backend`]).
+pub fn kernel_wg_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        wireguard::kernel_available()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Why the kernel WireGuard backend is unavailable (for API error messages).
+pub fn kernel_wg_unavailable_reason() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        wireguard::kernel_unavailable_reason()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        "the kernel backend requires Linux".to_string()
+    }
 }
 
 /// Enable TCP keepalive so a dead long-lived splice is eventually reaped by the

@@ -419,6 +419,14 @@ pub struct EgressConfig {
     /// connection). Raise it if a client uploads heavily through the tunnel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tx_buffer_kb: Option<u32>,
+    /// Which WireGuard implementation carries the tunnel: `"auto"` (default —
+    /// kernel when available, else userspace), `"kernel"` (netlink-managed wg
+    /// netdev; Linux + CAP_NET_ADMIN + the wireguard module; fails loudly when
+    /// unavailable), or `"userspace"` (boringtun in-process, portable). Only
+    /// used by the `wireguard` egress kind. `buffer_kb`/`tx_buffer_kb` apply
+    /// to the userspace backend only — the kernel autotunes its own windows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
 }
 
 /// Maps a domain pattern to an egress. `pattern` is an exact domain (matches the

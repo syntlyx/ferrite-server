@@ -515,6 +515,7 @@ mod tests {
                 seg_position: None,
                 buffer_kb: None,
                 tx_buffer_kb: None,
+                backend: None,
             }],
             rules: vec![RuleConfig {
                 pattern: "a.test".to_string(),

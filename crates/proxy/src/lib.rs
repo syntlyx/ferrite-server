@@ -47,6 +47,7 @@ use ferrite_upstream::{EgressConnectError, EgressConnectFuture, EgressConnector,
 pub use egress::direct_connect;
 pub use egress::usable_rcvbuf_bytes;
 pub use egress::{Egress, EgressConn};
+pub use egress::{detect_kernel_wg_backend, kernel_wg_available, kernel_wg_unavailable_reason};
 use health::Breaker;
 use rules::CompiledRule;
 pub use stats::ProxyStats;
@@ -462,6 +463,7 @@ fn egress_runtime_eq(a: &EgressConfig, b: &EgressConfig) -> bool {
         seg_position,
         buffer_kb,
         tx_buffer_kb,
+        backend,
     } = b;
     a.kind == *kind
         && a.address == *address
@@ -472,6 +474,7 @@ fn egress_runtime_eq(a: &EgressConfig, b: &EgressConfig) -> bool {
         && a.seg_position == *seg_position
         && a.buffer_kb == *buffer_kb
         && a.tx_buffer_kb == *tx_buffer_kb
+        && a.backend == *backend
 }
 
 /// Build the synthetic DNS answer for a routed domain. A/AAAA get the advertise
@@ -563,6 +566,7 @@ mod tests {
                 seg_position: None,
                 buffer_kb: None,
                 tx_buffer_kb: None,
+                backend: None,
             }],
             rules: vec![RuleConfig {
                 pattern: "*.example.com".to_string(),
@@ -666,6 +670,7 @@ mod tests {
             seg_position: None,
             buffer_kb: None,
             tx_buffer_kb: None,
+            backend: None,
         }
     }
 
