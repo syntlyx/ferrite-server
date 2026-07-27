@@ -1,4 +1,5 @@
 /target
+/target-linux
 /dist
 .DS_Store
 

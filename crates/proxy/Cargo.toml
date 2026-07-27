@@ -26,3 +26,13 @@ smoltcp.workspace = true
 socket2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+# Kernel WireGuard backend (netlink-managed wg netdev; needs CAP_NET_ADMIN at
+# runtime — falls back to the userspace backend when unavailable).
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink.workspace = true
+genetlink.workspace = true
+netlink-packet-generic.workspace = true
+netlink-packet-wireguard.workspace = true
+netlink-packet-core.workspace = true
+futures-util.workspace = true

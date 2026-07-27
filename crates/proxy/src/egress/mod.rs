@@ -172,7 +172,9 @@ impl Egress {
             // SOCKS5 and WireGuard classify their own failures (proxy/tunnel
             // transport vs. destination) at the point they know which it was.
             Self::Socks5(s) => s.connect(host, port).await.map(EgressConn::Tcp),
-            Self::Wireguard(w) => w.connect(host, port).await.map(EgressConn::Wg),
+            // WireGuard wraps its own stream type (virtual pipe or real TCP,
+            // depending on the backend).
+            Self::Wireguard(w) => w.connect(host, port).await,
         }
     }
 }

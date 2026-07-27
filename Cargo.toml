@@ -110,6 +110,14 @@ tar = "0.4"       # tar extraction (server binary + web bundle)
 boringtun = { version = "0.7.1", default-features = false }  # WireGuard protocol (Noise handshake + transport crypto), no netstack
 smoltcp = { version = "0.13", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }  # userspace TCP/IP stack over the tunnel
 
+# ── WireGuard egress (kernel backend; Linux-only, CAP_NET_ADMIN) ──────────────
+rtnetlink = "0.21"                  # wg netdev / address / route / rule via rtnetlink
+genetlink = "0.2.6"                 # generic-netlink family resolution + connection
+netlink-packet-generic = "0.4"      # GenlMessage wrapper
+netlink-packet-wireguard = "0.4.1"  # WG_CMD_SET/GET_DEVICE messages
+netlink-packet-core = "0.8"         # NLM_F_* flags for genl requests
+futures-util = { version = "0.3", default-features = false }  # drive netlink response streams
+
 # ── Misc ──────────────────────────────────────────────────────────────────────
 async-trait = "0.1"  # async methods in the Storage trait
 base64 = "0.22"
