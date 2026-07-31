@@ -13,11 +13,16 @@
 //! * the allowed-ips as routes in a **dedicated table** [`table_id`] — plus an
 //!   `unreachable` default guard when allowed-ips isn't a full tunnel, so
 //!   traffic outside it fails instead of leaking out the WAN,
-//! * `ip rule from <tunnel address> lookup <table>` — the *only* global
-//!   routing state we touch. The main table is never modified: egress sockets
-//!   simply `bind()` to the tunnel address, which flips their lookups into the
-//!   dedicated table. The encrypted UDP to the peer endpoint keeps using the
-//!   main table, so there is no routing loop by construction.
+//! * `ip rule fwmark <mark> lookup <table>` — the *only* global routing state
+//!   we touch, with `mark == table_id`. The main table is never modified:
+//!   every egress socket gets `SO_MARK` set (CAP_NET_ADMIN, which this backend
+//!   requires anyway) and `bind()`s to the tunnel address for its source IP.
+//!   The mark — not the source address — is what steers the lookup, because
+//!   VPN providers hand out the *same* interface address in every config
+//!   (e.g. Proton's 10.2.0.2/32): with two such egresses, `from <addr>` rules
+//!   are identical selectors and all tunnel traffic collapses into whichever
+//!   table wins. The encrypted UDP to the peer endpoint carries no mark and
+//!   keeps using the main table, so there is no routing loop by construction.
 //!
 //! Health mirrors the userspace backend: the last handshake must be younger
 //! than `SESSION_MAX_AGE`. The kernel re-handshakes whenever traffic (including
@@ -66,8 +71,9 @@ const GENL_FAIL_LIMIT: u32 = 3;
 /// Setup retry backoff bounds (endpoint unresolvable at boot, netlink races).
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
-/// `ip rule` priority for the per-egress source-address rules — anywhere below
-/// the local-table rule (0) and above the main-table rule (32766).
+/// `ip rule` priority for the per-egress fwmark rules — anywhere below the
+/// local-table rule (0) and above the main-table rule (32766). Sharing one
+/// priority is fine: each rule's fwmark selector matches only its own egress.
 const RULE_PRIORITY: u32 = 16000;
 
 // Raw errnos from netlink acks (no libc dependency for four constants).
@@ -152,6 +158,10 @@ pub(super) struct KernelWg {
     /// Tunnel-local source addresses connections bind to (from `Address =`).
     bind4: Option<Ipv4Addr>,
     bind6: Option<Ipv6Addr>,
+    /// `SO_MARK` for every socket of this egress (== [`table_id`]); the fwmark
+    /// rule keys the routing on it, since the bind address may be shared with
+    /// other egresses (identical provider confs).
+    fwmark: u32,
     /// Host → IP through the tunnel, cached by TTL (shared with userspace).
     resolver: TunnelResolver,
     /// Dropped with the handle → the supervisor tears the netdev down.
@@ -193,6 +203,7 @@ impl KernelWg {
             last_handshake,
             bind4,
             bind6,
+            fwmark: table_id(&id),
             resolver: TunnelResolver::new(id, dns, upstream),
             _shutdown: shutdown_tx,
         }
@@ -214,8 +225,9 @@ impl KernelWg {
         }
     }
 
-    /// Open a tunneled TCP connection to `host:port`: a plain socket bound to
-    /// the tunnel address, routed into the wg netdev by the source rule.
+    /// Open a tunneled TCP connection to `host:port`: a plain socket marked
+    /// with the egress fwmark (which routes it into the wg netdev) and bound
+    /// to the tunnel address (which gives it the tunnel-internal source IP).
     pub(super) async fn connect(
         &self,
         host: &str,
@@ -266,6 +278,12 @@ impl KernelWg {
                 )
             }
         };
+        // The mark is load-bearing, not advisory: without it the lookup falls
+        // through to the main table and the SYN leaves via the WAN with the
+        // tunnel source address. Refuse the connect rather than leak.
+        socket2::SockRef::from(&socket)
+            .set_mark(self.fwmark)
+            .map_err(io_egress)?;
         socket.bind(bind).map_err(io_egress)?;
         match timeout(WG_CONNECT_TIMEOUT, socket.connect(remote)).await {
             Err(_) => Err(ConnectError::destination(FeriteError::Dns(format!(
@@ -411,7 +429,7 @@ async fn run(
                     && gap_ok
                     && let Some(target) = kick
                 {
-                    send_kick(conf, target).await;
+                    send_kick(conf, target, table).await;
                     last_kick = Some(Instant::now());
                 }
             }
@@ -578,15 +596,18 @@ async fn wire_up(
         state.routes.push(msg);
     }
 
-    // Source rules: `from <tunnel addr> lookup <table>` — what routes a bound
-    // socket into the tunnel without touching the main table.
-    if let Some((IpAddr::V4(b4), _)) = conf.addresses.iter().find(|(ip, _)| ip.is_ipv4()) {
+    // Steering rules: `fwmark <table> lookup <table>` — what routes a marked
+    // socket into the tunnel without touching the main table. Keyed on the
+    // mark, NOT the source address: identical provider confs give several
+    // egresses the same tunnel address, and `from <addr>` rules would then all
+    // match the same sockets, collapsing every tunnel into one table.
+    if conf.addresses.iter().any(|(ip, _)| ip.is_ipv4()) {
         let mut req = state
             .rt
             .rule()
             .add()
             .v4()
-            .source_prefix(*b4, 32)
+            .fw_mark(table)
             .table_id(table)
             .priority(RULE_PRIORITY)
             .action(RuleAction::ToTable);
@@ -596,13 +617,13 @@ async fn wire_up(
             .map_err(|e| format!("add v4 rule: {e}"))?;
         state.rules.push(msg);
     }
-    if let Some((IpAddr::V6(b6), _)) = conf.addresses.iter().find(|(ip, _)| ip.is_ipv6()) {
+    if conf.addresses.iter().any(|(ip, _)| ip.is_ipv6()) {
         let mut req = state
             .rt
             .rule()
             .add()
             .v6()
-            .source_prefix(*b6, 128)
+            .fw_mark(table)
             .table_id(table)
             .priority(RULE_PRIORITY)
             .action(RuleAction::ToTable);
@@ -793,8 +814,10 @@ async fn wg_last_handshake(
 }
 
 /// A tiny DNS query sent through the tunnel to make the kernel (re)handshake —
-/// the response is irrelevant, the *send* is what arms the session.
-async fn send_kick(conf: &WgConf, target: SocketAddr) {
+/// the response is irrelevant, the *send* is what arms the session. Marked like
+/// every other egress socket; unmarked it would miss the fwmark rule and leave
+/// via the WAN (never reaching the tunnel it is supposed to warm).
+async fn send_kick(conf: &WgConf, target: SocketAddr, fwmark: u32) {
     let bind = conf
         .addresses
         .iter()
@@ -803,6 +826,9 @@ async fn send_kick(conf: &WgConf, target: SocketAddr) {
     let Ok(sock) = UdpSocket::bind(bind).await else {
         return;
     };
+    if socket2::SockRef::from(&sock).set_mark(fwmark).is_err() {
+        return;
+    }
     let _ = sock.send_to(&kick_query(), target).await;
 }
 
@@ -1052,6 +1078,60 @@ mod tests {
             link_index(&rt, &name).await.unwrap().is_none(),
             "tear_down must remove the netdev"
         );
+    }
+
+    /// Two egresses with the SAME tunnel address — how provider confs ship
+    /// (e.g. Proton assigns 10.2.0.2/32 in every config) — must be
+    /// independently routable: one fwmark rule per egress, each to its own
+    /// table. The former source-address rules were identical selectors here,
+    /// which collapsed both tunnels into whichever table won (the "NL exits
+    /// with the US IP, both probes show the same RTT" bug).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs CAP_NET_ADMIN + wireguard kernel module"]
+    async fn same_address_egresses_get_distinct_fwmark_rules() {
+        assert!(
+            detect().await,
+            "kernel backend must be detected in this env"
+        );
+
+        let conf = sample_conf(); // both egresses share 10.2.0.2/32
+        let (name_a, table_a) = (ifname("dup-nl"), table_id("dup-nl"));
+        let (name_b, table_b) = (ifname("dup-us"), table_id("dup-us"));
+        assert_ne!(
+            table_a, table_b,
+            "distinct ids must hash to distinct tables"
+        );
+
+        let state_a = bring_up("dup-nl", &conf, &name_a, table_a)
+            .await
+            .expect("bring up first egress");
+        let state_b = bring_up("dup-us", &conf, &name_b, table_b)
+            .await
+            .expect("bring up second egress with the same address");
+
+        // Every rule pointing at our tables must select on the table's own
+        // fwmark — that is what keeps the two same-address egresses apart.
+        let (c, rt, _) = rtnetlink::new_connection().unwrap();
+        tokio::spawn(c);
+        let mut ours: Vec<(Option<u32>, u32)> = Vec::new();
+        let mut rules = rt.rule().get(IpVersion::V4).execute();
+        while let Ok(Some(msg)) = rules.try_next().await {
+            let Some(t) = rule_table(&msg) else { continue };
+            if t == table_a || t == table_b {
+                let mark = msg.attributes.iter().find_map(|a| match a {
+                    RuleAttribute::FwMark(m) => Some(*m),
+                    _ => None,
+                });
+                ours.push((mark, t));
+            }
+        }
+        ours.sort_unstable();
+        let mut want = vec![(Some(table_a), table_a), (Some(table_b), table_b)];
+        want.sort_unstable();
+        assert_eq!(ours, want, "one fwmark rule per egress, mark == table");
+
+        tear_down(&state_a, &name_a).await;
+        tear_down(&state_b, &name_b).await;
     }
 
     /// Real end-to-end check of the kernel backend against a live WireGuard

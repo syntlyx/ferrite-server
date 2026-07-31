@@ -98,7 +98,8 @@ argon2 = "0.5"    # web UI password hashing (Argon2id)
 subtle = "2"      # constant-time comparison (API key check)
 
 # ── Networking & system ───────────────────────────────────────────────────────
-socket2 = "0.6"   # low-level UDP socket options (mDNS multicast)
+# "all": SO_MARK (set_mark) for kernel-WG fwmark routing, Linux-only API.
+socket2 = { version = "0.6", features = ["all"] }   # low-level socket options (mDNS multicast, SO_MARK)
 sysinfo = "0.39"  # CPU / memory / system stats
 dirs = "6"        # locate config & data directories
 
