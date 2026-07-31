@@ -43,11 +43,13 @@ pub struct Config {
     /// Selective per-domain routing through tunnels/proxies (egresses).
     #[serde(default)]
     pub proxy: ProxyConfig,
-    /// Verbose debug-level logging for the `ferrite` target. On by default so a
-    /// problem leaves a useful trail to attach to a bug report; turn it off from
-    /// Settings if the volume is too high. Applied live (no restart); the
-    /// `RUST_LOG` environment variable overrides it.
-    #[serde(default = "default_true")]
+    /// Verbose debug-level logging for the `ferrite` target. **Off by default**:
+    /// every DNS query and proxied connection emits a record, and each one costs
+    /// two allocations, a process-wide ring-buffer lock and a stdout write — real
+    /// CPU on a busy small box, for output nobody is reading. Turn it on from
+    /// Settings when a problem needs a trail to attach to a bug report. Applied
+    /// live (no restart); the `RUST_LOG` environment variable overrides it.
+    #[serde(default)]
     pub debug_logging: bool,
     /// Override path for static web UI files. If unset, defaults to `data_dir()/web`.
     /// Useful during frontend development to point at a local `dist/` folder.
@@ -603,7 +605,7 @@ impl Default for Config {
             zones: vec![],
             custom_records: vec![],
             proxy: ProxyConfig::default(),
-            debug_logging: true,
+            debug_logging: false,
             web_dir: None,
         }
     }
