@@ -1,6 +1,7 @@
 //! The slice of app state the DNS pipeline sees.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 
 use parking_lot::RwLock;
 use tokio::sync::{Semaphore, mpsc};
@@ -30,6 +31,11 @@ pub struct DnsCtx {
     pub live_stats: Arc<LiveStats>,
     /// Hot-patchable list of domain patterns to suppress from the query log.
     pub log_ignore: Arc<RwLock<Vec<String>>>,
+    /// Ceiling on the TTL handed to client devices (seconds); `0` = don't cache.
+    /// ferrite holds the real cache, so devices are kept deliberately thin —
+    /// this is what bounds how long a stale answer survives on a phone after a
+    /// list, rule or profile change. Hot-patchable.
+    pub client_ttl: Arc<AtomicU32>,
     /// Limits in-flight queries to prevent memory exhaustion under slow upstream.
     pub query_semaphore: Arc<Semaphore>,
     /// Sender side of the query pipeline (handler → stats writer).

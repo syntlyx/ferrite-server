@@ -65,6 +65,7 @@ mod nullable {
 /// All fields that can be changed via PATCH /api/settings.
 ///
 /// Hot-patchable (no restart): `api_key`, `password`, `dns_min_ttl`, `dns_max_ttl`,
+///                             `dns_client_ttl`,
 ///                             `dns_log_ignore`, `web_dir`, `log_retention_days`,
 ///                             `blocklist_enabled`, `blocklist_client_bypass`,
 ///                             `debug_logging`.
@@ -81,6 +82,7 @@ pub struct SettingsPatch {
     pub password: Option<Option<String>>,
     pub dns_min_ttl: Option<u64>,
     pub dns_max_ttl: Option<u64>,
+    pub dns_client_ttl: Option<u32>,
     pub dns_log_ignore: Option<Vec<String>>,
     #[serde(default, deserialize_with = "nullable::deserialize")]
     pub web_dir: Option<Option<PathBuf>>,
@@ -137,6 +139,7 @@ pub async fn update_settings(
     let mut hot_changed: Vec<&'static str> = Vec::new();
     let mut restart_changed: Vec<&'static str> = Vec::new();
     let mut ttl_bounds_to_apply: Option<(u64, u64)> = None;
+    let mut client_ttl_to_apply: Option<u32> = None;
     let mut blocklist_enabled_to_apply: Option<bool> = None;
     let mut blocklist_client_bypass_to_apply: Option<Vec<String>> = None;
     let mut debug_logging_to_apply: Option<bool> = None;
@@ -203,6 +206,20 @@ pub async fn update_settings(
 
         if ttl_changed {
             ttl_bounds_to_apply = Some((cfg.dns.min_ttl, cfg.dns.max_ttl));
+        }
+
+        if let Some(ttl) = patch.dns_client_ttl {
+            // 0 is meaningful ("clients must not cache"), so only the upper end
+            // is bounded — and by the same ceiling as the cache TTLs.
+            if ttl as u64 > MAX_TTL {
+                return Err(ApiError(FeriteError::Config(format!(
+                    "dns_client_ttl must be between 0 and {} seconds",
+                    MAX_TTL
+                ))));
+            }
+            cfg.dns.client_ttl = ttl;
+            client_ttl_to_apply = Some(ttl);
+            hot_changed.push("dns_client_ttl");
         }
 
         if let Some(ref patterns) = patch.dns_log_ignore {
@@ -350,6 +367,13 @@ pub async fn update_settings(
 
     if let Some((min, max)) = ttl_bounds_to_apply {
         state.inner.dns_cache.set_ttl_bounds(min, max);
+    }
+
+    if let Some(ttl) = client_ttl_to_apply {
+        state
+            .inner
+            .client_ttl
+            .store(ttl, std::sync::atomic::Ordering::Relaxed);
     }
 
     if let Some(enabled) = blocklist_enabled_to_apply {

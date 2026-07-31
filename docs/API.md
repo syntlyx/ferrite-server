@@ -800,6 +800,7 @@ Returns the full parsed config. Non-empty `api_key` and `password_hash` values a
     "cache_size": 10000,
     "min_ttl": 60,
     "max_ttl": 3600,
+    "client_ttl": 60,
     "log_ignore": ["fe.te", "*.arpa", "*.local", "*.localdomain"]
   },
   "upstream": [
@@ -848,8 +849,9 @@ All fields are optional. Fields not provided are left unchanged.
 | -------------------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `api_key`            | `string \| null` | API key for Bearer/X-Api-Key auth; blank values are rejected; `null` disables key auth                                                                                                                          |
 | `password`           | `string \| null` | Web UI password (hashed server-side, Argon2id); empty values are rejected; `null` disables password auth                                                                                                        |
-| `dns_min_ttl`        | int              | Minimum TTL clamp for cached DNS responses, 60–3600 seconds                                                                                                                                                     |
-| `dns_max_ttl`        | int              | Maximum TTL clamp for cached DNS responses, 60–3600 seconds                                                                                                                                                     |
+| `dns_min_ttl`        | int              | Minimum TTL clamp for responses cached **by ferrite**, 60–3600 seconds                                                                                                                                          |
+| `dns_max_ttl`        | int              | Maximum TTL clamp for responses cached **by ferrite**, 60–3600 seconds                                                                                                                                          |
+| `dns_client_ttl`     | int              | Ceiling on the TTL advertised to **client devices**, 0–3600 seconds. Bounds how long a device keeps using an answer after a blocklist/whitelist, routing-rule or profile change — including blocked answers, whose SOA carries this TTL. Only ever lowers a TTL: a shorter upstream TTL passes through unchanged. `0` tells devices not to cache at all. |
 | `dns_log_ignore`     | `string[]`       | Domain patterns to suppress from the query log entirely. Replaces the full list. Supports exact names (`fe.te`) and wildcard suffixes (`*.local`). Queries matching these patterns are still resolved normally. |
 | `web_dir`            | `string \| null` | Override static web UI directory; `null` resets to `~/.local/share/ferrite/web`                                                                                                                                 |
 | `log_retention_days` | int              | Automatically delete query log entries older than N days; `0` disables retention. Applied once ~30 s after startup and every 24 h thereafter.                                                                   |

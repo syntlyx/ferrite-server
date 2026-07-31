@@ -98,6 +98,10 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
     let want_dnssec =
         ctx.dns_config.dnssec && query.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok);
     let log_ignored = is_log_ignored(&name, &ctx.log_ignore.read());
+    // The ceiling on what this client is told to cache. Applied to every exit
+    // path below, so no answer leaves with a longer lifetime than the window in
+    // which a list/rule/profile change is guaranteed to reach the device.
+    let client_ttl = ctx.client_ttl.load(Ordering::Relaxed);
 
     tracing::debug!("query {:?} {} from {}", question.query_type(), name, src);
 
@@ -120,7 +124,12 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
                 ),
             );
         }
-        return Ok(patch_id(&custom_resp.bytes, query.metadata.id));
+        // Custom records carry an operator-chosen TTL, but they are still a
+        // local override that can be edited live — cap them like everything else.
+        return Ok(cap_ttls(
+            patch_id(&custom_resp.bytes, query.metadata.id),
+            client_ttl,
+        ));
     }
 
     // ── Step 2: Blocklist (skipped when globally disabled or client bypasses filtering) ──
@@ -148,7 +157,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
                 ),
             );
         }
-        return Ok(build_nxdomain(&query));
+        return Ok(build_nxdomain(&query, client_ttl));
     }
 
     // ── Step 3: Selective routing / proxy interception ────────────────────
@@ -175,7 +184,10 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
                 ),
             );
         }
-        return Ok(patch_id(&intercept.response.bytes, query.metadata.id));
+        return Ok(cap_ttls(
+            patch_id(&intercept.response.bytes, query.metadata.id),
+            client_ttl,
+        ));
     }
 
     // ── Step 4: DNS response cache ────────────────────────────────────────
@@ -202,7 +214,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
                     ),
                 );
             }
-            return Ok(build_nxdomain(&query));
+            return Ok(build_nxdomain(&query, client_ttl));
         }
 
         if !log_ignored {
@@ -223,7 +235,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
         return Ok(patch_cached(
             &cached.bytes,
             query.metadata.id,
-            remaining_ttl,
+            remaining_ttl.min(client_ttl),
         ));
     }
 
@@ -274,7 +286,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
                 ),
             );
         }
-        return Ok(build_nxdomain(&query));
+        return Ok(build_nxdomain(&query, client_ttl));
     }
 
     // ── Step 7: Cache NOERROR responses ───────────────────────────────────
@@ -320,10 +332,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
     // covers the first, uncached lookup so `max_ttl` reliably bounds what every
     // client caches — e.g. how long a client clings to a pre-rule direct answer
     // before re-querying and getting routed.
-    Ok(cap_ttls(
-        response_bytes,
-        ctx.dns_cache.max_ttl_secs() as u32,
-    ))
+    Ok(cap_ttls(response_bytes, client_ttl))
 }
 
 // ---------------------------------------------------------------------------
@@ -370,7 +379,16 @@ fn make_entry(
     }
 }
 
-fn build_nxdomain(query: &Message) -> Vec<u8> {
+/// NXDOMAIN for a blocked name, carrying an SOA in the authority section so the
+/// client's *negative* caching is bounded by `ttl` too.
+///
+/// Without an SOA there is nothing for RFC 2308 negative caching to key on, and
+/// each stub resolver falls back to its own default — which we neither control
+/// nor can shorten. That is what used to make un-blocking a domain (adding it to
+/// the whitelist) apply instantly on the server and stay broken on a device for
+/// an unpredictable while. The SOA's own TTL and its MINIMUM field are both set
+/// to `ttl`, since the negative-cache lifetime is the smaller of the two.
+fn build_nxdomain(query: &Message, ttl: u32) -> Vec<u8> {
     let mut resp = Message::response(query.metadata.id, OpCode::Query);
     resp.metadata.authoritative = true;
     // RFC 1035 §4.1.1: RD must be echoed; RA indicates we support recursion.
@@ -378,6 +396,29 @@ fn build_nxdomain(query: &Message) -> Vec<u8> {
     resp.metadata.recursion_available = true;
     resp.metadata.response_code = ResponseCode::NXDomain;
     resp.add_queries(query.queries.iter().cloned());
+    if let Some(q) = query.queries.first() {
+        // The SOA is synthetic: only its TTL and MINIMUM carry meaning for a
+        // resolver, the names are cosmetic (`.invalid` per RFC 2606, so they can
+        // never collide with a real zone).
+        let apex = q.name().clone();
+        let ns = hickory_proto::rr::Name::from_ascii("ferrite.invalid.")
+            .unwrap_or_else(|_| apex.clone());
+        let secs = ttl as i32;
+        let soa = hickory_proto::rr::rdata::SOA::new(
+            ns.clone(),
+            ns,
+            1,    // serial
+            secs, // refresh
+            secs, // retry
+            secs, // expire
+            ttl,  // minimum — one half of the negative-cache lifetime
+        );
+        resp.add_authority(hickory_proto::rr::Record::from_rdata(
+            apex,
+            ttl,
+            RData::SOA(soa),
+        ));
+    }
     resp.to_bytes().unwrap_or_default()
 }
 
@@ -582,6 +623,7 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::path::PathBuf;
     use std::str::FromStr;
+    use std::sync::atomic::AtomicU32;
 
     use hickory_proto::op::{MessageType, Query};
     use hickory_proto::rr::rdata::{A, CNAME};
@@ -654,6 +696,8 @@ mod tests {
         interceptor: Arc<StubInterceptor>,
         client_registry: Arc<ClientRegistry>,
         upstream: Arc<ZoneRouter>,
+        /// The client-facing TTL ceiling this harness hands to the pipeline.
+        client_ttl: u32,
         query_tx: mpsc::Sender<QueryEntry>,
         rx: mpsc::Receiver<QueryEntry>,
         db_path: PathBuf,
@@ -680,6 +724,9 @@ mod tests {
                 ClientRegistry::new(Arc::clone(&upstream), Arc::clone(&storage) as _).await;
             let (query_tx, rx) = mpsc::channel(8_192);
             Self {
+                // Deliberately not the production default, so a test asserting a
+                // capped TTL can't pass by coincidence.
+                client_ttl: 45,
                 live_stats: LiveStats::new(),
                 blocklist: Arc::new(blocklist()),
                 dns_cache: Arc::new(DnsCache::new(1024, 0, 0, 86_400)),
@@ -704,6 +751,7 @@ mod tests {
                 interceptor: Arc::clone(&self.interceptor) as Arc<dyn DnsInterceptor>,
                 live_stats: Arc::clone(&self.live_stats),
                 log_ignore: Arc::new(RwLock::new(Vec::new())),
+                client_ttl: Arc::new(AtomicU32::new(self.client_ttl)),
                 query_semaphore: Arc::new(Semaphore::new(256)),
                 query_tx: self.query_tx.clone(),
             }
@@ -872,7 +920,7 @@ mod tests {
 
     #[test]
     fn nxdomain_response_echoes_query_context() {
-        let bytes = build_nxdomain(&query("blocked.test", RecordType::A));
+        let bytes = build_nxdomain(&query("blocked.test", RecordType::A), 60);
         let msg = Message::from_bytes(&bytes).unwrap();
 
         assert_eq!(msg.metadata.id, 0xCAFE);
@@ -1164,6 +1212,137 @@ mod tests {
         // …and the log entry carries the routed status + which egress will serve it.
         assert_eq!(entry.status, QueryStatus::Routed);
         assert_eq!(entry.upstream.as_deref(), Some("proxy:t"));
+
+        cleanup_sqlite(&h.db_path);
+    }
+
+    /// The client-facing ceiling only ever lowers a TTL. An origin that asks for
+    /// a 5-second lifetime (CDN failover) must be passed through untouched —
+    /// raising it to our ceiling would defeat exactly what it asked for.
+    #[test]
+    fn client_ttl_lowers_but_never_raises() {
+        let query = query("host.test", RecordType::A);
+        let long = {
+            let mut resp = Message::response(query.metadata.id, OpCode::Query);
+            resp.add_queries(query.queries.iter().cloned());
+            resp.add_answer(Record::from_rdata(
+                name("host.test"),
+                3600,
+                RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
+            ));
+            resp.to_bytes().unwrap()
+        };
+        let short = {
+            let mut resp = Message::response(query.metadata.id, OpCode::Query);
+            resp.add_queries(query.queries.iter().cloned());
+            resp.add_answer(Record::from_rdata(
+                name("host.test"),
+                5,
+                RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
+            ));
+            resp.to_bytes().unwrap()
+        };
+
+        let capped = cap_ttls(long, 60);
+        assert_eq!(Message::from_bytes(&capped).unwrap().answers[0].ttl, 60);
+
+        let untouched = cap_ttls(short.clone(), 60);
+        assert_eq!(
+            Message::from_bytes(&untouched).unwrap().answers[0].ttl,
+            5,
+            "an upstream TTL below the ceiling must survive verbatim"
+        );
+        assert_eq!(untouched, short, "no reserialization when nothing changed");
+    }
+
+    /// A blocked name answers NXDOMAIN **with an SOA**, so the device's negative
+    /// cache is bounded by our ceiling instead of its own default. Without this
+    /// the whitelist appeared to "not work" on clients that had cached the
+    /// refusal.
+    #[tokio::test]
+    async fn blocked_answer_carries_an_soa_bounding_negative_caching() {
+        let h = Harness::new("dns-block-soa").await;
+        h.blocklist.add_blacklist("ads.test").unwrap();
+
+        let response = handle_query(
+            query("ads.test", RecordType::A).to_bytes().unwrap(),
+            SocketAddr::from(([192, 0, 2, 10], 53_000)),
+            Arc::new(h.ctx()),
+        )
+        .await
+        .unwrap();
+        let msg = Message::from_bytes(&response).unwrap();
+
+        assert_eq!(msg.metadata.response_code, ResponseCode::NXDomain);
+        let soa = msg
+            .authorities
+            .iter()
+            .find_map(|rr| match &rr.data {
+                RData::SOA(soa) => Some((rr.ttl, soa.minimum)),
+                _ => None,
+            })
+            .expect("negative answer must carry an SOA");
+        // The negative-cache lifetime is min(record TTL, SOA MINIMUM) — both are
+        // the harness ceiling, so a device can't hold the refusal any longer.
+        assert_eq!(soa, (h.client_ttl, h.client_ttl));
+
+        cleanup_sqlite(&h.db_path);
+    }
+
+    /// Every exit path is capped, including the two that used to bypass it: a
+    /// custom (local) record and a cache hit.
+    #[tokio::test]
+    async fn custom_records_and_cache_hits_respect_the_client_ceiling() {
+        let h = Harness::new("dns-client-ttl-paths").await;
+        h.custom_records
+            .add(&CustomRecordConfig {
+                domain: "local.test".into(),
+                record_type: "A".into(),
+                value: "10.0.0.9".into(),
+                ttl: 86_400, // operator asked for a day
+            })
+            .unwrap();
+
+        let custom = handle_query(
+            query("local.test", RecordType::A).to_bytes().unwrap(),
+            SocketAddr::from(([192, 0, 2, 10], 53_000)),
+            Arc::new(h.ctx()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            Message::from_bytes(&custom).unwrap().answers[0].ttl,
+            h.client_ttl,
+            "a custom record's own TTL must still be capped"
+        );
+
+        // Cache hit: stored with a long TTL, served capped.
+        h.dns_cache.insert(
+            "cached.test",
+            1,
+            false,
+            DnsResponse {
+                bytes: bytes::Bytes::from(a_response(
+                    0x2222,
+                    "cached.test",
+                    Ipv4Addr::new(192, 0, 2, 8),
+                    3600,
+                )),
+                ttl: 3600,
+            },
+        );
+        let hit = handle_query(
+            query("cached.test", RecordType::A).to_bytes().unwrap(),
+            SocketAddr::from(([192, 0, 2, 10], 53_000)),
+            Arc::new(h.ctx()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            Message::from_bytes(&hit).unwrap().answers[0].ttl,
+            h.client_ttl,
+            "a cache hit must not advertise more than the ceiling"
+        );
 
         cleanup_sqlite(&h.db_path);
     }

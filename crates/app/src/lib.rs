@@ -9,6 +9,7 @@ pub mod test_support;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::time::Instant;
 
 use dashmap::DashMap;
@@ -54,6 +55,8 @@ pub struct AppStateInner {
     pub snapshot_path: std::path::PathBuf,
     /// Hot-patchable list of domain patterns to suppress from the query log.
     pub log_ignore: Arc<RwLock<Vec<String>>>,
+    /// Hot-patchable ceiling on the TTL handed to client devices (seconds).
+    pub client_ttl: Arc<AtomicU32>,
     /// Limits in-flight DNS queries to prevent memory exhaustion under slow upstream.
     pub query_semaphore: Arc<Semaphore>,
 }
@@ -123,6 +126,7 @@ impl AppState {
             interceptor,
             live_stats: Arc::clone(&self.inner.live_stats),
             log_ignore: Arc::clone(&self.inner.log_ignore),
+            client_ttl: Arc::clone(&self.inner.client_ttl),
             query_semaphore: Arc::clone(&self.inner.query_semaphore),
             query_tx: self.query_tx.clone(),
         }
@@ -369,6 +373,7 @@ impl AppState {
             panel_hosts: panel_hosts(config),
             snapshot_path,
             log_ignore: Arc::new(RwLock::new(config.dns.log_ignore.clone())),
+            client_ttl: Arc::new(AtomicU32::new(config.dns.client_ttl)),
             query_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
         });
 

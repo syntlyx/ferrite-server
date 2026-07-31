@@ -90,6 +90,12 @@ fn default_custom_ttl() -> u32 {
     300
 }
 
+/// One minute — the same window the proxy's synthetic routing answers use, so
+/// "a change applies within a minute" holds for every kind of change.
+fn default_client_ttl() -> u32 {
+    60
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct DnsConfig {
@@ -99,8 +105,30 @@ pub struct DnsConfig {
     /// entry *count*, which alone can't bound memory — a DNSSEC answer with
     /// RRSIGs is 10–20× the size of a plain one. `0` disables the byte bound.
     pub cache_max_mb: usize,
+    /// Bounds for **ferrite's own** cache: how long an upstream answer is kept
+    /// here. They do not decide what client devices cache — see `client_ttl`.
     pub min_ttl: u64,
     pub max_ttl: u64,
+    /// Ceiling on the TTL handed to **client devices**, in seconds.
+    ///
+    /// ferrite is the cache; devices are meant to be thin. A device that caches
+    /// an answer for an hour keeps using it after a blocklist, whitelist,
+    /// routing-rule or per-device-profile change — the change is live here and
+    /// invisible there. Capping what we advertise bounds that lag to this value
+    /// (it also bounds negative caching: blocked answers carry an SOA with this
+    /// TTL). The default matches the routing rules' own synthetic TTL, so the
+    /// whole product makes one promise: a change takes effect within a minute.
+    ///
+    /// The cap only ever *lowers* a TTL — an upstream answer that says 5 seconds
+    /// is passed through unchanged, because raising it would break the
+    /// short-TTL failover the origin deliberately asked for.
+    ///
+    /// `0` tells devices not to cache at all: maximum immediacy, every lookup
+    /// reaches us. That is affordable (answers come from our cache in
+    /// microseconds) but it does multiply the query log; some older stub
+    /// resolvers also mishandle a zero TTL, hence the non-zero default.
+    #[serde(default = "default_client_ttl")]
+    pub client_ttl: u32,
     /// Domains to suppress from the query log entirely.
     /// Supports exact names (`fe.te`) and wildcard suffixes (`*.local`).
     pub log_ignore: Vec<String>,
@@ -521,6 +549,7 @@ impl Default for DnsConfig {
             cache_max_mb: 8,
             min_ttl: 60,
             max_ttl: 3600,
+            client_ttl: default_client_ttl(),
             log_ignore: vec![
                 "fe.te".to_string(),
                 "*.arpa".to_string(),
