@@ -81,9 +81,12 @@ chosen **egress**:
 | `evasion`   | Like `direct`, but splits the TLS ClientHello at the SNI across TCP segments so DPI can't read the hostname.                       |
 
 Rules can be scoped to **specific devices** (by name/MAC/IP) — route a kid's
-tablet through a tunnel while everything else goes direct. Routing is independent
-of blocking (a routed domain is never blocked). Rules, egresses, and listener
-ports **hot-reload** — no restart.
+tablet through a tunnel while everything else goes direct. Routing decides *how*
+traffic leaves, blocking decides *whether* a name resolves: a blocklisted domain
+stays blocked even when a routing rule covers it (so routing a service through a
+tunnel doesn't unblock its tracker subdomains). To deliberately reach a
+blocklisted domain, whitelist it — it then routes as usual. Rules, egresses, and
+listener ports **hot-reload** — no restart.
 
 ## Install
 

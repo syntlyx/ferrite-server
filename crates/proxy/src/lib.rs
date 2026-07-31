@@ -38,6 +38,7 @@ use hickory_proto::serialize::binary::BinEncodable;
 use parking_lot::RwLock;
 use tokio::sync::Notify;
 
+use ferrite_blocklist::Blocklist;
 use ferrite_clients::ClientRegistry;
 use ferrite_core::config::{Config, EgressConfig, ProxyConfig};
 use ferrite_dns::intercept::{DnsInterceptor, Intercept};
@@ -62,6 +63,11 @@ const SYNTH_TTL: u32 = 60;
 #[derive(Clone)]
 pub struct ProxyCtx {
     pub proxy: Arc<ProxyState>,
+    /// Blocking applies at the listeners too: DNS-level blocking alone is
+    /// bypassable by connecting to the advertise IP with a blocked SNI/Host
+    /// (stale client cache or on purpose), so [`intercept`] re-checks the
+    /// peeked host before splicing.
+    pub blocklist: Arc<Blocklist>,
     /// IP→MAC lookups for client-scoped rules.
     pub client_registry: Arc<ClientRegistry>,
     /// Resolver for direct (unrouted / fail-open) connects.
@@ -324,7 +330,7 @@ impl ProxyState {
     }
 }
 
-/// The routing hook the DNS pipeline sees (step 2 of the query pipeline).
+/// The routing hook the DNS pipeline sees (step 3 of the query pipeline).
 impl DnsInterceptor for ProxyState {
     fn has_client_rules(&self) -> bool {
         self.registry
@@ -347,10 +353,12 @@ impl DnsInterceptor for ProxyState {
         if !snap.enabled {
             return None;
         }
-        // Routing is independent of the whitelist: the whitelist means "never
-        // block this", not "never route this". An explicit rule wins regardless
-        // (to exclude a subdomain from a broad rule, point it at a Direct egress).
-        // A rule may also be scoped to specific clients (by IP/MAC).
+        // Routing is orthogonal to blocking: the DNS pipeline checks the
+        // blocklist BEFORE calling this, so a blocked name never reaches us —
+        // and the whitelist means "never block this", not "never route this"
+        // (whitelisted + routed = routed). To exclude a subdomain from a broad
+        // rule without blocking it, point it at a Direct egress. A rule may
+        // also be scoped to specific clients (by IP/MAC).
         let rule = snap.route(name, client_ip, client_mac)?;
         let egress_id = snap.egresses[rule.egress_idx].id().to_string();
         let response = synth_response(query, qtype, snap.advertise_ipv4, snap.advertise_ipv6);

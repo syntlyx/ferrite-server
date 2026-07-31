@@ -133,6 +133,7 @@ impl AppState {
     pub fn proxy_ctx(&self) -> ferrite_proxy::ProxyCtx {
         ferrite_proxy::ProxyCtx {
             proxy: Arc::clone(&self.inner.proxy),
+            blocklist: Arc::clone(&self.inner.blocklist),
             client_registry: Arc::clone(&self.inner.client_registry),
             upstream_pool: Arc::clone(&self.inner.upstream_pool),
             live_config: Arc::clone(&self.live_config),

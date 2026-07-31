@@ -2,9 +2,11 @@
 //!
 //! Clients connect here because DNS handed them our advertise IP — so these are
 //! ordinary `accept()`ed connections, not TPROXY/IP_TRANSPARENT intercepts. We
-//! peek the SNI/Host, re-match the routing rule on the real host (authoritative),
-//! and splice the connection through the chosen egress (or direct if the client
-//! reached us for a host we don't route).
+//! peek the SNI/Host, re-check the blocklist on the real host (a blocked name
+//! must not be reachable by carrying a stale resolution past the DNS-level
+//! block), re-match the routing rule on it (authoritative), and splice the
+//! connection through the chosen egress (or direct if the client reached us
+//! for a host we don't route).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +16,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
+use ferrite_blocklist::Blocklist;
 use ferrite_dns::intercept::DnsInterceptor;
 
 use super::ProxyCtx;
@@ -224,6 +227,25 @@ pub async fn forward_http(ctx: ProxyCtx, client: TcpStream, buf: Vec<u8>, host: 
     }
 }
 
+/// Would the DNS pipeline block `host` for this client? Mirrors the handler's
+/// gating exactly: global blocking switch → per-client bypass → per-client
+/// profile → `should_block_for`. Split out of [`splice_through`] so the gating
+/// is unit-testable without listeners.
+fn host_blocked_for_client(
+    blocklist: &Blocklist,
+    host: &str,
+    client_ip: &str,
+    client_mac: Option<&str>,
+) -> bool {
+    if !blocklist.blocking_enabled()
+        || blocklist.client_bypasses_blocking_normalized(client_ip, client_mac)
+    {
+        return false;
+    }
+    let profile = blocklist.profile_for(client_ip, client_mac);
+    blocklist.should_block_for(host, profile.as_deref())
+}
+
 /// Route `host` to its egress (or forward-direct), replay the peeked `buf`, and
 /// splice both directions. Shared by the proxy's own listeners and the panel's
 /// :80 demux.
@@ -236,15 +258,30 @@ async fn splice_through(
 ) -> std::io::Result<()> {
     let port = proto.upstream_port();
 
-    // Identify the connecting client for client-scoped rules (canonicalize so an
-    // IPv4-mapped IPv6 peer matches the registry's plain IPv4).
+    // Identify the connecting client for client-scoped rules and per-client
+    // blocking (canonicalize so an IPv4-mapped IPv6 peer matches the registry's
+    // plain IPv4). MAC resolution is a cheap in-memory lookup, but skip it
+    // entirely when nothing keys on it.
     let client_addr = client.peer_addr().ok().map(|a| a.ip().to_canonical());
     let client_ip = client_addr.map(|ip| ip.to_string()).unwrap_or_default();
-    let client_mac = if ctx.proxy.has_client_rules() {
+    let need_mac = ctx.proxy.has_client_rules()
+        || (ctx.blocklist.blocking_enabled()
+            && (ctx.blocklist.has_client_bypass() || ctx.blocklist.has_profiles()));
+    let client_mac = if need_mac {
         client_addr.and_then(|ip| ctx.client_registry.get_mac(ip))
     } else {
         None
     };
+
+    // Blocking applies here too, not just at DNS answer time: the client may
+    // hold a stale (or deliberately kept) resolution to our advertise IP, and
+    // the DNS-level block is useless if presenting a blocked SNI/Host to the
+    // listener still gets spliced through. Same per-client gating as the DNS
+    // pipeline; the peeked host is already lowercased with no trailing dot.
+    if host_blocked_for_client(&ctx.blocklist, &host, &client_ip, client_mac.as_deref()) {
+        tracing::debug!("proxy: {host} is blocked for {client_ip} → dropping connection");
+        return Ok(());
+    }
 
     // Decide the egress from the actual SNI/Host (authoritative). Clone the
     // egress Arc out of the snapshot so the ArcSwap guard isn't held across the
@@ -441,6 +478,77 @@ where
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod blocking_tests {
+    use super::*;
+    use ferrite_core::config::{AllowlistConfig, BlocklistConfig};
+
+    fn blocklist(name: &str, client_bypass: Vec<String>) -> Blocklist {
+        let unique = format!(
+            "{}-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        Blocklist::new(
+            BlocklistConfig {
+                enabled: true,
+                decision_cache_size: 128,
+                lists: vec![],
+                wildcard_block: vec![],
+                whitelist: vec![],
+                client_bypass,
+                profiles: vec![],
+            },
+            AllowlistConfig::default(),
+            std::env::temp_dir().join(unique).join("blocklist.fst"),
+        )
+    }
+
+    /// The listener drops blocked hosts with the same subtree semantics as the
+    /// DNS pipeline: a blocklisted apex blocks its subdomains, the whitelist
+    /// lifts the block, and unrelated hosts pass.
+    #[test]
+    fn blocked_host_is_dropped_including_subdomains() {
+        let bl = blocklist("proxy-blocked-host", vec![]);
+        bl.add_blacklist("ads.test").unwrap();
+
+        assert!(host_blocked_for_client(&bl, "ads.test", "10.0.0.5", None));
+        assert!(host_blocked_for_client(
+            &bl,
+            "pixel.ads.test",
+            "10.0.0.5",
+            None
+        ));
+        assert!(!host_blocked_for_client(
+            &bl,
+            "example.test",
+            "10.0.0.5",
+            None
+        ));
+
+        bl.add_whitelist("ads.test").unwrap();
+        assert!(!host_blocked_for_client(&bl, "ads.test", "10.0.0.5", None));
+    }
+
+    /// The global blocking switch and the per-client bypass gate the listener
+    /// check exactly like the DNS pipeline's `filtering_enabled`.
+    #[test]
+    fn bypass_and_global_switch_disable_the_check() {
+        let bl = blocklist("proxy-bypass", vec!["10.0.0.9".to_string()]);
+        bl.add_blacklist("ads.test").unwrap();
+
+        assert!(host_blocked_for_client(&bl, "ads.test", "10.0.0.5", None));
+        assert!(!host_blocked_for_client(&bl, "ads.test", "10.0.0.9", None));
+
+        bl.set_blocking_enabled(false);
+        assert!(!host_blocked_for_client(&bl, "ads.test", "10.0.0.5", None));
+    }
 }
 
 #[cfg(test)]

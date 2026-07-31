@@ -1,10 +1,11 @@
 //! The selective-routing hook the DNS pipeline sees.
 //!
-//! Step 2 of the query pipeline asks "should this query be answered with the
-//! proxy's advertise IP so the client connects to the proxy listeners?". The
-//! proxy owns that decision, but the proxy also consumes DNS types — so the
-//! DNS side owns this narrow contract ([`DnsInterceptor`]), the proxy
-//! implements it, and the composition root wires the two together.
+//! Step 3 of the query pipeline (after the blocklist — routing never unblocks
+//! a name) asks "should this query be answered with the proxy's advertise IP
+//! so the client connects to the proxy listeners?". The proxy owns that
+//! decision, but the proxy also consumes DNS types — so the DNS side owns this
+//! narrow contract ([`DnsInterceptor`]), the proxy implements it, and the
+//! composition root wires the two together.
 
 use hickory_proto::op::Message;
 

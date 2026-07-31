@@ -25,7 +25,7 @@ pub struct DnsCtx {
     pub custom_records: Arc<CustomRecords>,
     pub client_registry: Arc<ClientRegistry>,
     pub upstream_pool: Arc<ZoneRouter>,
-    /// Selective-routing hook (step 2 of the pipeline), implemented by the proxy.
+    /// Selective-routing hook (step 3 of the pipeline), implemented by the proxy.
     pub interceptor: Arc<dyn DnsInterceptor>,
     pub live_stats: Arc<LiveStats>,
     /// Hot-patchable list of domain patterns to suppress from the query log.

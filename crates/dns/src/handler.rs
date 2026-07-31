@@ -25,15 +25,19 @@ pub fn seed_query_counter(max_persisted_id: u64) {
     QUERY_COUNTER.fetch_max(max_persisted_id + 1, Ordering::Relaxed);
 }
 
-/// DNS query pipeline (per query, runs in its own tokio task):
+/// DNS query pipeline (per query, runs in its own tokio task; after parsing,
+/// the steps match the `Step N` markers below):
 ///
-///  1. Parse wire bytes.
-///  2. Check DNS cache → return cached bytes immediately.
-///  3. If not whitelisted → check blocklist → return NXDOMAIN.
-///  4. Forward to upstream pool.
-///  5. CNAME inspection — walk answer section, block if any CNAME target is blocked.
-///  6. Cache successful response.
-///  7. Send QueryEntry to stats writer (non-blocking).
+///  1. Custom DNS records — local overrides answer first.
+///  2. Blocklist → NXDOMAIN. Runs before routing on purpose: blocking decides
+///     WHETHER a name resolves, routing only HOW its traffic leaves — so a
+///     blocklisted subdomain of a routed domain stays blocked (whitelist it
+///     to route it anyway).
+///  3. Selective routing → synthetic answer with the proxy's advertise IP.
+///  4. DNS cache → return cached bytes (CNAME targets re-checked).
+///  5. Forward to upstream pool.
+///  6. CNAME inspection — walk answer section, block if any CNAME target is blocked.
+///  7. Cache successful response; send QueryEntry to stats writer (non-blocking).
 pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Result<Vec<u8>> {
     let start = Instant::now();
 
@@ -119,12 +123,39 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
         return Ok(patch_id(&custom_resp.bytes, query.metadata.id));
     }
 
-    // ── Step 2: Selective routing / proxy interception ────────────────────
+    // ── Step 2: Blocklist (skipped when globally disabled or client bypasses filtering) ──
+    // Runs BEFORE selective routing: the blocklist decides WHETHER a name
+    // resolves, a routing rule only decides HOW its traffic leaves. A rule
+    // matches its whole subtree, so letting routing pre-empt the block would
+    // silently unblock every blocklisted subdomain under a routed domain. To
+    // reach a blocklisted domain on purpose, whitelist it — the whitelist walk
+    // covers the subtree, and routing still applies (the whitelist means
+    // "never block", not "never route").
+    if filtering_enabled && ctx.blocklist.should_block_for(&name, profile.as_deref()) {
+        tracing::debug!("blocked: {}", name);
+        if !log_ignored {
+            let elapsed = start.elapsed().as_millis() as u32;
+            emit(
+                &ctx,
+                make_entry(
+                    &name,
+                    qtype,
+                    &client_ip,
+                    QueryStatus::Blocked,
+                    elapsed,
+                    None,
+                    3,
+                ),
+            );
+        }
+        return Ok(build_nxdomain(&query));
+    }
+
+    // ── Step 3: Selective routing / proxy interception ────────────────────
     // For a routed domain, answer with our advertise IP so the client connects
-    // to the proxy listeners. Runs BEFORE the blocklist: an explicitly routed
-    // domain is never blocked (you asked for it on purpose). Synthetic + returned
-    // early (NOT cached): routing rules are runtime-mutable, so a cached redirect
-    // could outlive a deletion.
+    // to the proxy listeners. The blocklist already ran, so a blocked name
+    // never gets here. Synthetic + returned early (NOT cached): routing rules
+    // are runtime-mutable, so a cached redirect could outlive a deletion.
     if let Some(intercept) =
         ctx.interceptor
             .maybe_intercept(&query, &name, qtype, &client_ip, client_mac.as_deref())
@@ -147,28 +178,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
         return Ok(patch_id(&intercept.response.bytes, query.metadata.id));
     }
 
-    // ── Step 3: Blocklist (skipped when globally disabled or client bypasses filtering) ──
-    if filtering_enabled && ctx.blocklist.should_block_for(&name, profile.as_deref()) {
-        tracing::debug!("blocked: {}", name);
-        if !log_ignored {
-            let elapsed = start.elapsed().as_millis() as u32;
-            emit(
-                &ctx,
-                make_entry(
-                    &name,
-                    qtype,
-                    &client_ip,
-                    QueryStatus::Blocked,
-                    elapsed,
-                    None,
-                    3,
-                ),
-            );
-        }
-        return Ok(build_nxdomain(&query));
-    }
-
-    // ── Step 3: DNS response cache ────────────────────────────────────────
+    // ── Step 4: DNS response cache ────────────────────────────────────────
     if let Some((cached, remaining_ttl)) =
         ctx.dns_cache.get_with_remaining(&name, qtype, want_dnssec)
     {
@@ -217,7 +227,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
         ));
     }
 
-    // ── Step 4: Forward to upstream ───────────────────────────────────────
+    // ── Step 5: Forward to upstream ───────────────────────────────────────
     // Harden the outbound query: drop EDNS Client Subnet (so the resolver never
     // learns the client's subnet) and set the upstream DO bit to `want_dnssec`
     // (honor this client's request, or strip it when the feature is off).
@@ -240,7 +250,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
             }
         };
 
-    // ── Step 5: CNAME inspection ───────────────────────────────────────────
+    // ── Step 6: CNAME inspection ───────────────────────────────────────────
     // Walk the answer section. If any CNAME target is blocked (and the queried
     // name is not whitelisted), return NXDOMAIN without caching.
     if rcode == 0
@@ -267,7 +277,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
         return Ok(build_nxdomain(&query));
     }
 
-    // ── Step 6: Cache NOERROR responses ───────────────────────────────────
+    // ── Step 7: Cache NOERROR responses ───────────────────────────────────
     // A TTL of 0 means "do not cache" (RFC 1035/2181) — caching it would break
     // failover/GeoDNS that relies on near-zero TTLs. NODATA (empty answer)
     // responses are cached under the RFC 2308 negative TTL from the authority
@@ -1152,6 +1162,68 @@ mod tests {
             RData::A(A(ip)) if ip == Ipv4Addr::new(192, 0, 2, 77)
         ));
         // …and the log entry carries the routed status + which egress will serve it.
+        assert_eq!(entry.status, QueryStatus::Routed);
+        assert_eq!(entry.upstream.as_deref(), Some("proxy:t"));
+
+        cleanup_sqlite(&h.db_path);
+    }
+
+    #[tokio::test]
+    async fn blocklist_wins_over_routing_rule() {
+        let mut h = Harness::new("dns-routed-blocked").await;
+        // A routing rule covers the name AND it is blocklisted (the typical
+        // case: a tracker subdomain under a routed domain). The block must win
+        // — routing decides how traffic leaves, never whether a name resolves.
+        h.interceptor.route(
+            "ads.routed.test",
+            a_response(0, "ads.routed.test", Ipv4Addr::new(192, 0, 2, 77), 60),
+            "t",
+        );
+        h.blocklist.add_blacklist("ads.routed.test").unwrap();
+
+        let response = handle_query(
+            query("ads.routed.test", RecordType::A).to_bytes().unwrap(),
+            SocketAddr::from(([192, 0, 2, 10], 53_000)),
+            Arc::new(h.ctx()),
+        )
+        .await
+        .unwrap();
+        let msg = Message::from_bytes(&response).unwrap();
+        let entry = h.rx.try_recv().unwrap();
+
+        assert_eq!(msg.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(entry.status, QueryStatus::Blocked);
+
+        cleanup_sqlite(&h.db_path);
+    }
+
+    #[tokio::test]
+    async fn whitelist_restores_routing_for_blocklisted_domain() {
+        let mut h = Harness::new("dns-routed-whitelisted").await;
+        // The escape hatch for deliberately routing a blocklisted domain: the
+        // whitelist lifts the block, and the routing rule then applies.
+        h.interceptor.route(
+            "ads.routed.test",
+            a_response(0, "ads.routed.test", Ipv4Addr::new(192, 0, 2, 77), 60),
+            "t",
+        );
+        h.blocklist.add_blacklist("ads.routed.test").unwrap();
+        h.blocklist.add_whitelist("ads.routed.test").unwrap();
+
+        let response = handle_query(
+            query("ads.routed.test", RecordType::A).to_bytes().unwrap(),
+            SocketAddr::from(([192, 0, 2, 10], 53_000)),
+            Arc::new(h.ctx()),
+        )
+        .await
+        .unwrap();
+        let msg = Message::from_bytes(&response).unwrap();
+        let entry = h.rx.try_recv().unwrap();
+
+        assert!(matches!(
+            msg.answers[0].data,
+            RData::A(A(ip)) if ip == Ipv4Addr::new(192, 0, 2, 77)
+        ));
         assert_eq!(entry.status, QueryStatus::Routed);
         assert_eq!(entry.upstream.as_deref(), Some("proxy:t"));
 
