@@ -953,6 +953,7 @@ dependencies = [
  "futures-util",
  "genetlink",
  "hickory-proto",
+ "libc",
  "netlink-packet-core",
  "netlink-packet-generic",
  "netlink-packet-wireguard",

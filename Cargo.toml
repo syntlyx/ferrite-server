@@ -111,6 +111,9 @@ tar = "0.4"       # tar extraction (server binary + web bundle)
 boringtun = { version = "0.7.1", default-features = false }  # WireGuard protocol (Noise handshake + transport crypto), no netstack
 smoltcp = { version = "0.13", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }  # userspace TCP/IP stack over the tunnel
 
+# ── Zero-copy relay (Linux-only) ──────────────────────────────────────────────
+libc = "0.2"   # splice(2) + pipe2(2): move proxied bytes without a userspace copy
+
 # ── WireGuard egress (kernel backend; Linux-only, CAP_NET_ADMIN) ──────────────
 rtnetlink = "0.21"                  # wg netdev / address / route / rule via rtnetlink
 genetlink = "0.2.6"                 # generic-netlink family resolution + connection

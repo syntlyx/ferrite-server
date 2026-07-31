@@ -326,6 +326,16 @@ pub struct ProbeSnapshot {
     pub last_probe_secs_ago: u64,
 }
 
+#[cfg(target_os = "linux")]
+impl EgressStats {
+    /// The live up/down counters, for the `splice(2)` relay: it moves bytes
+    /// without an `AsyncRead`/`AsyncWrite` wrapper, so it bumps these directly
+    /// (keeping the UI's mid-transfer rates working on the zero-copy path).
+    pub fn byte_counters(&self) -> (&AtomicU64, &AtomicU64) {
+        (&self.bytes_up, &self.bytes_down)
+    }
+}
+
 /// Byte-counting wrapper around an egress connection: every successful write
 /// counts as up-traffic, every successful read as down-traffic, both into the
 /// shared per-egress counters (live, so rates are visible mid-transfer) and into
@@ -351,6 +361,13 @@ impl<S> Counted<S> {
     /// (bytes up, bytes down) moved through this connection so far.
     pub fn transferred(&self) -> (u64, u64) {
         (self.up, self.down)
+    }
+
+    /// The wrapped connection, for a relay that bypasses `AsyncRead`/`AsyncWrite`
+    /// (the `splice(2)` path needs the raw socket and counts its own bytes).
+    #[cfg(target_os = "linux")]
+    pub fn get_mut(&mut self) -> &mut S {
+        &mut self.inner
     }
 }
 

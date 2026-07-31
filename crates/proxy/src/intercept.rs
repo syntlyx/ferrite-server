@@ -369,6 +369,15 @@ async fn splice_through(
     let mut conn = Counted::new(conn, stats.clone());
     let _active = stats.as_ref().map(|s| s.begin_conn(&host));
 
+    // Bytes moved by the zero-copy path, which counts itself (it never goes
+    // through `Counted`'s AsyncRead/AsyncWrite). Added to `Counted`'s totals for
+    // the per-domain attribution below.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(unused_mut, reason = "only the Linux zero-copy path assigns it")
+    )]
+    let mut zero_copy = (0u64, 0u64);
+
     // Replay the bytes we already consumed, then splice both directions. For an
     // evasion egress on a TLS connection the ClientHello replay is fragmented so
     // the SNI is split across TCP segments (DPI bypass); everything else is a
@@ -378,6 +387,18 @@ async fn splice_through(
             Some(p) if matches!(proto, Protocol::Tls) => write_split(&mut conn, &buf, &p).await?,
             _ => conn.write_all(&buf).await?,
         }
+        // Socket-to-socket (kernel-WG / direct / evasion): let the kernel move
+        // the payload — no userspace copy, no per-connection buffers. A
+        // userspace-WG egress is an in-memory stream, so it takes the generic
+        // relay below, as does any non-Linux build.
+        #[cfg(target_os = "linux")]
+        if let EgressConn::Tcp(peer) = conn.get_mut()
+            && let Some(relayed) =
+                super::splice::relay(&client, peer, IDLE_TIMEOUT, stats.as_deref()).await
+        {
+            zero_copy = (relayed.up, relayed.down);
+            return relayed.result;
+        }
         copy_bidirectional_idle(&mut client, &mut conn, IDLE_TIMEOUT).await
     }
     .await;
@@ -386,7 +407,7 @@ async fn splice_through(
     // with an error — those bytes still crossed the tunnel.
     if let Some(s) = &stats {
         let (up, down) = conn.transferred();
-        s.add_domain_bytes(&host, up, down);
+        s.add_domain_bytes(&host, up + zero_copy.0, down + zero_copy.1);
     }
     result
 }
