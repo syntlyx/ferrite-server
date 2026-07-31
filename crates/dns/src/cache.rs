@@ -6,7 +6,16 @@ use std::num::NonZeroUsize;
 
 use crate::types::DnsResponse;
 
-pub const MIN_TTL: u64 = 60;
+/// Range a cache TTL bound may be configured to, in seconds.
+///
+/// The lower end is `0`, not a floor of its own: `min_ttl = 0` means "keep an
+/// answer exactly as long as its origin said", which is the only way to *not*
+/// override the origin. A non-zero `min_ttl` trades that away for fewer upstream
+/// queries — we keep serving a record whose own lifetime has expired, which is
+/// wrong for the short TTLs a CDN uses to steer traffic away from a dead host.
+/// How long a *client* then caches what we hand it is a separate knob
+/// (`dns.client_ttl`).
+pub const MIN_TTL: u64 = 0;
 pub const MAX_TTL: u64 = 3600;
 
 #[derive(Debug, Clone, Copy)]
@@ -334,6 +343,34 @@ mod tests {
     fn ttl_bounds_are_normalized() {
         let cache = DnsCache::new(8, 0, 7200, 30);
         assert_eq!(cache.min_ttl_secs(), MAX_TTL);
+    }
+
+    /// `min_ttl = 0` is the "don't override the origin" setting: a 5-second
+    /// answer stays a 5-second answer. A non-zero floor deliberately extends it,
+    /// which is the trade the setting exists to express — so assert both, or the
+    /// zero case could pass with the floor silently still applied.
+    #[test]
+    fn zero_min_ttl_keeps_the_origin_lifetime() {
+        let honest = DnsCache::new(8, 0, 0, 3600);
+        assert_eq!(honest.min_ttl_secs(), 0, "no floor should survive");
+        honest.insert("cdn.test", 1, false, response(5));
+        let (_, remaining) = honest
+            .get_with_remaining("cdn.test", 1, false)
+            .expect("entry is cached");
+        assert!(
+            remaining <= 5,
+            "must not outlive the origin's 5s TTL, got {remaining}"
+        );
+
+        let floored = DnsCache::new(8, 0, 60, 3600);
+        floored.insert("cdn.test", 1, false, response(5));
+        let (_, remaining) = floored
+            .get_with_remaining("cdn.test", 1, false)
+            .expect("entry is cached");
+        assert!(
+            remaining > 5,
+            "a 60s floor must extend the 5s answer, got {remaining}"
+        );
     }
 
     #[test]
