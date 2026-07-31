@@ -16,13 +16,13 @@ all: mac linux
 mac: mac-arm64 mac-x86_64
 
 mac-arm64: $(DIST)
-	cargo build --release --target $(TARGET_MAC_ARM64)
-	cp target/$(TARGET_MAC_ARM64)/release/$(BINARY) \
+	cargo build --profile dist --target $(TARGET_MAC_ARM64)
+	cp target/$(TARGET_MAC_ARM64)/dist/$(BINARY) \
 	   $(DIST)/$(BINARY)-$(VERSION)-macos-arm64
 
 mac-x86_64: $(DIST)
-	cargo build --release --target $(TARGET_MAC_X86_64)
-	cp target/$(TARGET_MAC_X86_64)/release/$(BINARY) \
+	cargo build --profile dist --target $(TARGET_MAC_X86_64)
+	cp target/$(TARGET_MAC_X86_64)/dist/$(BINARY) \
 	   $(DIST)/$(BINARY)-$(VERSION)-macos-x86_64
 
 # ── Linux (musl, static) ──────────────────────────────────────────────────────
@@ -45,14 +45,14 @@ linux: linux-arm64 linux-x86_64
 
 linux-arm64: $(DIST)
 	$(check-zigbuild)
-	ulimit -n 65536; cargo zigbuild --release --target $(TARGET_LINUX_ARM64)
-	cp target/$(TARGET_LINUX_ARM64)/release/$(BINARY) \
+	ulimit -n 65536; cargo zigbuild --profile dist --target $(TARGET_LINUX_ARM64)
+	cp target/$(TARGET_LINUX_ARM64)/dist/$(BINARY) \
 	   $(DIST)/$(BINARY)-$(VERSION)-linux-arm64
 
 linux-x86_64: $(DIST)
 	$(check-zigbuild)
-	ulimit -n 65536; cargo zigbuild --release --target $(TARGET_LINUX_X86_64)
-	cp target/$(TARGET_LINUX_X86_64)/release/$(BINARY) \
+	ulimit -n 65536; cargo zigbuild --profile dist --target $(TARGET_LINUX_X86_64)
+	cp target/$(TARGET_LINUX_X86_64)/dist/$(BINARY) \
 	   $(DIST)/$(BINARY)-$(VERSION)-linux-x86_64
 
 # ── Utility ───────────────────────────────────────────────────────────────────

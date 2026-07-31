@@ -106,7 +106,7 @@ docker run -d --name ferrite \
 ```
 
 ```bash
-# From source (Rust 1.88+)
+# From source (Rust 1.97+)
 cargo build --release
 cp target/release/ferrite /usr/local/bin/ferrite
 ```

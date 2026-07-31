@@ -103,6 +103,11 @@ async fn run() -> anyhow::Result<()> {
             .init();
     }
 
+    // rustls is built without a bundled provider (one crypto stack in the binary,
+    // not two), so the process default has to be installed before anything opens
+    // a TLS connection — reqwest resolves its provider from it.
+    ferrite_upstream::install_default_crypto();
+
     let persistent_config = config::Config::load()?;
     let mut runtime_config = persistent_config.clone();
     tracing::info!("ferrite v{} starting", env!("CARGO_PKG_VERSION"));

@@ -189,3 +189,31 @@ fn http_err(label: &str, e: &reqwest::Error) -> FeriteError {
     }
     FeriteError::Dns(msg)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// rustls ships without a bundled provider in this workspace (one crypto
+    /// stack in the binary, not two), so every `reqwest` client depends on the
+    /// process-wide default that `install_default_crypto` installs. Building a
+    /// DoH resolver is where that surfaces — without the provider it fails at
+    /// runtime while every other test still passes, so pin it here.
+    #[test]
+    fn doh_client_builds_once_the_crypto_provider_is_installed() {
+        crate::install_default_crypto();
+
+        let resolver = DohResolver::new("https://cloudflare-dns.com/dns-query", Some("1.1.1.1"));
+
+        assert!(
+            resolver.is_ok(),
+            "DoH client must build with the installed provider: {:?}",
+            resolver.err()
+        );
+    }
+
+    #[test]
+    fn doh_rejects_a_non_https_url() {
+        assert!(DohResolver::new("http://example.test/dns-query", None).is_err());
+    }
+}

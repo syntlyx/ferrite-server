@@ -9,7 +9,7 @@ cargo build --release
 cp target/release/ferrite /usr/local/bin/ferrite
 ```
 
-Requires **Rust 1.96+**. Key dependencies: `tokio`, `axum`, `hickory-resolver`
+Requires **Rust 1.97+**. Key dependencies: `tokio`, `axum`, `hickory-resolver`
 (DoT/DoH/DoQ), `boringtun` + `smoltcp` (userspace WireGuard), `tokio-rustls`
 (tunneled DoT), `fst` (blocklist), `rusqlite` (storage), `argon2` (password
 hashing).

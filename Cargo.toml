@@ -8,9 +8,9 @@ members = ["crates/*"]
 default-members = ["crates/ferrite"]
 
 [workspace.package]
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.97"
 license = "MIT"
 
 # One authoritative version/feature spec per dependency; member crates opt in
@@ -39,7 +39,11 @@ hickory-proto = "0.26.1"                              # Message/Query/PTR parsin
 # Tunneled upstream: ferrite speaks DNS-over-TLS / DNS-over-TCP itself, directly
 # over a userspace egress stream (WireGuard/SOCKS5), so its own upstream queries
 # can ride the tunnel. hickory/reqwest own their sockets and can't, hence raw TLS.
-tokio-rustls = "0.26"   # TLS client over an arbitrary egress stream (tunneled DoT)
+# default-features off drops rustls's `aws_lc_rs` provider: ring is already in the
+# tree (hickory's *-ring features, plus `ring` directly), and pulling aws-lc too
+# would compile a second full crypto stack — dead weight in the binary and a C
+# toolchain the musl cross-build has to satisfy. See `install_default_crypto`.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }   # TLS client over an arbitrary egress stream (tunneled DoT)
 webpki-roots = "1"      # Mozilla root store for tunneled DoT certificate verification
 x509-parser = "0.18"    # parse presented certs for the /tools/cert inspector
 
@@ -50,7 +54,10 @@ axum = { version = "0.8", features = ["macros"] }     # REST API + serves the we
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }  # CORS + request tracing middleware
-reqwest = { version = "0.13.4", features = ["rustls", "json", "http2"], default-features = false }  # blocklist & update downloads; http2 required for DoH endpoints that reject HTTP/1.1 (e.g. Quad9 → HTTP 505)
+# `rustls-no-provider` rather than `rustls`: the latter force-enables the aws-lc-rs
+# provider (a second crypto stack next to ring). With no provider chosen here,
+# reqwest uses the process-wide default that `install_default_crypto` installs.
+reqwest = { version = "0.13.4", features = ["rustls-no-provider", "json", "http2"], default-features = false }  # blocklist & update downloads; http2 required for DoH endpoints that reject HTTP/1.1 (e.g. Quad9 → HTTP 505)
 
 # ── Blocklist engine ──────────────────────────────────────────────────────────
 fst = "0.4"        # finite-state-transducer set — fast exact-domain blocklist lookups
@@ -133,3 +140,19 @@ tower = "0.5"
 # Line-table debug info: keeps release optimisations but lets gdb show file:line
 # in backtraces.  Negligible performance impact; small binary size increase.
 debug = 1
+
+# The profile shipped artifacts are built with (`make linux-arm64`, release CI).
+# Same optimisations as `release`, but sized for distribution: on a static musl
+# build the line tables inherited from `release` dominate the file — 171 MB
+# unstripped vs 23 MB stripped for aarch64 — and nobody debugs a released binary
+# with gdb. `cargo build --release` keeps its debug info for local work.
+#
+# `panic` stays at unwind on purpose: with `abort` a panic in one tokio task
+# would take the whole DNS server down instead of just that task.
+[profile.dist]
+inherits = "release"
+strip = "symbols"
+# Cross-crate inlining shrinks the binary further and is measurably faster;
+# "thin" gets nearly all of it for a fraction of "fat"'s link time.
+lto = "thin"
+codegen-units = 1
