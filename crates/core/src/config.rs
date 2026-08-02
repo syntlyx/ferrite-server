@@ -107,6 +107,8 @@ pub struct DnsConfig {
     pub cache_max_mb: usize,
     /// Bounds for **ferrite's own** cache: how long an upstream answer is kept
     /// here. They do not decide what client devices cache — see `client_ttl`.
+    /// `min_ttl = 0` honours the origin lifetime; `max_ttl = 0` means no
+    /// ceiling of its own (the hard 3600s maximum still applies).
     pub min_ttl: u64,
     pub max_ttl: u64,
     /// Ceiling on the TTL handed to **client devices**, in seconds.

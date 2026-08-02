@@ -186,7 +186,11 @@ pub async fn update_settings(
                     MIN_TTL, MAX_TTL
                 ))));
             }
-            if min > max {
+            // A max of 0 means "no ceiling" (normalized to MAX_TTL by the
+            // cache), so the ordering check must compare against what it will
+            // actually become — otherwise min=120,max=0 is falsely rejected.
+            let effective_max = if max == 0 { MAX_TTL } else { max };
+            if min > effective_max {
                 return Err(ApiError(FeriteError::Config(format!(
                     "dns_min_ttl ({}) cannot be greater than dns_max_ttl ({})",
                     min, max
@@ -627,11 +631,13 @@ mod tests {
         let (state, db_path, config_path) =
             test_support::app_state_with_config_path("settings-invalid-ttl").await;
 
+        // max is a real (non-zero) ceiling here — 0 would mean "no ceiling"
+        // and make the patch valid.
         let err = update_settings(
             State(state.clone()),
             Json(SettingsPatch {
                 dns_min_ttl: Some(MAX_TTL),
-                dns_max_ttl: Some(MIN_TTL),
+                dns_max_ttl: Some(120),
                 ..Default::default()
             }),
         )
@@ -648,6 +654,44 @@ mod tests {
         drop(cfg);
         drop(state);
         test_support::cleanup_sqlite(&db_path);
+    }
+
+    /// `dns_max_ttl = 0` means "no ceiling": it must pass validation even with
+    /// a non-zero floor (the ordering check compares against the effective
+    /// ceiling, not the literal 0) and land in the cache as MAX_TTL — not as a
+    /// cache whose every insert expires instantly.
+    #[tokio::test]
+    async fn zero_max_ttl_patch_means_no_ceiling() {
+        let (state, db_path, config_path) =
+            test_support::app_state_with_config_path("settings-zero-max-ttl").await;
+
+        let Json(value) = update_settings(
+            State(state.clone()),
+            Json(SettingsPatch {
+                dns_min_ttl: Some(120),
+                dns_max_ttl: Some(0),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(value["status"], "ok");
+        assert_eq!(state.inner.dns_cache.min_ttl_secs(), 120);
+        assert_eq!(
+            state.inner.dns_cache.max_ttl_secs(),
+            MAX_TTL,
+            "0 must normalize to the hard ceiling, not a dead cache"
+        );
+        // The config keeps the literal 0 — it's the documented spelling of
+        // "no ceiling", not a value to be rewritten behind the operator's back.
+        let cfg = state.live_config.read().clone();
+        assert_eq!(cfg.dns.min_ttl, 120);
+        assert_eq!(cfg.dns.max_ttl, 0);
+
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
+        let _ = std::fs::remove_file(config_path);
     }
 
     #[tokio::test]

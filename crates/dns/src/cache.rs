@@ -292,6 +292,12 @@ impl DnsCache {
 }
 
 fn normalize_ttl_bounds(min_ttl: u64, max_ttl: u64) -> TtlBounds {
+    // For the ceiling, 0 means "no ceiling" (the hard MAX_TTL) — the same
+    // 0-disables-the-limit convention as `cache_max_mb` and
+    // `log_retention_days`. Taken literally, a 0 ceiling would stamp every
+    // insert with `expires_at = now`: a cache that looks configured but never
+    // serves a single hit.
+    let max_ttl = if max_ttl == 0 { MAX_TTL } else { max_ttl };
     let min_secs = min_ttl.clamp(MIN_TTL, MAX_TTL);
     let max_secs = max_ttl.clamp(MIN_TTL, MAX_TTL).max(min_secs);
     TtlBounds { min_secs, max_secs }
@@ -371,6 +377,37 @@ mod tests {
             remaining > 5,
             "a 60s floor must extend the 5s answer, got {remaining}"
         );
+    }
+
+    /// `max_ttl = 0` means "no ceiling", not "expire instantly". The dangerous
+    /// shape is `{min: 0, max: 0}` — the honest-looking "don't override
+    /// anything" config — which taken literally stamps every entry expired at
+    /// insert and silently disables the cache.
+    #[test]
+    fn zero_max_ttl_means_no_ceiling_not_a_dead_cache() {
+        let cache = DnsCache::new(8, 0, 0, 0);
+        assert_eq!(
+            cache.max_ttl_secs(),
+            MAX_TTL,
+            "0 must mean the hard ceiling"
+        );
+
+        // Entries survive: served with the origin lifetime (min is still 0)…
+        cache.insert("cdn.test", 1, false, response(5));
+        let (_, remaining) = cache
+            .get_with_remaining("cdn.test", 1, false)
+            .expect("a {0,0} cache must still serve hits");
+        assert!(
+            remaining <= 5,
+            "min_ttl=0 keeps the origin's 5s, got {remaining}"
+        );
+
+        // …and the hard ceiling still applies to an over-long origin TTL.
+        cache.insert("slow.test", 1, false, response(86_400));
+        let (_, remaining) = cache
+            .get_with_remaining("slow.test", 1, false)
+            .expect("entry is cached");
+        assert!(remaining as u64 <= MAX_TTL);
     }
 
     #[test]
