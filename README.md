@@ -20,10 +20,30 @@ written in Rust.
   IoT mode) while local network names keep resolving.
 - **No root, no TUN device.** WireGuard runs in userspace (boringtun + smoltcp),
   fully in-process.
-- **Fast and small.** Rust, single binary, sub-2 ms cache/block decisions,
-  tens-of-thousands of QPS on a home server.
+- **Fast and small.** Rust, single binary. ~60 MB RSS on an ARM board serving 30
+  clients off a 1.8M-domain blocklist, sub-2 ms cache/block decisions,
+  tens-of-thousands of QPS.
 - **Self-hosted and private.** No telemetry, no phone-home. Your queries stay on
   your box.
+
+## How it compares
+
+|                                                            | ferrite               | Pi-hole              | AdGuard Home       | NextDNS            |
+| ---------------------------------------------------------- | --------------------- | -------------------- | ------------------ | ------------------ |
+| Ad / tracker blocking                                       | yes                   | yes                  | yes                | yes                |
+| Per-device filtering profiles                                | yes                   | yes (groups)         | yes (clients)      | yes                |
+| Encrypted upstreams (DoT / DoH / DoQ)                        | built in              | needs unbound or cloudflared | built in   | n/a — it *is* the upstream |
+| **Per-device / per-domain egress via WireGuard, SOCKS5, Tor** | **yes**               | no                   | no                 | no                 |
+| **DPI evasion (TLS ClientHello / SNI fragmentation)**        | **yes**               | no                   | no                 | no                 |
+| Runs without root                                            | yes (no TUN either)   | no                   | needs a capability | n/a                |
+| Self-hosted, no third party sees your queries                | yes                   | yes                  | yes                | no                 |
+| DHCP server                                                  | not yet               | yes                  | yes                | n/a                |
+| Maturity                                                     | v0.1.x, one developer | mature               | mature             | mature             |
+
+Short version: if you want a sinkhole and nothing else, Pi-hole and AdGuard Home
+are mature and excellent — use them. ferrite is for when you also want to decide
+**per device which tunnel the traffic leaves through**, without hand-wiring a DNS
+blocker to a VPN client and a proxy.
 
 ## Screenshots
 
@@ -105,6 +125,21 @@ docker run -d --name ferrite \
   ghcr.io/syntlyx/ferrite-server:latest
 ```
 
+```yaml
+# Docker Compose — see docker-compose.yml in the repo root
+services:
+  ferrite:
+    image: ghcr.io/syntlyx/ferrite-server:latest
+    container_name: ferrite
+    restart: unless-stopped
+    network_mode: host          # so ferrite sees real client IPs (see note below)
+    cap_add: [NET_BIND_SERVICE]
+    volumes:
+      - ferrite-data:/var/lib/ferrite
+volumes:
+  ferrite-data:
+```
+
 ```bash
 # From source (Rust 1.97+)
 cargo build --release
@@ -116,8 +151,12 @@ open **`http://fe.te`** on the LAN, and set a password.
 
 - The Docker image is a small Alpine runtime; mount `/var/lib/ferrite` so config,
   data, and updates survive restarts. If port 53 fails to bind, add
-  `--cap-add=NET_BIND_SERVICE`. In bridge mode set `FERRITE_PANEL_IP=<host LAN IP>`
-  so the `fe.te` shortcut resolves.
+  `--cap-add=NET_BIND_SERVICE`.
+- **Prefer host networking.** Per-device profiles and routing rules match on the
+  client's LAN IP/MAC — behind a Docker bridge every query arrives from the
+  gateway, so all your devices look like one. If you must use bridge mode, set
+  `FERRITE_PANEL_IP=<host LAN IP>` so the `fe.te` shortcut resolves, and publish
+  `443/tcp` as well if you use selective routing.
 - `fe.te` is a built-in DNS record pointing at the detected (or configured) server
   IP, so the panel is easy to find.
 
