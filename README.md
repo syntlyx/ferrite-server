@@ -110,23 +110,9 @@ listener ports **hot-reload** — no restart.
 
 ## Install
 
-```bash
-# Linux — release install (systemd / OpenRC service)
-curl -fsSL https://raw.githubusercontent.com/syntlyx/ferrite-server/main/install.sh | sudo sh
-```
-
-```bash
-# Docker — image on GHCR (not Docker Hub)
-docker run -d --name ferrite \
-  --restart unless-stopped \
-  -p 53:53/tcp -p 53:53/udp \
-  -p 80:80/tcp \
-  -v ferrite-data:/var/lib/ferrite \
-  ghcr.io/syntlyx/ferrite-server:latest
-```
+**Docker Compose** (recommended — see `docker-compose.yml` in the repo root):
 
 ```yaml
-# Docker Compose — see docker-compose.yml in the repo root
 services:
   ferrite:
     image: ghcr.io/syntlyx/ferrite-server:latest
@@ -138,6 +124,36 @@ services:
       - ferrite-data:/var/lib/ferrite
 volumes:
   ferrite-data:
+```
+
+```bash
+# Docker — image on GHCR (not Docker Hub)
+docker run -d --name ferrite \
+  --restart unless-stopped \
+  --network host \
+  --cap-add=NET_BIND_SERVICE \
+  -v ferrite-data:/var/lib/ferrite \
+  ghcr.io/syntlyx/ferrite-server:latest
+```
+
+**Static binary.** Every release ships musl binaries for `x86_64` and `aarch64`
+with a `.sha256` next to each, so you can verify before running anything:
+
+```bash
+VER=v0.1.8; ARCH=$(uname -m)-unknown-linux-musl
+BASE=https://github.com/syntlyx/ferrite-server/releases/download/$VER
+curl -fsSLO $BASE/ferrite-$VER-$ARCH.tar.gz
+curl -fsSL  $BASE/ferrite-$VER-$ARCH.tar.gz.sha256 | sha256sum -c -
+tar -xzf ferrite-$VER-$ARCH.tar.gz && sudo install -m755 ferrite /usr/local/bin/ferrite
+```
+
+**Install script** — sets up a systemd/OpenRC service around that same binary.
+Read it before you run it; it is not piped into a shell here on purpose:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/syntlyx/ferrite-server/main/install.sh
+less install.sh          # see what it does
+sudo sh install.sh
 ```
 
 ```bash
