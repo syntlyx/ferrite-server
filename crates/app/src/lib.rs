@@ -20,6 +20,7 @@ use ferrite_blocklist::Blocklist;
 use ferrite_clients::ClientRegistry;
 use ferrite_core::config::{Config, CustomRecordConfig};
 use ferrite_core::error::Result;
+use ferrite_core::recording::RecordSwitches;
 use ferrite_core::types::QueryEntry;
 use ferrite_dns::cache::DnsCache;
 use ferrite_dns::custom::CustomRecords;
@@ -51,12 +52,13 @@ pub struct AppStateInner {
     /// Host names that resolve to the local admin panel. The shared HTTP listener
     /// serves the panel for these and hands everything else to the proxy.
     pub panel_hosts: std::collections::HashSet<String>,
-    /// Path to the warm-restart snapshot file.
-    pub snapshot_path: std::path::PathBuf,
     /// Hot-patchable list of domain patterns to suppress from the query log.
     pub log_ignore: Arc<RwLock<Vec<String>>>,
     /// Hot-patchable ceiling on the TTL handed to client devices (seconds).
     pub client_ttl: Arc<AtomicU32>,
+    /// Hot-patchable privacy switches: whether queries are logged and whether
+    /// statistics are kept. Shared with the DNS handler and the stats writer.
+    pub record_switches: Arc<RecordSwitches>,
     /// Limits in-flight DNS queries to prevent memory exhaustion under slow upstream.
     pub query_semaphore: Arc<Semaphore>,
 }
@@ -73,6 +75,13 @@ pub struct AppState {
     pub live_config: Arc<RwLock<Config>>,
     /// Path of the config file we loaded from (for saving patches).
     pub config_path: Arc<Option<std::path::PathBuf>>,
+    /// Where the warm-restart snapshot lives. On the outer handle rather than
+    /// `AppStateInner` so a test can point it at a temp file instead of writing
+    /// over the operator's real `state.bin`.
+    pub snapshot_path: Arc<std::path::PathBuf>,
+    /// Serializes every writer of [`Self::snapshot_path`]. See
+    /// [`AppState::save_snapshot`].
+    snapshot_lock: Arc<tokio::sync::Mutex<()>>,
     /// Active sessions: token → expiry Instant.
     pub sessions: Arc<DashMap<String, Instant>>,
     /// Signals the stats writer to flush its current batch immediately (used on shutdown).
@@ -90,6 +99,30 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Write the warm-restart snapshot, serialized against every other writer
+    /// of the same file.
+    ///
+    /// Three callers reach this: the five-minute saver, the shutdown/restart
+    /// paths, and the settings handler when the operator switches recording
+    /// off. The lock is what makes the last one trustworthy — the recording
+    /// scope is read *inside* it, so a save that began while recording was
+    /// still on cannot finish after the scrub and put the cached domains back
+    /// on disk. It also stops two savers colliding over the temp file.
+    pub async fn save_snapshot(&self) -> Result<()> {
+        let _guard = self.snapshot_lock.lock().await;
+        let dns_cache = Arc::clone(&self.inner.dns_cache);
+        let live = Arc::clone(&self.inner.live_stats);
+        let path = self.snapshot_path.as_ref().clone();
+        let scope = self.inner.record_switches.scope();
+        // spawn_blocking: save() ends in std::fs::write, a blocking syscall that
+        // would stall a runtime worker on slow storage (SD card, NFS).
+        tokio::task::spawn_blocking(move || snapshot::save::save(&dns_cache, &live, &path, scope))
+            .await
+            .map_err(|e| {
+                ferrite_core::error::FeriteError::Internal(format!("snapshot task failed: {e}"))
+            })?
+    }
+
     /// The slice of state the stats writer consumes (everything but the
     /// pipeline receiver, which `main` takes out of `query_rx` once).
     pub fn writer_ctx(&self) -> ferrite_stats::writer::WriterCtx {
@@ -97,6 +130,7 @@ impl AppState {
             live_stats: Arc::clone(&self.inner.live_stats),
             client_registry: Arc::clone(&self.inner.client_registry),
             storage: Arc::clone(&self.inner.storage),
+            switches: Arc::clone(&self.inner.record_switches),
             flush_notify: Arc::clone(&self.flush_notify),
             flush_done: Arc::clone(&self.flush_done),
         }
@@ -127,6 +161,7 @@ impl AppState {
             live_stats: Arc::clone(&self.inner.live_stats),
             log_ignore: Arc::clone(&self.inner.log_ignore),
             client_ttl: Arc::clone(&self.inner.client_ttl),
+            record_switches: Arc::clone(&self.inner.record_switches),
             query_semaphore: Arc::clone(&self.inner.query_semaphore),
             query_tx: self.query_tx.clone(),
         }
@@ -202,18 +237,29 @@ impl AppState {
 
         // Seed in-memory stats from retained storage so dashboards keep their
         // all-time counters/top lists after restart without polling storage.
+        //
+        // The privacy switches gate this, or they would not survive a reboot:
+        // `forget_history()`/`forget_recent()` empty these very structures when
+        // the operator switches recording off, and seeding them back out of
+        // `ferrite.db` would hand the same domains and devices straight back to
+        // the dashboard. The lifetime counters below are the exception — they
+        // carry no domain or device identity and are what the dashboard falls
+        // back to, so they are always restored.
+        let scope = config.storage.record_scope();
         let now_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
         let all_time_from_ts = 0;
 
-        match storage.timeseries(600).await {
-            Ok(b) => {
-                tracing::info!("seeded timeseries with {} buckets from storage", b.len());
-                live_stats.timeseries.seed(&b);
+        if scope.stats {
+            match storage.timeseries(600).await {
+                Ok(b) => {
+                    tracing::info!("seeded timeseries with {} buckets from storage", b.len());
+                    live_stats.timeseries.seed(&b);
+                }
+                Err(e) => tracing::warn!("failed to seed timeseries: {}", e),
             }
-            Err(e) => tracing::warn!("failed to seed timeseries: {}", e),
         }
 
         match storage.summary_counts(all_time_from_ts, now_ts).await {
@@ -243,51 +289,63 @@ impl AppState {
             Err(e) => tracing::warn!("failed to seed query counters: {}", e),
         }
 
-        match storage.top_domains(all_time_from_ts, now_ts, 1_000).await {
-            Ok(rows) => {
-                tracing::info!("seeded top_domains with {} entries", rows.len());
-                live_stats.top_domains.seed(&rows);
-            }
-            Err(e) => tracing::warn!("failed to seed top_domains: {}", e),
-        }
-
-        match storage
-            .top_blocked_domains(all_time_from_ts, now_ts, 1_000)
-            .await
-        {
-            Ok(rows) => {
-                tracing::info!("seeded top_blocked with {} entries", rows.len());
-                live_stats.top_blocked.seed(&rows);
-            }
-            Err(e) => tracing::warn!("failed to seed top_blocked: {}", e),
-        }
-
-        match storage.top_clients(all_time_from_ts, now_ts, 500).await {
-            Ok(rows) => {
-                tracing::info!("seeded top_clients with {} entries", rows.len());
-                let pairs: Vec<(String, u64)> =
-                    rows.into_iter().map(|c| (c.device, c.total)).collect();
-                live_stats.top_clients.seed(&pairs);
-            }
-            Err(e) => tracing::warn!("failed to seed top_clients: {}", e),
-        }
-
-        match storage
-            .query_range(&ferrite_storage::QueryFilter {
-                limit: Some(2_000),
-                ..Default::default()
-            })
-            .await
-        {
-            Ok(mut entries) => {
-                tracing::info!("seeded recent_queries with {} entries", entries.len());
-                if let Some(max_id) = entries.iter().map(|e| e.id).max() {
-                    ferrite_dns::handler::seed_query_counter(max_id);
+        if scope.stats {
+            match storage.top_domains(all_time_from_ts, now_ts, 1_000).await {
+                Ok(rows) => {
+                    tracing::info!("seeded top_domains with {} entries", rows.len());
+                    live_stats.top_domains.seed(&rows);
                 }
-                entries.reverse(); // query_range returns newest-first; ring buffer needs oldest-first
-                live_stats.recent_queries.seed(entries);
+                Err(e) => tracing::warn!("failed to seed top_domains: {}", e),
             }
-            Err(e) => tracing::warn!("failed to seed recent_queries: {}", e),
+
+            match storage
+                .top_blocked_domains(all_time_from_ts, now_ts, 1_000)
+                .await
+            {
+                Ok(rows) => {
+                    tracing::info!("seeded top_blocked with {} entries", rows.len());
+                    live_stats.top_blocked.seed(&rows);
+                }
+                Err(e) => tracing::warn!("failed to seed top_blocked: {}", e),
+            }
+
+            match storage.top_clients(all_time_from_ts, now_ts, 500).await {
+                Ok(rows) => {
+                    tracing::info!("seeded top_clients with {} entries", rows.len());
+                    let pairs: Vec<(String, u64)> =
+                        rows.into_iter().map(|c| (c.device, c.total)).collect();
+                    live_stats.top_clients.seed(&pairs);
+                }
+                Err(e) => tracing::warn!("failed to seed top_clients: {}", e),
+            }
+        }
+
+        // Always: the id counter has to resume above every stored row, whether
+        // or not the log is on, or a later insert would collide with one written
+        // before the restart.
+        match storage.max_query_id().await {
+            Ok(max_id) => ferrite_dns::handler::seed_query_counter(max_id),
+            Err(e) => tracing::warn!("failed to read the highest query id: {}", e),
+        }
+
+        // The ring itself is the query log's in-memory half, so it follows the
+        // switch: with logging off nothing is read back and no domain or client
+        // address returns to RAM.
+        if scope.queries {
+            match storage
+                .query_range(&ferrite_storage::QueryFilter {
+                    limit: Some(2_000),
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok(mut entries) => {
+                    tracing::info!("seeded recent_queries with {} entries", entries.len());
+                    entries.reverse(); // query_range returns newest-first; the ring needs oldest-first
+                    live_stats.recent_queries.seed(entries);
+                }
+                Err(e) => tracing::warn!("failed to seed recent_queries: {}", e),
+            }
         }
 
         // Upstream pool + zone router. The pool is built before the proxy (the
@@ -344,11 +402,19 @@ impl AppState {
         let client_registry =
             ClientRegistry::new(Arc::clone(&upstream_pool), Arc::clone(&storage)).await;
 
+        // The privacy switches are built before the proxy: its per-egress
+        // routed-domain table is one of the surfaces they gate, so it needs the
+        // same handle the DNS handler and the stats writer read.
+        let record_switches = RecordSwitches::new(config.storage.record_scope());
+
         // Selective routing / proxy. Egresses resolve real hosts through this
         // same upstream pool (never the OS resolver, which would loop back into
         // ferrite's own DNS for routed names).
-        let proxy =
-            ferrite_proxy::ProxyState::from_config(&config.proxy, Arc::clone(&upstream_pool));
+        let proxy = ferrite_proxy::ProxyState::from_config(
+            &config.proxy,
+            Arc::clone(&upstream_pool),
+            Arc::clone(&record_switches),
+        );
         // Now that the proxy exists, let tunneled upstreams reach its egresses.
         // (`set` only fails when already set — impossible for a handle created
         // a few lines above.)
@@ -371,9 +437,9 @@ impl AppState {
             client_registry,
             proxy,
             panel_hosts: panel_hosts(config),
-            snapshot_path,
             log_ignore: Arc::new(RwLock::new(config.dns.log_ignore.clone())),
             client_ttl: Arc::new(AtomicU32::new(config.dns.client_ttl)),
+            record_switches,
             query_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
         });
 
@@ -386,6 +452,8 @@ impl AppState {
             query_rx: Arc::new(Mutex::new(Some(query_rx))),
             live_config: Arc::new(RwLock::new(persistent_config)),
             config_path: Arc::new(config_path),
+            snapshot_path: Arc::new(snapshot_path),
+            snapshot_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions: Arc::new(DashMap::new()),
             flush_notify: Arc::new(Notify::new()),
             flush_done: Arc::new(Notify::new()),
@@ -543,16 +611,70 @@ mod tests {
         assert_eq!(panel_url(&cfg, "fe.te"), "http://fe.te:8031");
     }
 
+    /// The switches have to survive a reboot. Startup re-seeds every in-memory
+    /// history surface out of SQLite, so without a gate there the operator's
+    /// choice would last exactly until the next restart and the dashboard would
+    /// hand back the domains and devices `forget_history()` had just dropped.
+    #[tokio::test]
+    async fn recording_switched_off_survives_a_restart() {
+        let db_path = crate::test_support::temp_path("app-seed-privacy", "db");
+        let storage = SqliteStorage::open(&db_path).await.unwrap();
+        let ts = chrono::Utc::now().timestamp();
+        storage
+            .write_batch(
+                vec![
+                    query_entry(ts, "private.test", "192.168.1.10", QueryStatus::Upstream),
+                    query_entry(ts + 1, "private.test", "192.168.1.10", QueryStatus::Blocked),
+                ],
+                ferrite_core::recording::RecordScope::ALL,
+            )
+            .await
+            .unwrap();
+        drop(storage);
+
+        let mut cfg = Config::default();
+        cfg.storage.path = db_path.clone();
+        cfg.storage.log_queries = false;
+        cfg.storage.keep_stats = false;
+        cfg.blocklist.lists.clear();
+        cfg.upstream = vec![UpstreamConfig::Plain {
+            address: "127.0.0.1".to_string(),
+            port: 53,
+            egress: None,
+        }];
+
+        let state = AppState::init(&cfg, cfg.clone()).await.unwrap();
+        let live = &state.inner.live_stats;
+
+        // Nothing carrying a domain or a device came back…
+        assert!(live.top_domains.top(10).is_empty());
+        assert!(live.top_blocked.top(10).is_empty());
+        assert!(live.top_clients.top(10).is_empty());
+        assert!(live.recent_queries.recent(10).is_empty());
+        assert!(live.timeseries.buckets_24h().iter().all(|b| b.total == 0));
+
+        // …but the anonymous lifetime counters did, so the dashboard still has
+        // something honest to show after the restart.
+        assert_eq!(live.total(), 2);
+        assert_eq!(live.blocked(), 1);
+
+        drop(state);
+        crate::test_support::cleanup_sqlite(&db_path);
+    }
+
     #[tokio::test]
     async fn live_top_clients_seed_from_all_retained_history() {
         let db_path = crate::test_support::temp_path("app-seed-all-clients", "db");
         let storage = SqliteStorage::open(&db_path).await.unwrap();
         let old_ts = chrono::Utc::now().timestamp() - 2 * 86400;
         storage
-            .write_batch(&[
-                query_entry(old_ts, "old.test", "192.168.1.10", QueryStatus::Upstream),
-                query_entry(old_ts + 1, "old.test", "192.168.1.10", QueryStatus::Blocked),
-            ])
+            .write_batch(
+                vec![
+                    query_entry(old_ts, "old.test", "192.168.1.10", QueryStatus::Upstream),
+                    query_entry(old_ts + 1, "old.test", "192.168.1.10", QueryStatus::Blocked),
+                ],
+                ferrite_core::recording::RecordScope::ALL,
+            )
             .await
             .unwrap();
         drop(storage);

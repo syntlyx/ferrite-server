@@ -12,6 +12,7 @@ use crate::intercept::DnsInterceptor;
 use ferrite_blocklist::Blocklist;
 use ferrite_clients::ClientRegistry;
 use ferrite_core::config::DnsConfig;
+use ferrite_core::recording::RecordSwitches;
 use ferrite_core::types::QueryEntry;
 use ferrite_stats::live::LiveStats;
 use ferrite_upstream::ZoneRouter;
@@ -36,6 +37,10 @@ pub struct DnsCtx {
     /// this is what bounds how long a stale answer survives on a phone after a
     /// list, rule or profile change. Hot-patchable.
     pub client_ttl: Arc<AtomicU32>,
+    /// Privacy switches: whether a completed query may be recorded at all.
+    /// Read once per query — with both the log and statistics off the entry is
+    /// never built into the pipeline, only counted.
+    pub record_switches: Arc<RecordSwitches>,
     /// Limits in-flight queries to prevent memory exhaustion under slow upstream.
     pub query_semaphore: Arc<Semaphore>,
     /// Sender side of the query pipeline (handler → stats writer).

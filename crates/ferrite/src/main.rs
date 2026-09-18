@@ -154,7 +154,7 @@ async fn run() -> anyhow::Result<()> {
 
     // ── Warm restart: restore snapshot ───────────────────────────────────────
     {
-        let snap_path = state.inner.snapshot_path.clone();
+        let snap_path = state.snapshot_path.as_ref().clone();
         match ferrite_app::snapshot::restore::load_snapshot(&snap_path) {
             Ok(Some(snap)) => {
                 ferrite_app::snapshot::restore::apply_snapshot(
@@ -201,12 +201,7 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
             tracing::info!("saving snapshot…");
-            let path = state_for_shutdown.inner.snapshot_path.clone();
-            let dns_cache = Arc::clone(&state_for_shutdown.inner.dns_cache);
-            let live = Arc::clone(&state_for_shutdown.inner.live_stats);
-            let save_task = tokio::task::spawn_blocking(move || {
-                ferrite_app::snapshot::save::save(&dns_cache, &live, &path)
-            });
+            let save_task = tokio::spawn(async move { state_for_shutdown.save_snapshot().await });
             match tokio::time::timeout(std::time::Duration::from_secs(10), save_task).await {
                 Ok(Ok(Ok(()))) => tracing::info!("snapshot saved, exiting"),
                 Ok(Ok(Err(e))) => tracing::error!("failed to save snapshot: {}", e),
@@ -272,11 +267,7 @@ async fn run() -> anyhow::Result<()> {
         ferrite_api::serve(state.clone()),
         ferrite_stats::writer::run(state.writer_ctx(), query_rx),
         ferrite_updater::check_loop(state.updater_ctx()),
-        periodic_snapshot(
-            Arc::clone(&state.inner.dns_cache),
-            Arc::clone(&state.inner.live_stats),
-            state.inner.snapshot_path.clone(),
-        ),
+        periodic_snapshot(state.clone()),
     );
 
     // try_join returns on the first Err — log which service caused the exit.
@@ -288,30 +279,16 @@ async fn run() -> anyhow::Result<()> {
 }
 
 /// Save a snapshot every 5 minutes so a crash loses at most 5 min of cache.
-async fn periodic_snapshot(
-    dns_cache: Arc<ferrite_dns::cache::DnsCache>,
-    live: Arc<ferrite_stats::live::LiveStats>,
-    path: std::path::PathBuf,
-) -> anyhow::Result<()> {
+async fn periodic_snapshot(state: ferrite_app::AppState) -> anyhow::Result<()> {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
     interval.tick().await; // skip the immediate first tick
     loop {
         interval.tick().await;
-        let dns_cache = Arc::clone(&dns_cache);
-        let live = Arc::clone(&live);
-        let path = path.clone();
-        // Use spawn_blocking: std::fs::write inside save() is a blocking syscall.
-        // Calling it directly on a tokio worker thread would stall the runtime,
-        // especially on slow storage (SD card, NFS).
-        let result = tokio::task::spawn_blocking(move || {
-            ferrite_app::snapshot::save::save(&dns_cache, &live, &path)
-        })
-        .await;
-
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!("periodic snapshot failed: {}", e),
-            Err(e) => tracing::warn!("periodic snapshot task panicked: {}", e),
+        // save_snapshot() takes the snapshot lock and reads the recording scope
+        // inside it, so this save cannot land a DNS cache on disk after the
+        // settings handler scrubbed it.
+        if let Err(e) = state.save_snapshot().await {
+            tracing::warn!("periodic snapshot failed: {}", e);
         }
     }
 }

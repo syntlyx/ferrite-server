@@ -45,6 +45,7 @@ use tokio::sync::Notify;
 use ferrite_blocklist::Blocklist;
 use ferrite_clients::ClientRegistry;
 use ferrite_core::config::{Config, EgressConfig, ProxyConfig};
+use ferrite_core::recording::RecordSwitches;
 use ferrite_dns::intercept::{DnsInterceptor, Intercept};
 use ferrite_dns::types::{DnsResponse, qtype as qt};
 use ferrite_upstream::{EgressConnectError, EgressConnectFuture, EgressConnector, ZoneRouter};
@@ -171,7 +172,11 @@ impl Snapshot {
 }
 
 impl ProxyState {
-    pub fn from_config(cfg: &ProxyConfig, upstream: Arc<ZoneRouter>) -> Arc<Self> {
+    pub fn from_config(
+        cfg: &ProxyConfig,
+        upstream: Arc<ZoneRouter>,
+        switches: Arc<RecordSwitches>,
+    ) -> Arc<Self> {
         let snapshot = build_snapshot(cfg, cfg.enabled, &upstream, None);
         Arc::new(Self {
             registry: ArcSwap::from_pointee(snapshot),
@@ -179,7 +184,7 @@ impl ProxyState {
             listeners: ArcSwap::from_pointee(ListenerCfg::from(cfg)),
             listener_reload: Arc::new(Notify::new()),
             upstream,
-            stats: ProxyStats::default(),
+            stats: ProxyStats::new(switches),
             down: DashMap::new(),
         })
     }
@@ -542,6 +547,10 @@ mod tests {
     use ferrite_dns::types::qtype;
     use ferrite_upstream::{UpstreamPool, ZoneRouter, no_proxy};
 
+    fn all_recording() -> Arc<RecordSwitches> {
+        RecordSwitches::new(ferrite_core::recording::RecordScope::ALL)
+    }
+
     fn upstream() -> Arc<ZoneRouter> {
         let pool = UpstreamPool::from_config(
             &[UpstreamConfig::Plain {
@@ -588,7 +597,7 @@ mod tests {
             }],
         };
         cfg.normalize();
-        ProxyState::from_config(&cfg, upstream())
+        ProxyState::from_config(&cfg, upstream(), all_recording())
     }
 
     fn query(name: &str, rt: RecordType) -> Message {
@@ -700,6 +709,7 @@ mod tests {
         let proxy = ProxyState::from_config(
             &cfg_with(vec![direct_egress("t")], vec![rule("*.example.com", "t")]),
             upstream(),
+            all_recording(),
         );
         let before = proxy.egress("t").expect("egress exists");
 

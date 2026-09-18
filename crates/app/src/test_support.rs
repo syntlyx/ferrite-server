@@ -26,7 +26,13 @@ pub async fn app_state(name: &str) -> (AppState, PathBuf) {
         egress: None,
     }];
 
-    let state = AppState::init(&config, config.clone()).await.unwrap();
+    // Never the operator's real ~/.local/share/ferrite/state.bin: tests that
+    // switch recording off rewrite the snapshot, and that must not touch a
+    // running install's warm-restart state.
+    let state = AppState {
+        snapshot_path: Arc::new(temp_path(name, "bin")),
+        ..AppState::init(&config, config.clone()).await.unwrap()
+    };
     (state, db_path)
 }
 

@@ -58,9 +58,10 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
         None => return Ok(build_servfail(&query)),
     };
 
-    let name = question.name().to_lowercase().to_utf8();
-    // Strip trailing dot (FQDN form).
-    let name = name.trim_end_matches('.').to_string();
+    let mut name = question.name().to_lowercase().to_utf8();
+    // Strip trailing dot (FQDN form) in place — the same bytes, no second String.
+    let stripped = name.trim_end_matches('.').len();
+    name.truncate(stripped);
     // Normalise IPv4-mapped IPv6 (::ffff:a.b.c.d) to plain IPv4 so the DB
     // stores clean addresses and PTR grouping works correctly.
     let client_addr = unmap_v4(src.ip());
@@ -340,7 +341,17 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
 // ---------------------------------------------------------------------------
 
 fn emit(ctx: &DnsCtx, entry: QueryEntry) {
+    // The counters are process-lifetime totals in RAM with no domain or client
+    // in them, so they keep the dashboard honest even in the strictest privacy
+    // mode and are always updated.
     ctx.live_stats.record_query(&entry);
+    // With both the query log and statistics switched off there is nothing
+    // downstream to record the entry into. The entry itself is already built by
+    // the time we get here — every call site constructs it inline — so this
+    // saves the channel hop and the writer's batch, not the allocation.
+    if !ctx.record_switches.scope().records_anything() {
+        return;
+    }
     // try_send: if the channel is full we drop the stat rather than block DNS,
     // but count the drop and warn (rate-limited) so a stalled writer surfaces
     // instead of silently diverging the persisted log from the live counters.
@@ -639,6 +650,7 @@ mod tests {
     use ferrite_blocklist::Blocklist;
     use ferrite_clients::ClientRegistry;
     use ferrite_core::config::{BlocklistConfig, CustomRecordConfig, DnsConfig};
+    use ferrite_core::recording::{RecordScope, RecordSwitches};
     use ferrite_stats::live::LiveStats;
     use ferrite_storage::SqliteStorage;
     use ferrite_upstream::{UpstreamPool, ZoneRouter, no_proxy};
@@ -752,6 +764,7 @@ mod tests {
                 live_stats: Arc::clone(&self.live_stats),
                 log_ignore: Arc::new(RwLock::new(Vec::new())),
                 client_ttl: Arc::new(AtomicU32::new(self.client_ttl)),
+                record_switches: RecordSwitches::new(RecordScope::ALL),
                 query_semaphore: Arc::new(Semaphore::new(256)),
                 query_tx: self.query_tx.clone(),
             }
@@ -1085,6 +1098,32 @@ mod tests {
         emit(&ctx, entry());
 
         assert_eq!(h.live_stats.dropped(), 2);
+
+        cleanup_sqlite(&h.db_path);
+    }
+
+    #[tokio::test]
+    async fn recording_switched_off_counts_the_query_but_sends_nothing() {
+        let h = Harness::new("dns-emit-privacy").await;
+        let (tx, mut rx) = mpsc::channel::<QueryEntry>(4);
+        let entry = || make_entry("x.test", 1, "192.0.2.1", QueryStatus::Blocked, 0, None, 0);
+
+        let mut ctx = h.ctx();
+        ctx.query_tx = tx;
+        ctx.record_switches = RecordSwitches::new(RecordScope::NONE);
+        emit(&ctx, entry());
+
+        // The anonymous counters still move — the dashboard keeps working —
+        // but nothing carrying a domain or a client reaches the pipeline.
+        assert_eq!(h.live_stats.total(), 1);
+        assert_eq!(h.live_stats.blocked(), 1);
+        assert_eq!(h.live_stats.dropped(), 0);
+        assert!(rx.try_recv().is_err());
+
+        // Switched back on, the very next query flows again — no restart.
+        ctx.record_switches.set_stats(true);
+        emit(&ctx, entry());
+        assert_eq!(rx.try_recv().unwrap().domain, "x.test");
 
         cleanup_sqlite(&h.db_path);
     }

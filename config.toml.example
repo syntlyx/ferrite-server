@@ -114,6 +114,36 @@ port    = 53
 # Default: ~/.local/share/ferrite/ferrite.db
 # path = "/var/lib/ferrite/ferrite.db"
 
+# Automatically delete query log entries older than this many days.
+# 0 (default) keeps them forever.
+# log_retention_days = 30
+
+# Privacy switches — both default to true, both apply without a restart.
+#
+# Both work the same way: they stop new data being recorded AND stop the old
+# data being served. What was written before the switch stays on disk, but
+# ferrite will not hand it back while you have asked it not to be keeping any —
+# switch the setting on again to read it, or delete it for good with the Clear
+# button in the UI (DELETE /api/queries).
+#
+# log_queries = false stops the per-query log: nothing lands in the `queries`
+# table and the Queries page stays empty. Filtering and routing are unaffected.
+#
+# keep_stats = false stops the aggregates: no top domains, no top clients, no
+# 24-hour graph, no per-device counters, and no host names on the Tunnels page
+# (per-tunnel byte and connection totals keep counting — they name no host).
+# The Clients page goes empty too: it *is* the per-device counters. The
+# dashboard falls back to the process-lifetime totals, which carry no domain or
+# device identity. Those totals are anonymous, not ephemeral — they are kept in
+# the restart snapshot so the dashboard still means something after a reboot.
+#
+# With both off ferrite records nothing about what was resolved — including the
+# warm-restart snapshot, which stops storing cached domains (so a restart starts
+# with a cold cache). Existing data is not deleted: use the Clear button in the
+# UI, or DELETE /api/queries, which also vacuums the database.
+# log_queries = true
+# keep_stats = true
+
 
 # ── API / web UI ──────────────────────────────────────────────────────────────
 

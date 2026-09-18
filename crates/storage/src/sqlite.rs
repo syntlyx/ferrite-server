@@ -9,6 +9,7 @@ use tokio_rusqlite::Connection;
 use crate::schema::SCHEMA;
 use crate::{ClientStats, QueryFilter, Storage, SummaryStats};
 use ferrite_core::error::{FeriteError, Result};
+use ferrite_core::recording::RecordScope;
 use ferrite_core::types::TimeseriesBucket;
 use ferrite_core::types::{QueryEntry, QueryStatus};
 
@@ -59,12 +60,11 @@ impl SqliteStorage {
 
 #[async_trait]
 impl Storage for SqliteStorage {
-    async fn write_batch(&self, entries: &[QueryEntry]) -> Result<()> {
-        if entries.is_empty() {
+    async fn write_batch(&self, entries: Vec<QueryEntry>, scope: RecordScope) -> Result<()> {
+        if entries.is_empty() || !scope.records_anything() {
             return Ok(());
         }
 
-        let entries = entries.to_vec();
         self.conn
             .call(move |c| {
                 let tx = c.unchecked_transaction()?;
@@ -75,38 +75,47 @@ impl Storage for SqliteStorage {
                 {
                     // Explicit id: keeps SQLite ids identical to in-memory ids
                     // (counter is seeded from MAX(id) at startup, so no collisions).
-                    let mut stmt = tx.prepare_cached(
-                        "INSERT INTO queries (id, timestamp, domain, query_type, client_ip, device, status, latency_ms, upstream, rcode)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                    )?;
+                    // Prepared only when the query log is on — with it off the
+                    // batch is here purely to feed the rollups.
+                    let mut stmt = if scope.queries {
+                        Some(tx.prepare_cached(
+                            "INSERT INTO queries (id, timestamp, domain, query_type, client_ip, device, status, latency_ms, upstream, rcode)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        )?)
+                    } else {
+                        None
+                    };
                     for e in &entries {
-                        let ts = e.timestamp.timestamp();
                         // Defensive fallback: an untagged entry keys to its IP so it is
                         // never written with an empty device token.
                         let device = device_token(e);
-                        stmt.execute(rusqlite::params![
-                            e.id as i64,
-                            ts,
-                            e.domain,
-                            e.query_type as i64,
-                            e.client_ip,
-                            device,
-                            e.status.as_str(),
-                            e.latency_ms as i64,
-                            e.upstream,
-                            e.rcode as i64,
-                        ])?;
+                        if let Some(stmt) = stmt.as_mut() {
+                            stmt.execute(rusqlite::params![
+                                e.id as i64,
+                                e.timestamp.timestamp(),
+                                e.domain,
+                                e.query_type as i64,
+                                e.client_ip,
+                                device,
+                                e.status.as_str(),
+                                e.latency_ms as i64,
+                                e.upstream,
+                                e.rcode as i64,
+                            ])?;
+                        }
 
-                        collect_rollup_aggregates(
-                            e,
-                            &device,
-                            &mut query_buckets,
-                            &mut domain_buckets,
-                            &mut device_buckets,
-                        );
+                        if scope.stats {
+                            collect_rollup_aggregates(
+                                e,
+                                device,
+                                &mut query_buckets,
+                                &mut domain_buckets,
+                                &mut device_buckets,
+                            );
+                        }
                     }
                 }
-                {
+                if scope.stats {
                     let mut stmt = tx.prepare_cached(
                         "INSERT INTO query_buckets_10m (bucket, total, blocked, cached, upstream)
                          VALUES (?1, ?2, ?3, ?4, ?5)
@@ -126,7 +135,7 @@ impl Storage for SqliteStorage {
                         ])?;
                     }
                 }
-                {
+                if scope.stats {
                     let mut stmt = tx.prepare_cached(
                         "INSERT INTO domain_buckets_10m (bucket, domain, total, blocked)
                          VALUES (?1, ?2, ?3, ?4)
@@ -143,7 +152,7 @@ impl Storage for SqliteStorage {
                         ])?;
                     }
                 }
-                {
+                if scope.stats {
                     let mut stmt = tx.prepare_cached(
                         "INSERT INTO device_buckets_10m (bucket, device, total, blocked, last_seen)
                          VALUES (?1, ?2, ?3, ?4, ?5)
@@ -164,6 +173,18 @@ impl Storage for SqliteStorage {
                 }
                 tx.commit()?;
                 Ok(())
+            })
+            .await
+            .map_err(FeriteError::TokioDatabase)
+    }
+
+    async fn max_query_id(&self) -> Result<u64> {
+        self.conn
+            .call(|c| {
+                // COALESCE keeps the empty table a clean 0 rather than a NULL.
+                let id: i64 =
+                    c.query_row("SELECT COALESCE(MAX(id), 0) FROM queries", [], |r| r.get(0))?;
+                Ok(id as u64)
             })
             .await
             .map_err(FeriteError::TokioDatabase)
@@ -423,6 +444,25 @@ impl Storage for SqliteStorage {
                      DELETE FROM domain_buckets_10m;
                      DELETE FROM client_buckets_10m;
                      DELETE FROM device_buckets_10m;",
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(FeriteError::TokioDatabase)
+    }
+
+    async fn vacuum(&self) -> Result<()> {
+        self.conn
+            .call(|c| {
+                // Fold the WAL into the main file first: VACUUM rebuilds the
+                // database but leaves a long WAL untouched, so a log cleared on a
+                // busy box would still keep its pages (and its domains) on disk.
+                // Then checkpoint again — the rebuild itself lands in the WAL, and
+                // leaving that behind means the space never returns to the card.
+                c.execute_batch(
+                    "PRAGMA wal_checkpoint(TRUNCATE);
+                     VACUUM;
+                     PRAGMA wal_checkpoint(TRUNCATE);",
                 )?;
                 Ok(())
             })
@@ -797,11 +837,11 @@ impl Storage for SqliteStorage {
 
 /// The device identity token a query is written under: its tagged `device`
 /// (set by the stats writer), falling back to the client IP when untagged.
-fn device_token(entry: &QueryEntry) -> String {
+fn device_token(entry: &QueryEntry) -> &str {
     if entry.device.is_empty() {
-        entry.client_ip.clone()
+        &entry.client_ip
     } else {
-        entry.device.clone()
+        &entry.device
     }
 }
 
@@ -1068,6 +1108,15 @@ async fn top_domains_rollup_query(
 }
 
 #[cfg(test)]
+impl SqliteStorage {
+    /// Persist a batch with every recording surface enabled — what a test means
+    /// unless it is specifically exercising the privacy switches.
+    async fn write_batch_all(&self, entries: Vec<QueryEntry>) -> Result<()> {
+        self.write_batch(entries, RecordScope::ALL).await
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1146,7 +1195,7 @@ mod tests {
             query_entry(bucket + 4, "ads.test", "192.168.1.11", QueryStatus::Blocked),
         ];
 
-        storage.write_batch(&entries).await.unwrap();
+        storage.write_batch_all(entries).await.unwrap();
 
         let timeseries = storage.timeseries(600).await.unwrap();
         let current = timeseries
@@ -1189,7 +1238,7 @@ mod tests {
             query_entry(ts, "new.test", "192.168.1.10", QueryStatus::Upstream),
         ];
 
-        storage.write_batch(&entries).await.unwrap();
+        storage.write_batch_all(entries).await.unwrap();
 
         let first_page = storage
             .query_range(&QueryFilter {
@@ -1470,13 +1519,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_log_off_keeps_the_rollups_and_writes_no_rows() {
+        let storage = SqliteStorage::open(&temp_db_path("ferrite-scope-log-off"))
+            .await
+            .unwrap();
+        let bucket = align_bucket(chrono::Utc::now().timestamp());
+
+        storage
+            .write_batch(
+                vec![query_entry(
+                    bucket + 1,
+                    "stats-only.test",
+                    "192.168.1.10",
+                    QueryStatus::Blocked,
+                )],
+                RecordScope {
+                    queries: false,
+                    stats: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        // No per-query history…
+        assert!(
+            storage
+                .query_range(&QueryFilter::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // …but the aggregate still counts the query.
+        assert_eq!(storage.summary(3600).await.unwrap(), (1, 1));
+        assert_eq!(
+            storage.top_domains(bucket, bucket + 599, 10).await.unwrap(),
+            vec![("stats-only.test".to_string(), 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_off_keeps_the_log_and_aggregates_nothing() {
+        let storage = SqliteStorage::open(&temp_db_path("ferrite-scope-stats-off"))
+            .await
+            .unwrap();
+        let bucket = align_bucket(chrono::Utc::now().timestamp());
+
+        storage
+            .write_batch(
+                vec![query_entry(
+                    bucket + 1,
+                    "log-only.test",
+                    "192.168.1.10",
+                    QueryStatus::Blocked,
+                )],
+                RecordScope {
+                    queries: true,
+                    stats: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let rows = storage.query_range(&QueryFilter::default()).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].domain, "log-only.test");
+        // Rollups are the statistics surface — nothing there, so the dashboard
+        // graphs and top lists have nothing to show.
+        assert_eq!(storage.summary(3600).await.unwrap(), (0, 0));
+        assert!(
+            storage
+                .top_domains(bucket, bucket + 599, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            storage
+                .top_clients(bucket, bucket + 599, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_fully_off_writes_nothing_at_all() {
+        let storage = SqliteStorage::open(&temp_db_path("ferrite-scope-none"))
+            .await
+            .unwrap();
+        let bucket = align_bucket(chrono::Utc::now().timestamp());
+
+        storage
+            .write_batch(
+                vec![query_entry(
+                    bucket + 1,
+                    "nowhere.test",
+                    "192.168.1.10",
+                    QueryStatus::Upstream,
+                )],
+                RecordScope::NONE,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            storage
+                .query_range(&QueryFilter::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(storage.summary(3600).await.unwrap(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn vacuum_runs_after_a_clear_and_leaves_the_database_usable() {
+        let path = temp_db_path("ferrite-vacuum");
+        let storage = SqliteStorage::open(&path).await.unwrap();
+        let bucket = align_bucket(chrono::Utc::now().timestamp());
+        let entries: Vec<QueryEntry> = (0..500)
+            .map(|i| {
+                query_entry(
+                    bucket + 1,
+                    &format!("domain-{i}.test"),
+                    "192.168.1.10",
+                    QueryStatus::Upstream,
+                )
+            })
+            .collect();
+        storage.write_batch_all(entries).await.unwrap();
+        storage.delete_all_queries().await.unwrap();
+
+        storage.vacuum().await.unwrap();
+
+        // Still writable and readable after the file was rebuilt.
+        storage
+            .write_batch_all(vec![query_entry(
+                bucket + 2,
+                "after-vacuum.test",
+                "192.168.1.10",
+                QueryStatus::Upstream,
+            )])
+            .await
+            .unwrap();
+        let rows = storage.query_range(&QueryFilter::default()).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].domain, "after-vacuum.test");
+    }
+
+    #[tokio::test]
     async fn delete_all_queries_clears_history_and_rollups() {
         let storage = SqliteStorage::open(&temp_db_path("ferrite-delete-all"))
             .await
             .unwrap();
         let bucket = align_bucket(chrono::Utc::now().timestamp());
         storage
-            .write_batch(&[
+            .write_batch_all(vec![
                 query_entry(
                     bucket + 1,
                     "one.test",
@@ -1523,7 +1721,7 @@ mod tests {
         let now_bucket = align_bucket(chrono::Utc::now().timestamp());
         let old_bucket = now_bucket - 10 * 86400;
         storage
-            .write_batch(&[
+            .write_batch_all(vec![
                 query_entry(
                     old_bucket + 1,
                     "old.test",
@@ -1581,7 +1779,7 @@ mod tests {
         // One device, three queries spanning two different IPs (it changed IP),
         // plus a second device that has no MAC (IP fallback token).
         storage
-            .write_batch(&[
+            .write_batch_all(vec![
                 query_entry_dev(
                     bucket + 1,
                     "a.test",

@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use ferrite_core::error::Result;
+use ferrite_core::recording::RecordScope;
 use ferrite_core::types::QueryEntry;
 use ferrite_core::types::TimeseriesBucket;
 
@@ -49,8 +50,22 @@ pub struct SummaryStats {
 #[async_trait]
 #[allow(dead_code)]
 pub trait Storage: Send + Sync {
-    /// Persist a batch of query entries.
-    async fn write_batch(&self, entries: &[QueryEntry]) -> Result<()>;
+    /// Persist a batch of query entries, restricted to the surfaces `scope`
+    /// still records: per-query rows, aggregate rollups, both or neither. An
+    /// empty scope writes nothing, so flipping the privacy switches off stops
+    /// the batch at the database boundary rather than somewhere upstream.
+    ///
+    /// Takes the batch by value: the database thread needs `'static` data, and
+    /// the caller hands over a batch it is about to drop anyway — borrowing
+    /// would only force a deep copy of every entry behind the scenes.
+    async fn write_batch(&self, entries: Vec<QueryEntry>, scope: RecordScope) -> Result<()>;
+
+    /// The highest query id already stored, or 0 on an empty table. The
+    /// in-memory id counter resumes from here at startup so a later insert
+    /// cannot collide with a row written before the restart. Deriving it from
+    /// the newest rows instead would be wrong: rows are ordered by timestamp,
+    /// and a clock step backwards (NTP) can leave the highest id further down.
+    async fn max_query_id(&self) -> Result<u64>;
 
     /// Return query log entries matching the given filter.
     async fn query_range(&self, filter: &QueryFilter) -> Result<Vec<QueryEntry>>;
@@ -83,6 +98,12 @@ pub trait Storage: Send + Sync {
 
     /// Delete all query log entries.
     async fn delete_all_queries(&self) -> Result<()>;
+
+    /// Rebuild the database file so space freed by deletes is returned to the
+    /// filesystem. Deleting rows alone leaves the pages in the file, which is
+    /// the wrong answer for someone who cleared the log to reclaim a flash card
+    /// — or to stop a browsing history from sitting in free pages on disk.
+    async fn vacuum(&self) -> Result<()>;
 
     /// Delete query log entries with timestamp older than `cutoff_ts` (Unix seconds).
     /// Returns the number of rows deleted.

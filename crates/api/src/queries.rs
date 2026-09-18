@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use axum::{
     Json,
     extract::{Query, State},
@@ -5,6 +8,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use tokio::time::timeout;
 
 use crate::ApiError;
 use ferrite_app::AppState;
@@ -30,6 +35,11 @@ pub struct ListQueriesParams {
     pub after_id: Option<u64>,
 }
 
+/// How long `DELETE /api/queries` waits for the vacuum before answering
+/// `"running"` and leaving it to finish in the background. Short enough to stay
+/// well inside any reverse proxy's read timeout.
+const VACUUM_REPORT_WINDOW: Duration = Duration::from_secs(5);
+
 /// `QueryEntry` enriched with a resolved client hostname.
 #[derive(Serialize)]
 struct QueryEntryResponse {
@@ -46,10 +56,22 @@ struct QueryEntryResponse {
 /// (all other filters are ignored; if the response hits `limit`, the client
 /// should fall back to a full refresh because older unseen entries may exist).
 /// With any filter, offset, or before_* cursor: falls through to storage for historical queries.
+///
+/// With `storage.log_queries` off the endpoint serves nothing at all, on every
+/// branch. Emptying only the ring would be worse than useless: the unfiltered
+/// branch backfills a short ring from SQLite, so switching the log off would
+/// have replaced the last few thousand queries on the page with the *whole*
+/// stored history. Rows written before the switch stay on disk until the
+/// operator clears them with `DELETE /api/queries` — ferrite just stops handing
+/// per-query history out while it is supposed to not be keeping any.
 pub async fn list_queries(
     State(state): State<AppState>,
     Query(params): Query<ListQueriesParams>,
 ) -> Result<Json<Value>, ApiError> {
+    if !state.inner.record_switches.scope().queries {
+        return Ok(Json(serde_json::json!([])));
+    }
+
     if let Some(after_id) = params.after_id {
         let limit = params.limit.unwrap_or(100).min(1000);
         let entries = state
@@ -139,7 +161,8 @@ fn enrich(state: &AppState, entries: Vec<QueryEntry>) -> Vec<QueryEntryResponse>
         .collect()
 }
 
-/// DELETE /api/queries — purge the entire query log (SQLite + in-memory).
+/// DELETE /api/queries — purge the entire query log (SQLite + in-memory) and
+/// start returning the freed pages to the filesystem.
 pub async fn delete_queries(
     State(state): State<AppState>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
@@ -153,9 +176,140 @@ pub async fn delete_queries(
     if let Err(e) = state.inner.client_registry.clear_learned_ips().await {
         tracing::warn!("query log cleared, but clearing learned IP state failed: {e}");
     }
-    tracing::info!("query log cleared");
+    // The per-egress routed-domain tables are the same history by another
+    // route: which hosts each tunnel has been carrying, live on the Tunnels
+    // page. Clearing the log and leaving those behind would be a half-clear.
+    state.inner.proxy.stats().forget_domains();
+    // Rebuild the file so the deleted rows stop occupying pages on disk. Spawned
+    // rather than awaited to the end: VACUUM holds the single SQLite connection
+    // for the whole rebuild, and on a big log on a slow card that outlives any
+    // reverse-proxy timeout — the caller would never see the answer anyway.
+    // Dropping the join handle does not cancel the task, so it finishes either
+    // way; we just stop waiting for it. Best-effort throughout: VACUUM needs
+    // free space roughly the size of the database, and failing to reclaim space
+    // must not fail a clear that already succeeded.
+    let storage = Arc::clone(&state.inner.storage);
+    let task = tokio::spawn(async move {
+        let started = Instant::now();
+        match storage.vacuum().await {
+            Ok(()) => {
+                tracing::info!("database vacuumed in {:?}", started.elapsed());
+                true
+            }
+            Err(e) => {
+                tracing::warn!("query log cleared, but vacuuming the database failed: {e}");
+                false
+            }
+        }
+    });
+
+    // Right after a full clear the file is nearly empty, so the rebuild normally
+    // finishes in well under this window and the caller learns whether the space
+    // actually came back — the one failure (a full disk) worth surfacing in the
+    // UI. Past the window it keeps running and the outcome is in the log.
+    let vacuum = match timeout(VACUUM_REPORT_WINDOW, task).await {
+        Ok(Ok(true)) => "done",
+        Ok(Ok(false)) => "failed",
+        Ok(Err(e)) => {
+            tracing::error!("vacuum task panicked: {e}");
+            "failed"
+        }
+        Err(_) => "running",
+    };
+
+    tracing::info!("query log cleared (vacuum: {vacuum})");
     Ok((
         StatusCode::OK,
-        Json(serde_json::json!({ "status": "cleared" })),
+        Json(serde_json::json!({ "status": "cleared", "vacuum": vacuum })),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrite_app::test_support;
+    use ferrite_core::recording::RecordScope;
+    use ferrite_core::types::{QueryEntry, QueryStatus};
+
+    fn entry(id: u64, domain: &str) -> QueryEntry {
+        QueryEntry {
+            id,
+            timestamp: chrono::Utc::now(),
+            domain: domain.to_string(),
+            query_type: 1,
+            client_ip: "192.0.2.10".to_string(),
+            device: "192.0.2.10".to_string(),
+            status: QueryStatus::Upstream,
+            latency_ms: 1,
+            upstream: None,
+            rcode: 0,
+        }
+    }
+
+    /// The regression this endpoint's gate exists for: with an empty ring the
+    /// unfiltered branch backfills from SQLite, so switching the query log off
+    /// used to turn the Queries page from "the last few thousand queries" into
+    /// "every query ever stored".
+    #[tokio::test]
+    async fn query_log_switched_off_serves_nothing_stored_or_filtered() {
+        let (state, db_path) = test_support::app_state("api-queries-privacy").await;
+        state
+            .inner
+            .storage
+            .write_batch(
+                vec![entry(1, "kept.example"), entry(2, "also-kept.example")],
+                RecordScope::ALL,
+            )
+            .await
+            .unwrap();
+
+        // Recording on: the rows are visible, backfilled from storage.
+        let Json(before) = list_queries(State(state.clone()), Query(ListQueriesParams::default()))
+            .await
+            .unwrap();
+        assert_eq!(before.as_array().unwrap().len(), 2);
+
+        state.inner.record_switches.set_queries(false);
+
+        // Default page…
+        let Json(after) = list_queries(State(state.clone()), Query(ListQueriesParams::default()))
+            .await
+            .unwrap();
+        assert_eq!(after.as_array().unwrap().len(), 0);
+
+        // …an explicit filter, which reads storage directly…
+        let Json(filtered) = list_queries(
+            State(state.clone()),
+            Query(ListQueriesParams {
+                domain: Some("kept.example".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(filtered.as_array().unwrap().len(), 0);
+
+        // …and the delta poll the live view uses.
+        let Json(delta) = list_queries(
+            State(state.clone()),
+            Query(ListQueriesParams {
+                after_id: Some(0),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(delta.as_array().unwrap().len(), 0);
+
+        // The rows are still on disk — switching back on shows them again,
+        // which is what `DELETE /api/queries` is for.
+        state.inner.record_switches.set_queries(true);
+        let Json(back) = list_queries(State(state.clone()), Query(ListQueriesParams::default()))
+            .await
+            .unwrap();
+        assert_eq!(back.as_array().unwrap().len(), 2);
+
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
+    }
 }

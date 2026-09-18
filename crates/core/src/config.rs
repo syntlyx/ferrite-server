@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use crate::error::{FeriteError, Result};
 use crate::net::normalize_client_key;
+use crate::recording::RecordScope;
 
 /// XDG-style config dir: always `~/.config/ferrite` on every platform.
 pub fn config_dir() -> PathBuf {
@@ -206,10 +207,31 @@ pub struct StorageConfig {
     /// 0 = disabled (default). Applied once at startup and then every 24 hours.
     #[serde(skip_serializing_if = "is_retention_disabled")]
     pub log_retention_days: u32,
+    /// Record one row per DNS query — the query log behind the Queries page.
+    /// `false` answers queries without keeping any per-query history: nothing
+    /// reaches the `queries` table and the recent-queries view stays empty.
+    /// Hot-patchable. Always serialized: a privacy switch should be visible in
+    /// the config file even when it sits at its default.
+    pub log_queries: bool,
+    /// Keep aggregate statistics — top domains and clients, the 24-hour graph,
+    /// per-device counters. `false` leaves only the process-lifetime counters in
+    /// RAM, so nothing domain- or device-specific reaches the database.
+    /// Hot-patchable, and serialized for the same reason as `log_queries`.
+    pub keep_stats: bool,
 }
 
 fn is_retention_disabled(d: &u32) -> bool {
     *d == 0
+}
+
+impl StorageConfig {
+    /// The recording surfaces these settings leave enabled.
+    pub fn record_scope(&self) -> RecordScope {
+        RecordScope {
+            queries: self.log_queries,
+            stats: self.keep_stats,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -569,6 +591,8 @@ impl Default for StorageConfig {
         Self {
             path: data_dir().join("ferrite.db"),
             log_retention_days: 0,
+            log_queries: true,
+            keep_stats: true,
         }
     }
 }

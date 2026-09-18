@@ -24,6 +24,7 @@ use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use ferrite_core::config::ProxyConfig;
+use ferrite_core::recording::RecordSwitches;
 
 /// Cap on each egress's routed-domain table. Full + new domain → the
 /// least-recently-seen entry is evicted, so the table tracks what the tunnel is
@@ -36,7 +37,6 @@ const DOMAIN_CAP: usize = 48;
 const PROBE_FAIL_THRESHOLD: u32 = 3;
 
 /// All proxy traffic counters, shared across snapshot reloads.
-#[derive(Default)]
 pub struct ProxyStats {
     egresses: DashMap<String, Arc<EgressStats>>,
     /// Connections routed per rule, keyed by (pattern, egress id). Counted at
@@ -47,6 +47,10 @@ pub struct ProxyStats {
     /// Latest active-probe result per egress id (RTT + reachability), written by
     /// the probe loop and read by the stats API, metrics, and the health gate.
     probes: DashMap<String, ProbeState>,
+    /// The live privacy switches, handed to every egress table created from
+    /// here. The per-egress byte and connection totals are anonymous and always
+    /// counted; the routed-domain table is not, and follows `keep_stats`.
+    switches: Arc<RecordSwitches>,
 }
 
 /// The last active-probe outcome for one egress.
@@ -62,9 +66,31 @@ struct ProbeState {
 }
 
 impl ProxyStats {
+    pub fn new(switches: Arc<RecordSwitches>) -> Self {
+        Self {
+            egresses: DashMap::new(),
+            rule_hits: DashMap::new(),
+            probes: DashMap::new(),
+            switches,
+        }
+    }
+
     /// The (created-on-first-use) counters for egress `id`.
     pub fn egress(&self, id: &str) -> Arc<EgressStats> {
-        self.egresses.entry(id.to_string()).or_default().clone()
+        self.egresses
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(EgressStats::new(Arc::clone(&self.switches))))
+            .clone()
+    }
+
+    /// Drop every egress's routed-domain table, keeping the anonymous byte and
+    /// connection totals. Called when statistics are switched off: the Tunnels
+    /// page should stop showing which hosts a tunnel has been carrying, and the
+    /// table already in memory is exactly that history.
+    pub fn forget_domains(&self) {
+        for eg in self.egresses.iter() {
+            eg.value().domains.lock().unwrap().clear();
+        }
     }
 
     pub fn record_rule_hit(&self, pattern: &str, egress_id: &str) {
@@ -157,7 +183,6 @@ impl ProxyStats {
 }
 
 /// Live counters for one egress.
-#[derive(Default)]
 pub struct EgressStats {
     /// Connections currently spliced through this egress.
     active: AtomicU64,
@@ -172,7 +197,11 @@ pub struct EgressStats {
     /// Client connections dropped by a fail-closed rule (unhealthy egress, or a
     /// connect failure with fallback disallowed).
     fail_closed_drops: AtomicU64,
+    /// Which hosts this egress has been carrying. Unlike everything above it
+    /// names what was visited, so it is a statistics surface and stops being
+    /// filled while `keep_stats` is off.
     domains: Mutex<HashMap<String, DomainStat>>,
+    switches: Arc<RecordSwitches>,
 }
 
 struct DomainStat {
@@ -184,6 +213,19 @@ struct DomainStat {
 }
 
 impl EgressStats {
+    fn new(switches: Arc<RecordSwitches>) -> Self {
+        Self {
+            active: AtomicU64::new(0),
+            total_conns: AtomicU64::new(0),
+            bytes_up: AtomicU64::new(0),
+            bytes_down: AtomicU64::new(0),
+            connect_fails: AtomicU64::new(0),
+            fail_closed_drops: AtomicU64::new(0),
+            domains: Mutex::new(HashMap::new()),
+            switches,
+        }
+    }
+
     /// Record a connection successfully opened through this egress to `host`.
     /// The returned guard keeps the `active` gauge up for the connection's
     /// lifetime; every exit path (clean close, error, idle reap) decrements
@@ -206,7 +248,7 @@ impl EgressStats {
     /// Attribute a finished connection's byte totals to `host`. Upserts, so a
     /// heavy domain evicted mid-connection comes back with its traffic.
     pub fn add_domain_bytes(&self, host: &str, up: u64, down: u64) {
-        if up == 0 && down == 0 {
+        if up == 0 && down == 0 || !self.switches.scope().stats {
             return;
         }
         let mut map = self.domains.lock().unwrap();
@@ -223,6 +265,9 @@ impl EgressStats {
     }
 
     fn touch_domain(&self, host: &str) {
+        if !self.switches.scope().stats {
+            return;
+        }
         let mut map = self.domains.lock().unwrap();
         Self::make_room(&mut map, host);
         let d = map.entry(host.to_string()).or_insert(DomainStat {
@@ -429,11 +474,12 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrite_core::recording::RecordScope;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
     #[tokio::test]
     async fn counted_tracks_both_directions() {
-        let stats = Arc::new(EgressStats::default());
+        let stats = Arc::new(EgressStats::new(RecordSwitches::new(RecordScope::ALL)));
         let (mut peer, inner) = duplex(1024);
         let mut conn = Counted::new(inner, Some(Arc::clone(&stats)));
 
@@ -448,8 +494,38 @@ mod tests {
     }
 
     #[test]
+    fn statistics_off_stops_and_drops_the_routed_domain_table() {
+        let switches = RecordSwitches::new(RecordScope::ALL);
+        let stats = ProxyStats::new(Arc::clone(&switches));
+        let egress = stats.egress("t");
+
+        let _guard = egress.begin_conn("private.example");
+        egress.add_domain_bytes("private.example", 100, 200);
+        assert_eq!(stats.egress_snapshot("t").domains.len(), 1);
+
+        // Statistics off: the per-egress totals are anonymous and keep counting,
+        // but which hosts the tunnel carries is history and stops being kept.
+        switches.set_stats(false);
+        stats.forget_domains();
+
+        let _guard2 = egress.begin_conn("another.example");
+        egress.add_domain_bytes("another.example", 7, 9);
+
+        // The host names are gone; the anonymous per-egress totals kept counting
+        // straight through the switch.
+        let snap = stats.egress_snapshot("t");
+        assert!(snap.domains.is_empty(), "no host names while stats are off");
+        assert_eq!(snap.total_conns, 2);
+
+        // Back on, and the table fills again — no restart.
+        switches.set_stats(true);
+        egress.add_domain_bytes("back.example", 1, 1);
+        assert_eq!(stats.egress_snapshot("t").domains.len(), 1);
+    }
+
+    #[test]
     fn probe_marks_unhealthy_only_after_sustained_failures() {
-        let stats = ProxyStats::default();
+        let stats = ProxyStats::new(RecordSwitches::new(RecordScope::ALL));
 
         // Never probed → not unhealthy, no snapshot (fail open).
         assert!(!stats.probe_unhealthy("wg"));
@@ -482,7 +558,7 @@ mod tests {
 
     #[test]
     fn active_guard_decrements_on_every_drop_path() {
-        let stats = Arc::new(EgressStats::default());
+        let stats = Arc::new(EgressStats::new(RecordSwitches::new(RecordScope::ALL)));
         let a = stats.begin_conn("a.test");
         let b = stats.begin_conn("b.test");
         assert_eq!(stats.active.load(Ordering::Relaxed), 2);
@@ -496,7 +572,7 @@ mod tests {
 
     #[test]
     fn domain_table_stays_bounded() {
-        let stats = Arc::new(EgressStats::default());
+        let stats = Arc::new(EgressStats::new(RecordSwitches::new(RecordScope::ALL)));
         for i in 0..(DOMAIN_CAP + 10) {
             drop(stats.begin_conn(&format!("host{i}.test")));
         }
@@ -512,7 +588,7 @@ mod tests {
     fn prune_drops_removed_egresses_and_rules() {
         use ferrite_core::config::{EgressConfig, RuleConfig};
 
-        let stats = ProxyStats::default();
+        let stats = ProxyStats::new(RecordSwitches::new(RecordScope::ALL));
         stats.egress("keep").record_connect_fail();
         stats.egress("gone").record_connect_fail();
         stats.record_rule_hit("a.test", "keep");

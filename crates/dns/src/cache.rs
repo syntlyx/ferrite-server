@@ -115,13 +115,22 @@ impl DnsCache {
     /// fail), nor a non-DO client the bulky signed one (oversized → truncation
     /// → TCP). The non-DO form keeps the original two-part key so snapshots
     /// written before this split still restore and match.
+    ///
+    /// Built in one allocation: called once per lookup and again per insert, so
+    /// the obvious `to_ascii_lowercase()` + `format!()` pair cost two per query
+    /// and copied the name twice. Lowercasing in place after the copy is the
+    /// same normalisation for one.
     pub fn cache_key(name: &str, qtype: u16, dnssec: bool) -> String {
-        let name = name.to_ascii_lowercase();
+        use std::fmt::Write;
+        // name + '/' + at most 5 digits + "/do"
+        let mut key = String::with_capacity(name.len() + 9);
+        key.push_str(name);
+        key.make_ascii_lowercase();
+        let _ = write!(key, "/{qtype}");
         if dnssec {
-            format!("{name}/{qtype}/do")
-        } else {
-            format!("{name}/{qtype}")
+            key.push_str("/do");
         }
+        key
     }
 
     /// Retrieve a cached entry. Returns `None` if not present or expired.

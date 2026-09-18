@@ -68,8 +68,16 @@ ferrite is a privacy tool first. What that means concretely:
   a validating resolver over DoT/DoH for end-to-end integrity.
 - **No TLS interception.** For routed domains ferrite peeks the SNI/Host but
   **never terminates TLS** — the client validates the real certificate end-to-end.
-- **Local, optional logging.** The query log is SQLite on your disk. Retention is
-  configurable, and verbose logging is a toggle.
+- **Local, optional logging — and switchable off.** The query log is SQLite on
+  your disk. Retention is configurable, verbose logging is a toggle, and the
+  query log and statistics each have their own on/off switch (Settings →
+  Privacy). Turn both off and ferrite keeps filtering while recording nothing
+  about what was resolved: no per-query rows, no top lists, no per-device
+  history, no host names on the Tunnels page, and no cached domains in the
+  restart snapshot — the one already written is rewritten the moment you flip
+  the switch. What was recorded earlier is not served back either, and a reboot
+  does not undo the choice. Clearing the log vacuums the database, so the freed
+  pages actually leave the disk.
 - **No auth by default is loopback-only.** The panel binds `127.0.0.1` until you
   expose it; if you bind it to the LAN without a password, ferrite warns you.
 

@@ -54,12 +54,7 @@ pub async fn update_server(State(state): State<AppState>) -> Result<Json<Value>,
 fn restart_after_response(state: AppState) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let path = state.inner.snapshot_path.clone();
-        if let Err(e) = ferrite_app::snapshot::save::save(
-            &state.inner.dns_cache,
-            &state.inner.live_stats,
-            &path,
-        ) {
+        if let Err(e) = state.save_snapshot().await {
             tracing::error!("snapshot save before server update restart failed: {}", e);
         }
         std::process::exit(0);

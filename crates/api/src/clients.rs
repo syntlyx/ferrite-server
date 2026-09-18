@@ -42,12 +42,23 @@ struct ClientGroup {
 ///
 /// Returns clients grouped by resolved hostname (PTR or alias).
 /// IPv4 and IPv6 addresses belonging to the same host are merged into one entry.
+///
+/// Empty while `storage.keep_stats` is off: this list *is* the per-device
+/// counters, read straight out of `device_buckets_10m`, so there is no version
+/// of it that holds no per-device history. Alias management lives on
+/// `/api/clients/aliases` and keeps working.
 pub async fn list_clients(
     State(state): State<AppState>,
     Query(params): Query<ListClientsParams>,
 ) -> Result<Json<Value>, ApiError> {
     let (now, from) = client_time_window(&params);
     let limit = params.limit.unwrap_or(50).min(500);
+
+    if !state.inner.record_switches.scope().stats {
+        return Ok(Json(
+            json!({ "clients": [], "from_ts": from, "to_ts": now }),
+        ));
+    }
 
     // Fetch more raw devices than the final limit because merging by resolved
     // name (e.g. a MAC device and its warm-up IP-tagged rows) may reduce count.
@@ -220,6 +231,15 @@ pub async fn client_ip_stats(
     State(state): State<AppState>,
     Path(device): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    // Same surface as the list: per-device history, gone while statistics are
+    // off. Reported as "not found" because that is exactly what it is — there
+    // is no record of this device to serve.
+    if !state.inner.record_switches.scope().stats {
+        return Err(ApiError(ferrite_core::error::FeriteError::NotFound(
+            format!("client '{}' not found", device),
+        )));
+    }
+
     let stats = state
         .inner
         .storage

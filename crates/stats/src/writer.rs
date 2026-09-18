@@ -8,6 +8,7 @@ use tokio::time::timeout;
 use crate::live::LiveStats;
 use ferrite_clients::ClientRegistry;
 use ferrite_core::net::parse_ip;
+use ferrite_core::recording::RecordSwitches;
 use ferrite_core::types::QueryEntry;
 use ferrite_storage::Storage;
 
@@ -19,6 +20,9 @@ pub struct WriterCtx {
     pub live_stats: Arc<LiveStats>,
     pub client_registry: Arc<ClientRegistry>,
     pub storage: Arc<dyn Storage>,
+    /// Live privacy switches. Read per entry and per flush, so turning the query
+    /// log or statistics off takes effect on the batch being built right now.
+    pub switches: Arc<RecordSwitches>,
     /// Signals the writer to flush its current batch immediately (shutdown).
     pub flush_notify: Arc<Notify>,
     /// Signalled by the writer once its final flush is complete.
@@ -38,7 +42,7 @@ pub async fn run(ctx: WriterCtx, mut rx: mpsc::Receiver<QueryEntry>) -> anyhow::
                 // Drain any remaining entries queued before the signal.
                 while let Ok(mut entry) = rx.try_recv() {
                     tag_device(&ctx, &mut entry);
-                    ctx.live_stats.push_entry(entry.clone());
+                    ctx.live_stats.push_entry(entry.clone(), &ctx.switches);
                     batch.push(entry);
                 }
                 tracing::info!("stats writer flush requested, writing {} entries", batch.len());
@@ -54,7 +58,7 @@ pub async fn run(ctx: WriterCtx, mut rx: mpsc::Receiver<QueryEntry>) -> anyhow::
                     match timeout(FLUSH_INTERVAL, rx.recv()).await {
                         Ok(Some(mut entry)) => {
                             tag_device(&ctx, &mut entry);
-                            ctx.live_stats.push_entry(entry.clone());
+                            ctx.live_stats.push_entry(entry.clone(), &ctx.switches);
                             batch.push(entry);
                             if batch.len() >= BATCH_SIZE {
                                 break true; // flush now
@@ -104,6 +108,18 @@ async fn flush_batch(ctx: &WriterCtx, batch: &mut Vec<QueryEntry>) {
 
     let to_write = std::mem::take(batch);
 
+    // Both surfaces switched off while this batch was accumulating (the DNS
+    // handler stops sending, but what is already in flight is still ours to
+    // drop). Nothing is written and nothing is resolved — the entries die here.
+    let scope = ctx.switches.scope();
+    if !scope.records_anything() {
+        tracing::debug!(
+            "recording disabled mid-batch, dropping {} query entries",
+            to_write.len()
+        );
+        return;
+    }
+
     // Trigger background PTR resolution for each unique client IP in this batch.
     // This is best-effort and never delays the write.
     let mut seen: HashSet<&str> = HashSet::new();
@@ -115,16 +131,15 @@ async fn flush_batch(ctx: &WriterCtx, batch: &mut Vec<QueryEntry>) {
         }
     }
 
-    match ctx.storage.write_batch(&to_write).await {
+    // Counted before the batch is handed over: the storage layer takes it by
+    // value so it can reach the database thread without a second copy.
+    let written = to_write.len();
+    match ctx.storage.write_batch(to_write, scope).await {
         Err(e) => {
-            tracing::error!(
-                "failed to write query batch ({} entries): {}",
-                to_write.len(),
-                e
-            );
+            tracing::error!("failed to write query batch ({} entries): {}", written, e);
         }
         _ => {
-            tracing::debug!("flushed {} query entries to storage", to_write.len());
+            tracing::debug!("flushed {} query entries to storage", written);
         }
     }
 }

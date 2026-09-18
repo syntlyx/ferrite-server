@@ -67,6 +67,7 @@ mod nullable {
 /// Hot-patchable (no restart): `api_key`, `password`, `dns_min_ttl`, `dns_max_ttl`,
 ///                             `dns_client_ttl`,
 ///                             `dns_log_ignore`, `web_dir`, `log_retention_days`,
+///                             `log_queries`, `keep_stats`,
 ///                             `blocklist_enabled`, `blocklist_client_bypass`,
 ///                             `debug_logging`.
 /// Restart-required:           `dns_bind_addr`, `dns_cache_size`, `dns_cache_max_mb`,
@@ -87,6 +88,13 @@ pub struct SettingsPatch {
     #[serde(default, deserialize_with = "nullable::deserialize")]
     pub web_dir: Option<Option<PathBuf>>,
     pub log_retention_days: Option<u32>,
+    /// Privacy switch: record one row per query (the query log). Turning it off
+    /// only stops new records — use `DELETE /api/queries` to drop what is
+    /// already stored.
+    pub log_queries: Option<bool>,
+    /// Privacy switch: keep aggregate statistics (top lists, 24-hour graph,
+    /// per-device counters). Same note about existing data.
+    pub keep_stats: Option<bool>,
     pub blocklist_enabled: Option<bool>,
     pub blocklist_client_bypass: Option<Vec<String>>,
     pub debug_logging: Option<bool>,
@@ -143,6 +151,8 @@ pub async fn update_settings(
     let mut blocklist_enabled_to_apply: Option<bool> = None;
     let mut blocklist_client_bypass_to_apply: Option<Vec<String>> = None;
     let mut debug_logging_to_apply: Option<bool> = None;
+    let mut log_queries_to_apply: Option<bool> = None;
+    let mut keep_stats_to_apply: Option<bool> = None;
 
     {
         let mut cfg = state.live_config.write();
@@ -239,6 +249,18 @@ pub async fn update_settings(
         if let Some(days) = patch.log_retention_days {
             cfg.storage.log_retention_days = days;
             hot_changed.push("log_retention_days");
+        }
+
+        if let Some(on) = patch.log_queries {
+            cfg.storage.log_queries = on;
+            log_queries_to_apply = Some(on);
+            hot_changed.push("log_queries");
+        }
+
+        if let Some(on) = patch.keep_stats {
+            cfg.storage.keep_stats = on;
+            keep_stats_to_apply = Some(on);
+            hot_changed.push("keep_stats");
         }
 
         if let Some(enabled) = patch.blocklist_enabled {
@@ -380,6 +402,44 @@ pub async fn update_settings(
             .store(ttl, std::sync::atomic::Ordering::Relaxed);
     }
 
+    // Applied before the config is persisted: the switches decide what the very
+    // next query records, and a crash between the two should leave ferrite
+    // recording less than the operator asked for, never more.
+    if let Some(on) = log_queries_to_apply {
+        state.inner.record_switches.set_queries(on);
+        // Query log off: drop the recent-queries buffer the live view reads
+        // from, so the UI stops showing history that is no longer being kept.
+        if !on {
+            state.inner.live_stats.forget_recent();
+        }
+    }
+
+    if let Some(on) = keep_stats_to_apply {
+        state.inner.record_switches.set_stats(on);
+        // Statistics off: drop what the in-memory top-N counters and the
+        // 24-hour timeseries already hold, for the same reason — and the
+        // proxy's per-egress routed-domain tables, which are the same kind of
+        // history for anything that went through a tunnel.
+        if !on {
+            state.inner.live_stats.forget_history();
+            state.inner.proxy.stats().forget_domains();
+        }
+    }
+
+    // Nothing is recorded any more, but the snapshot written before the switch
+    // still holds the DNS cache — a list of recently resolved domains that
+    // would survive a power cut and be restored into the cache on the next
+    // start. Rewrite it now (counters only) rather than waiting up to five
+    // minutes for the periodic saver, which a hard reset may never reach.
+    if (log_queries_to_apply.is_some() || keep_stats_to_apply.is_some())
+        && !state.inner.record_switches.scope().records_anything()
+    {
+        match state.save_snapshot().await {
+            Ok(()) => tracing::info!("recording disabled, snapshot rewritten without the cache"),
+            Err(e) => tracing::warn!("recording disabled, but rewriting the snapshot failed: {e}"),
+        }
+    }
+
     if let Some(enabled) = blocklist_enabled_to_apply {
         state.inner.blocklist.set_blocking_enabled(enabled);
     }
@@ -417,12 +477,7 @@ pub async fn update_settings(
         let snap_state = state.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            let path = snap_state.inner.snapshot_path.clone();
-            if let Err(e) = ferrite_app::snapshot::save::save(
-                &snap_state.inner.dns_cache,
-                &snap_state.inner.live_stats,
-                &path,
-            ) {
+            if let Err(e) = snap_state.save_snapshot().await {
                 tracing::error!("snapshot save before restart failed: {}", e);
             }
             std::process::exit(0);
@@ -596,6 +651,140 @@ mod tests {
         drop(state);
         test_support::cleanup_sqlite(&db_path);
         let _ = std::fs::remove_file(config_path);
+    }
+
+    #[tokio::test]
+    async fn privacy_switches_stop_recording_and_drop_what_is_in_memory() {
+        let (state, db_path, config_path) =
+            test_support::app_state_with_config_path("settings-privacy").await;
+
+        // Something already recorded, as if the box had been running.
+        let entry = ferrite_core::types::QueryEntry {
+            id: 1,
+            timestamp: chrono::Utc::now(),
+            domain: "private.example".to_string(),
+            query_type: 1,
+            client_ip: "192.0.2.10".to_string(),
+            device: "192.0.2.10".to_string(),
+            status: ferrite_core::types::QueryStatus::Blocked,
+            latency_ms: 1,
+            upstream: None,
+            rcode: 0,
+        };
+        state.inner.live_stats.record_query(&entry);
+        state
+            .inner
+            .live_stats
+            .push_entry(entry, &state.inner.record_switches);
+        assert_eq!(state.inner.live_stats.top_domains.top(10).len(), 1);
+        assert_eq!(state.inner.live_stats.recent_queries.recent(10).len(), 1);
+
+        let Json(value) = update_settings(
+            State(state.clone()),
+            Json(SettingsPatch {
+                log_queries: Some(false),
+                keep_stats: Some(false),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["restart_required"], false);
+
+        // Switches are live…
+        assert!(!state.inner.record_switches.scope().records_anything());
+        // …the history already in RAM is gone…
+        assert!(state.inner.live_stats.top_domains.top(10).is_empty());
+        assert!(state.inner.live_stats.recent_queries.recent(10).is_empty());
+        // …but the anonymous lifetime counters stay, so the dashboard still has
+        // something honest to show.
+        assert_eq!(state.inner.live_stats.total(), 1);
+        assert_eq!(state.inner.live_stats.blocked(), 1);
+
+        let cfg = state.live_config.read().clone();
+        assert!(!cfg.storage.log_queries);
+        assert!(!cfg.storage.keep_stats);
+
+        let saved: Config = toml::from_str(&std::fs::read_to_string(&config_path).unwrap())
+            .expect("persisted config should parse");
+        assert!(!saved.storage.log_queries);
+        assert!(!saved.storage.keep_stats);
+
+        // And back on again without a restart.
+        let _ = update_settings(
+            State(state.clone()),
+            Json(SettingsPatch {
+                log_queries: Some(true),
+                keep_stats: Some(true),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state.inner.record_switches.scope(),
+            ferrite_core::recording::RecordScope::ALL
+        );
+
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
+        let _ = std::fs::remove_file(config_path);
+    }
+
+    #[tokio::test]
+    async fn switching_recording_off_scrubs_the_snapshot_already_on_disk() {
+        let (state, db_path, config_path) =
+            test_support::app_state_with_config_path("settings-privacy-snapshot").await;
+        let snapshot_path = state.snapshot_path.as_ref().clone();
+
+        // A snapshot written while recording was still on: it carries the DNS
+        // cache, which is a list of recently resolved names.
+        state.inner.dns_cache.insert(
+            "private.example",
+            1,
+            false,
+            ferrite_dns::types::DnsResponse {
+                bytes: bytes::Bytes::from_static(b"\x00\x01wire"),
+                ttl: 300,
+            },
+        );
+        ferrite_app::snapshot::save::save(
+            &state.inner.dns_cache,
+            &state.inner.live_stats,
+            &snapshot_path,
+            ferrite_core::recording::RecordScope::ALL,
+        )
+        .unwrap();
+        let before = ferrite_app::snapshot::restore::load_snapshot(&snapshot_path)
+            .unwrap()
+            .expect("snapshot written");
+        assert_eq!(before.dns_cache.len(), 1);
+
+        let _ = update_settings(
+            State(state.clone()),
+            Json(SettingsPatch {
+                log_queries: Some(false),
+                keep_stats: Some(false),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Rewritten before the request returned, not five minutes later: a
+        // power cut in that window would otherwise leave the domains on disk
+        // and restore them into the cache on the next start.
+        let after = ferrite_app::snapshot::restore::load_snapshot(&snapshot_path)
+            .unwrap()
+            .expect("snapshot still present");
+        assert!(after.dns_cache.is_empty());
+
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_file(snapshot_path);
     }
 
     #[tokio::test]

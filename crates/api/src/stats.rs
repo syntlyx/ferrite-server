@@ -152,21 +152,33 @@ pub async fn get_timeseries(State(state): State<AppState>) -> Result<Json<Value>
 }
 
 /// GET /api/stats/top-domains
+///
+/// Empty while `storage.keep_stats` is off, like every other aggregate read.
+/// The rollups written before the switch are still on disk, but serving them
+/// would mean an operator who asked for no statistics gets the full stored
+/// domain history back from `?all_time=true`. `DELETE /api/queries` removes
+/// them for good.
 pub async fn get_top_domains(
     State(state): State<AppState>,
     Query(params): Query<TopStatsParams>,
 ) -> Result<Json<Value>, ApiError> {
     let (now, from, limit) = time_window(&params);
+    if !state.inner.record_switches.scope().stats {
+        return Ok(Json(domains_json(Vec::new(), from, now)));
+    }
     let rows = state.inner.storage.top_domains(from, now, limit).await?;
     Ok(Json(domains_json(rows, from, now)))
 }
 
-/// GET /api/stats/top-blocked
+/// GET /api/stats/top-blocked — empty while `storage.keep_stats` is off.
 pub async fn get_top_blocked(
     State(state): State<AppState>,
     Query(params): Query<TopStatsParams>,
 ) -> Result<Json<Value>, ApiError> {
     let (now, from, limit) = time_window(&params);
+    if !state.inner.record_switches.scope().stats {
+        return Ok(Json(domains_json(Vec::new(), from, now)));
+    }
     let rows = state
         .inner
         .storage
@@ -175,12 +187,17 @@ pub async fn get_top_blocked(
     Ok(Json(domains_json(rows, from, now)))
 }
 
-/// GET /api/stats/top-clients
+/// GET /api/stats/top-clients — empty while `storage.keep_stats` is off.
 pub async fn get_top_clients(
     State(state): State<AppState>,
     Query(params): Query<TopStatsParams>,
 ) -> Result<Json<Value>, ApiError> {
     let (now, from, limit) = time_window(&params);
+    if !state.inner.record_switches.scope().stats {
+        return Ok(Json(
+            serde_json::json!({ "clients": [], "from_ts": from, "to_ts": now }),
+        ));
+    }
 
     let clients = state
         .inner
@@ -261,6 +278,87 @@ fn push_unique(values: &mut Vec<String>, value: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrite_app::test_support;
+    use ferrite_core::recording::RecordScope;
+
+    /// The rollups outlive the switch, so every aggregate read has to be gated
+    /// too — otherwise `?all_time=true` hands back the whole stored domain
+    /// history the moment statistics are turned off.
+    #[tokio::test]
+    async fn statistics_off_empties_every_aggregate_read() {
+        let (state, db_path) = test_support::app_state("api-stats-privacy").await;
+        let ts = chrono::Utc::now().timestamp();
+        state
+            .inner
+            .storage
+            .write_batch(
+                vec![QueryEntry {
+                    id: 1,
+                    timestamp: chrono::DateTime::from_timestamp(ts, 0).unwrap(),
+                    domain: "private.example".to_string(),
+                    query_type: 1,
+                    client_ip: "192.0.2.10".to_string(),
+                    device: "aa:bb:cc:dd:ee:ff".to_string(),
+                    status: QueryStatus::Blocked,
+                    latency_ms: 1,
+                    upstream: None,
+                    rcode: 0,
+                }],
+                RecordScope::ALL,
+            )
+            .await
+            .unwrap();
+
+        let all_time = || {
+            Query(TopStatsParams {
+                all_time: Some(true),
+                ..Default::default()
+            })
+        };
+
+        // Recording on: the rollups are visible.
+        let Json(before) = get_top_domains(State(state.clone()), all_time())
+            .await
+            .unwrap();
+        assert_eq!(before["domains"].as_array().unwrap().len(), 1);
+
+        state.inner.record_switches.set_stats(false);
+
+        for (name, value) in [
+            (
+                "top-domains",
+                get_top_domains(State(state.clone()), all_time())
+                    .await
+                    .unwrap()
+                    .0["domains"]
+                    .clone(),
+            ),
+            (
+                "top-blocked",
+                get_top_blocked(State(state.clone()), all_time())
+                    .await
+                    .unwrap()
+                    .0["domains"]
+                    .clone(),
+            ),
+            (
+                "top-clients",
+                get_top_clients(State(state.clone()), all_time())
+                    .await
+                    .unwrap()
+                    .0["clients"]
+                    .clone(),
+            ),
+        ] {
+            assert!(
+                value.as_array().unwrap().is_empty(),
+                "{name} still served stored history with statistics off"
+            );
+        }
+
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
+    }
 
     #[test]
     fn time_window_supports_explicit_all_time() {

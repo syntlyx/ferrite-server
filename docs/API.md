@@ -378,10 +378,20 @@ GET /api/queries?limit=100&offset=100          → SQLite (offset present)
 
 ### `DELETE /api/queries` — purge the query log
 
-Deletes all entries from SQLite **and** resets all in-memory stats: ring buffer, top-N counters, timeseries, and atomic counters (`total_queries`, `blocked_queries`, etc.). The next `/api/stats/summary` response will show zeroes until new traffic arrives.
+Deletes all entries from SQLite **and** resets all in-memory stats: ring buffer, top-N counters, timeseries, atomic counters (`total_queries`, `blocked_queries`, etc.) and the per-egress routed-domain tables behind the Tunnels page. The next `/api/stats/summary` response will show zeroes until new traffic arrives.
+
+Reclaiming the space is a separate step: the database is checkpointed and `VACUUM`ed, which holds the single SQLite connection for the whole rebuild. Right after a full clear that is normally quick, so the response waits up to 5 s for it and reports the result; past that it keeps running in the background and the outcome goes to the log. It is best-effort (it needs temporary free space roughly the size of the database) and never fails the clear.
+
+`vacuum` is one of:
+
+| Value | Meaning |
+| --- | --- |
+| `done` | The file was rebuilt; the space is back. |
+| `failed` | The rows are gone but the file is the same size — usually too little free disk space. |
+| `running` | Still rebuilding; check the log for the outcome. |
 
 ```json
-{ "status": "cleared" }
+{ "status": "cleared", "vacuum": "done" }
 ```
 
 ---
@@ -391,6 +401,8 @@ Deletes all entries from SQLite **and** resets all in-memory stats: ring buffer,
 ### `GET /api/clients` — client list grouped by hostname
 
 IPv4 and IPv6 addresses resolving to the same PTR hostname are merged into one entry. By default this returns all retained client history. Pass `hours` for a rolling window.
+
+Returns an empty list while `storage.keep_stats` is off: this list is assembled from the per-device rollups, so there is no version of it that holds no per-device history. Alias management (`/api/clients/aliases`) is unaffected.
 
 | Param      | Type | Description                                                |
 | ---------- | ---- | ---------------------------------------------------------- |
@@ -426,6 +438,8 @@ IPv4 and IPv6 addresses resolving to the same PTR hostname are merged into one e
 > PTR lookups run in the background on first sight. A new IP shows `name == ip` immediately and gets a resolved name within seconds.
 
 ### `GET /api/clients/:ip/stats` — per-client stats
+
+Returns `404` while `storage.keep_stats` is off — the same surface as the list above, and with statistics off there is no record of the device to serve.
 
 ```
 GET /api/clients/192.168.1.42/stats
@@ -810,7 +824,9 @@ Returns the full parsed config. Non-empty `api_key` and `password_hash` values a
   "zones": [{ "name": "1.168.192.in-addr.arpa", "upstream": "192.168.1.1:53" }],
   "storage": {
     "path": "/path/to/ferrite.db",
-    "log_retention_days": 30
+    "log_retention_days": 30,
+    "log_queries": true,
+    "keep_stats": true
   },
   "api": {
     "bind_addr": "127.0.0.1:8080",
@@ -855,6 +871,8 @@ All fields are optional. Fields not provided are left unchanged.
 | `dns_log_ignore`     | `string[]`       | Domain patterns to suppress from the query log entirely. Replaces the full list. Supports exact names (`fe.te`) and wildcard suffixes (`*.local`). Queries matching these patterns are still resolved normally. |
 | `web_dir`            | `string \| null` | Override static web UI directory; `null` resets to `~/.local/share/ferrite/web`                                                                                                                                 |
 | `log_retention_days` | int              | Automatically delete query log entries older than N days; `0` disables retention. Applied once ~30 s after startup and every 24 h thereafter.                                                                   |
+| `log_queries`        | bool             | Privacy switch for the per-query log. `false` stops writing rows to `queries`, empties the live ring buffer, and makes `GET /api/queries` return `[]` on every branch — default page, filtered query and delta poll alike. Filtering, routing and the lifetime counters are unaffected. Existing rows stay on disk and become readable again if you switch it back on; clear them for good with `DELETE /api/queries`. |
+| `keep_stats`         | bool             | Privacy switch for the aggregates. `false` stops the 10-minute rollups, the top-N counters, the 24-hour timeseries and the per-egress routed-domain tables, drops what they already hold in memory, and stops every aggregate *read* as well: `/api/stats/top-domains`, `/api/stats/top-blocked`, `/api/stats/top-clients` and `/api/clients` return empty, and `/api/clients/{device}/stats` returns 404, however far back the window reaches. Per-egress byte and connection totals keep counting — they name no host. `/api/stats/summary` keeps serving the process-lifetime counters (`total_queries`, `blocked_queries`, …), which hold no domain or device identity. |
 | `blocklist_enabled`  | bool             | Master switch for DNS blocklist filtering. DNS resolution, custom records, caching, and logging continue to work while filtering is disabled.                                                                    |
 | `blocklist_client_bypass` | `string[]` | Full replacement list of client IP/MAC keys that bypass blocklist filtering. IPs are normalized; MACs use `aa:bb:cc:dd:ee:ff`. No groups yet.                                                                   |
 
@@ -1113,6 +1131,10 @@ All errors follow the same shape:
 **Multi-IP client filter:** `GET /api/stats/top-clients` and `GET /api/stats/summary` return `ips[]` per client entry. Pass the whole array as a comma-separated `client_ip` value to `GET /api/queries` to see all traffic for that client regardless of which IP was used.
 
 **Client name latency:** PTR lookups are asynchronous. On first load some clients appear with an IP as their name. Re-polling `GET /api/clients` after a few seconds returns resolved names. The no-flicker guarantee means once a name is known, it stays visible even while being refreshed in the background.
+
+**Recording switches:** `storage.log_queries` and `storage.keep_stats` (PATCH `/api/settings`, no restart) decide whether a completed query is recorded at all. With both off the DNS handler counts the query in the in-memory totals and drops it: nothing reaches the stats writer, the database or the warm-restart snapshot, which stops storing cached domains as well (a restart then begins with a cold cache). Switching them off also rewrites the existing `state.bin` immediately, so a snapshot saved while recording was on does not survive on disk waiting for a power cut to restore it.
+
+Each switch gates reads as well as writes, and the gate survives a restart: startup normally re-seeds the in-memory top lists, timeseries and recent-queries ring out of SQLite, and a switched-off surface is simply not seeded. Rows and rollups written before the switch stay on disk — they become readable again if you switch the surface back on, and `DELETE /api/queries` removes them for good. The process-lifetime counters are always restored: they carry no domain or device identity and are what the dashboard falls back to.
 
 **Log ignore:** Domains matching `dns.log_ignore` patterns are resolved normally but never appear in `/api/queries` or any top-N list. Defaults: `fe.te`, `*.arpa`, `*.local`, `*.localdomain`. Update via `PATCH /api/settings` → `dns_log_ignore`.
 
