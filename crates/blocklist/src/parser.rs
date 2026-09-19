@@ -4,9 +4,18 @@
 ///   `0.0.0.0 ads.example.com`
 ///   `127.0.0.1 tracker.evil.com # comment`
 pub fn parse_hosts(content: &str) -> Vec<String> {
-    let mut domains = Vec::new();
+    feed_all(HostsParser::default(), content).finish()
+}
 
-    for line in content.lines() {
+/// [`parse_hosts`], fed one line at a time — so a list can be parsed as it
+/// arrives rather than held in memory whole.
+#[derive(Default)]
+pub struct HostsParser {
+    domains: Vec<String>,
+}
+
+impl HostsParser {
+    pub fn feed(&mut self, line: &str) {
         // Strip inline comments.
         let line = match line.find('#') {
             Some(idx) => &line[..idx],
@@ -14,19 +23,19 @@ pub fn parse_hosts(content: &str) -> Vec<String> {
         };
         let line = line.trim();
         if line.is_empty() {
-            continue;
+            return;
         }
 
         let mut parts = line.split_whitespace();
         // First token is the IP address — skip it.
         let ip = match parts.next() {
             Some(ip) => ip,
-            None => continue,
+            None => return,
         };
 
         // Skip lines that are not 0.0.0.0 or 127.0.0.1 (e.g., legitimate host entries).
         if ip != "0.0.0.0" && ip != "127.0.0.1" && ip != "::1" {
-            continue;
+            return;
         }
 
         for domain in parts {
@@ -40,12 +49,34 @@ pub fn parse_hosts(content: &str) -> Vec<String> {
             }
             // Basic domain validation.
             if is_valid_domain(&domain) {
-                domains.push(domain);
+                self.domains.push(domain);
             }
         }
     }
 
-    domains
+    pub fn finish(self) -> Vec<String> {
+        self.domains
+    }
+}
+
+/// Run a whole body through a line parser — the shape every `parse_*` function
+/// below keeps for its callers and tests.
+fn feed_all<P: LineFed>(mut parser: P, content: &str) -> P {
+    for line in content.lines() {
+        parser.feed(line);
+    }
+    parser
+}
+
+/// A parser that consumes a list one line at a time.
+pub trait LineFed {
+    fn feed(&mut self, line: &str);
+}
+
+impl LineFed for HostsParser {
+    fn feed(&mut self, line: &str) {
+        HostsParser::feed(self, line)
+    }
 }
 
 /// Returns `true` if `line` uses Adblock/uBO filter syntax rather than being a
@@ -83,11 +114,20 @@ pub fn is_adblock_syntax(line: &str) -> bool {
 ///   `ads.example.com`
 ///   `tracker.evil.com  # optional comment`
 pub fn parse_plain(content: &str) -> Vec<String> {
-    let mut domains = Vec::new();
-    for line in content.lines() {
+    feed_all(PlainParser::default(), content).finish()
+}
+
+/// [`parse_plain`], fed one line at a time.
+#[derive(Default)]
+pub struct PlainParser {
+    domains: Vec<String>,
+}
+
+impl PlainParser {
+    pub fn feed(&mut self, line: &str) {
         let line = line.trim();
         if line.is_empty() {
-            continue;
+            return;
         }
 
         // Defend against Adblock syntax reaching the plain parser via a
@@ -95,7 +135,7 @@ pub fn parse_plain(content: &str) -> Vec<String> {
         // a cosmetic rule like `google.com##.cls` would otherwise be truncated
         // at the first `#` and wrongly yield `google.com` as a blocked domain.
         if is_adblock_syntax(line) {
-            continue;
+            return;
         }
 
         // Strip inline `#` comments (only reached for non-Adblock lines).
@@ -105,14 +145,23 @@ pub fn parse_plain(content: &str) -> Vec<String> {
         }
         .trim();
         if line.is_empty() {
-            continue;
+            return;
         }
         let domain = line.to_ascii_lowercase();
         if is_valid_domain(&domain) {
-            domains.push(domain);
+            self.domains.push(domain);
         }
     }
-    domains
+
+    pub fn finish(self) -> Vec<String> {
+        self.domains
+    }
+}
+
+impl LineFed for PlainParser {
+    fn feed(&mut self, line: &str) {
+        PlainParser::feed(self, line)
+    }
 }
 
 /// Breakdown of how an Adblock-style list was interpreted. Surfaced through the
@@ -153,18 +202,28 @@ pub struct AdblockStats {
 /// deliberately do NOT let one list's exception cancel another list's block, as
 /// that cross-list interaction is opaque and surprising.
 pub fn parse_adblock(content: &str) -> (Vec<String>, AdblockStats) {
-    let mut domains = Vec::new();
-    let mut exceptions = std::collections::HashSet::new();
+    feed_all(AdblockParser::default(), content).finish()
+}
+
+/// [`parse_adblock`], fed one line at a time. The exception subtraction is the
+/// one thing that has to wait for the end of the list, so it lives in
+/// [`Self::finish`].
+#[derive(Default)]
+pub struct AdblockParser {
+    domains: Vec<String>,
+    exceptions: std::collections::HashSet<String>,
     // Diagnostics: count what we deliberately do NOT turn into block entries so
     // the volume of a filter list (e.g. EasyList) is explainable from the logs.
-    let mut scoped_skipped = 0usize; // `$domain=`-scoped block rules
-    let mut cosmetic_skipped = 0usize; // element-hiding / scriptlet rules
-    let mut unsupported_skipped = 0usize; // regex, paths, wildcards, etc.
+    scoped_skipped: usize,      // `$domain=`-scoped block rules
+    cosmetic_skipped: usize,    // element-hiding / scriptlet rules
+    unsupported_skipped: usize, // regex, paths, wildcards, etc.
+}
 
-    for line in content.lines() {
+impl AdblockParser {
+    pub fn feed(&mut self, line: &str) {
         let line = line.trim();
         if line.is_empty() || line.starts_with('!') || line.starts_with('#') {
-            continue;
+            return;
         }
 
         // Exception rules (`@@||domain^…`) — checked before the `||` arm since
@@ -172,9 +231,9 @@ pub fn parse_adblock(content: &str) -> (Vec<String>, AdblockStats) {
         // is exempted, which errs toward NOT blocking (avoids false positives).
         if let Some(rest) = line.strip_prefix("@@||") {
             if let Some(domain) = adblock_rule_domain(rest) {
-                exceptions.insert(domain);
+                self.exceptions.insert(domain);
             }
-            continue;
+            return;
         }
 
         // Network block rules — the only `||domain^` form we can act on.
@@ -191,15 +250,15 @@ pub fn parse_adblock(content: &str) -> (Vec<String>, AdblockStats) {
             if let Some(opts) = options
                 && opts.split(',').any(|o| o.trim().starts_with("domain="))
             {
-                scoped_skipped += 1;
-                continue;
+                self.scoped_skipped += 1;
+                return;
             }
 
             match adblock_rule_domain(pattern) {
-                Some(domain) => domains.push(domain),
-                None => unsupported_skipped += 1, // wildcard/path/invalid host
+                Some(domain) => self.domains.push(domain),
+                None => self.unsupported_skipped += 1, // wildcard/path/invalid host
             }
-            continue;
+            return;
         }
 
         // Anything else that is recognisably a filter rule but unusable as a
@@ -207,41 +266,49 @@ pub fn parse_adblock(content: &str) -> (Vec<String>, AdblockStats) {
         // rules. Counted for visibility, not blocked.
         if is_adblock_syntax(line) {
             if line.contains("##") || line.contains("#?#") || line.contains("#@#") {
-                cosmetic_skipped += 1;
+                self.cosmetic_skipped += 1;
             } else {
-                unsupported_skipped += 1;
+                self.unsupported_skipped += 1;
             }
         }
     }
 
-    let exception_count = exceptions.len();
-    let removed = if exceptions.is_empty() {
-        0
-    } else {
-        let before = domains.len();
-        domains.retain(|d| !exceptions.contains(d));
-        before - domains.len()
-    };
+    pub fn finish(mut self) -> (Vec<String>, AdblockStats) {
+        let exception_count = self.exceptions.len();
+        let removed = if self.exceptions.is_empty() {
+            0
+        } else {
+            let before = self.domains.len();
+            self.domains.retain(|d| !self.exceptions.contains(d));
+            before - self.domains.len()
+        };
 
-    let stats = AdblockStats {
-        kept: domains.len(),
-        exceptions: exception_count,
-        unblocked_by_exception: removed,
-        scoped_skipped,
-        cosmetic_skipped,
-        unsupported_skipped,
-    };
+        let stats = AdblockStats {
+            kept: self.domains.len(),
+            exceptions: exception_count,
+            unblocked_by_exception: removed,
+            scoped_skipped: self.scoped_skipped,
+            cosmetic_skipped: self.cosmetic_skipped,
+            unsupported_skipped: self.unsupported_skipped,
+        };
 
-    tracing::debug!(
-        kept = stats.kept,
-        exceptions = stats.exceptions,
-        unblocked_by_exception = stats.unblocked_by_exception,
-        scoped_skipped = stats.scoped_skipped,
-        cosmetic_skipped = stats.cosmetic_skipped,
-        unsupported_skipped = stats.unsupported_skipped,
-        "parsed adblock list"
-    );
-    (domains, stats)
+        tracing::debug!(
+            kept = stats.kept,
+            exceptions = stats.exceptions,
+            unblocked_by_exception = stats.unblocked_by_exception,
+            scoped_skipped = stats.scoped_skipped,
+            cosmetic_skipped = stats.cosmetic_skipped,
+            unsupported_skipped = stats.unsupported_skipped,
+            "parsed adblock list"
+        );
+        (self.domains, stats)
+    }
+}
+
+impl LineFed for AdblockParser {
+    fn feed(&mut self, line: &str) {
+        AdblockParser::feed(self, line)
+    }
 }
 
 /// Parse an Adblock-style filter list with allowlist polarity: the `@@||domain^`
@@ -260,20 +327,28 @@ pub fn parse_adblock(content: &str) -> (Vec<String>, AdblockStats) {
 /// Stats reuse [`AdblockStats`] with allow semantics: `kept` = allow entries
 /// emitted, `exceptions` = `@@` rules seen, `unblocked_by_exception` = 0.
 pub fn parse_adblock_exceptions(content: &str) -> (Vec<String>, AdblockStats) {
-    let mut domains = Vec::new();
-    let mut exception_rules = 0usize;
-    let mut scoped_skipped = 0usize;
-    let mut cosmetic_skipped = 0usize;
-    let mut unsupported_skipped = 0usize;
+    feed_all(AdblockExceptionsParser::default(), content).finish()
+}
 
-    for line in content.lines() {
+/// [`parse_adblock_exceptions`], fed one line at a time.
+#[derive(Default)]
+pub struct AdblockExceptionsParser {
+    domains: Vec<String>,
+    exception_rules: usize,
+    scoped_skipped: usize,
+    cosmetic_skipped: usize,
+    unsupported_skipped: usize,
+}
+
+impl AdblockExceptionsParser {
+    pub fn feed(&mut self, line: &str) {
         let line = line.trim();
         if line.is_empty() || line.starts_with('!') || line.starts_with('#') {
-            continue;
+            return;
         }
 
         if let Some(rest) = line.strip_prefix("@@||") {
-            exception_rules += 1;
+            self.exception_rules += 1;
             let (pattern, options) = match rest.split_once('$') {
                 Some((p, o)) => (p, Some(o)),
                 None => (rest, None),
@@ -281,45 +356,53 @@ pub fn parse_adblock_exceptions(content: &str) -> (Vec<String>, AdblockStats) {
             if let Some(opts) = options
                 && opts.split(',').any(|o| o.trim().starts_with("domain="))
             {
-                scoped_skipped += 1;
-                continue;
+                self.scoped_skipped += 1;
+                return;
             }
             match adblock_rule_domain(pattern) {
-                Some(domain) => domains.push(domain),
-                None => unsupported_skipped += 1, // wildcard/path/invalid host
+                Some(domain) => self.domains.push(domain),
+                None => self.unsupported_skipped += 1, // wildcard/path/invalid host
             }
-            continue;
+            return;
         }
 
         // Everything else can't produce an allow entry; keep the same
         // diagnostic buckets as the block parse so the UI stays explainable.
         if is_adblock_syntax(line) {
             if line.contains("##") || line.contains("#?#") || line.contains("#@#") {
-                cosmetic_skipped += 1;
+                self.cosmetic_skipped += 1;
             } else {
-                unsupported_skipped += 1;
+                self.unsupported_skipped += 1;
             }
         }
     }
 
-    let stats = AdblockStats {
-        kept: domains.len(),
-        exceptions: exception_rules,
-        unblocked_by_exception: 0,
-        scoped_skipped,
-        cosmetic_skipped,
-        unsupported_skipped,
-    };
+    pub fn finish(self) -> (Vec<String>, AdblockStats) {
+        let stats = AdblockStats {
+            kept: self.domains.len(),
+            exceptions: self.exception_rules,
+            unblocked_by_exception: 0,
+            scoped_skipped: self.scoped_skipped,
+            cosmetic_skipped: self.cosmetic_skipped,
+            unsupported_skipped: self.unsupported_skipped,
+        };
 
-    tracing::debug!(
-        kept = stats.kept,
-        exceptions = stats.exceptions,
-        scoped_skipped = stats.scoped_skipped,
-        cosmetic_skipped = stats.cosmetic_skipped,
-        unsupported_skipped = stats.unsupported_skipped,
-        "parsed adblock list as allowlist"
-    );
-    (domains, stats)
+        tracing::debug!(
+            kept = stats.kept,
+            exceptions = stats.exceptions,
+            scoped_skipped = stats.scoped_skipped,
+            cosmetic_skipped = stats.cosmetic_skipped,
+            unsupported_skipped = stats.unsupported_skipped,
+            "parsed adblock list as allowlist"
+        );
+        (self.domains, stats)
+    }
+}
+
+impl LineFed for AdblockExceptionsParser {
+    fn feed(&mut self, line: &str) {
+        AdblockExceptionsParser::feed(self, line)
+    }
 }
 
 /// Extract a validated, lowercased domain from the body of a `||…`/`@@||…`

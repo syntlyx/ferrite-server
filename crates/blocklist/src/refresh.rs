@@ -67,24 +67,25 @@ pub(super) async fn load_or_build_list_fst(
     }
 
     let fst_cache2 = fst_cache.clone();
-    match tokio::task::spawn_blocking(move || loader::build_fst(domains)).await {
-        Ok(Ok(bytes)) => {
-            let count = Map::new(bytes.as_slice()).map(|m| m.len()).unwrap_or(0);
-            // tmp + rename: FST files are mmap'd (at merge time and by the
-            // explain scan), so they must only ever be replaced atomically,
-            // never written in place.
-            let tmp = fst_cache2.with_extension("fst.tmp");
-            let saved = match tokio::fs::write(&tmp, &bytes).await {
-                Ok(()) => tokio::fs::rename(&tmp, &fst_cache2).await,
-                Err(e) => Err(e),
-            };
-            match saved {
-                Ok(()) => (name, ListFst::File(fst_cache2), count, stats),
-                Err(e) => {
-                    tracing::warn!("list '{}': could not save FST cache: {}", name, e);
-                    (name, ListFst::Ram(bytes), count, stats)
-                }
+    // tmp + rename: FST files are mmap'd (at merge time and by the explain
+    // scan), so they must only ever be replaced atomically, never written in
+    // place. The map is built straight into the temporary file — it would
+    // otherwise exist in memory as well, next to the domain list it came from.
+    let tmp = fst_cache2.with_extension("fst.tmp");
+    let build_into = tmp.clone();
+    match tokio::task::spawn_blocking(move || loader::build_fst_file(domains, &build_into)).await {
+        Ok(Ok(loader::BuiltFst::File(count))) => match tokio::fs::rename(&tmp, &fst_cache2).await {
+            Ok(()) => (name, ListFst::File(fst_cache2), count, stats),
+            Err(e) => {
+                tracing::warn!("list '{}': could not save FST cache: {}", name, e);
+                let _ = tokio::fs::remove_file(&tmp).await;
+                (String::new(), ListFst::Ram(Vec::new()), 0, None)
             }
+        },
+        // The disk refused it; serve this refresh from memory.
+        Ok(Ok(loader::BuiltFst::Ram(bytes))) => {
+            let count = Map::new(bytes.as_slice()).map(|m| m.len()).unwrap_or(0);
+            (name, ListFst::Ram(bytes), count, stats)
         }
         Ok(Err(e)) => {
             tracing::error!("list '{}': FST build failed: {}", name, e);

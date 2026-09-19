@@ -1332,24 +1332,36 @@ async fn refresh_list_set(
                 Err(e) => tracing::warn!("skipping list FST in merge: {}", e),
             }
         }
-        let fst_bytes = loader::merge_fsts(&maps)?;
-        let unique_count = Map::new(fst_bytes.as_slice())
-            .map_err(|e| FeriteError::Fst(e.to_string()))?
-            .len();
-
         if let Some(parent) = merged_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        // Merged straight into the temporary file: the union streams out of the
+        // page cache and into the disk, never existing as a second copy in RAM.
         let tmp = merged_path.with_extension("fst.tmp");
-        let persisted =
-            std::fs::write(&tmp, &fst_bytes).is_ok() && std::fs::rename(&tmp, &merged_path).is_ok();
+        let (unique_count, ram_bytes) = match loader::merge_fsts_file(&maps, &tmp)? {
+            loader::BuiltFst::File(count) => (count, None),
+            loader::BuiltFst::Ram(bytes) => {
+                let count = Map::new(bytes.as_slice())
+                    .map_err(|e| FeriteError::Fst(e.to_string()))?
+                    .len();
+                (count, Some(bytes))
+            }
+        };
+        let persisted = ram_bytes.is_none() && std::fs::rename(&tmp, &merged_path).is_ok();
         let fst = if persisted {
             tracing::info!("merged FST saved to {}", merged_path.display());
             // Serve from the mmap'd file: the merged map then sits in the
             // page cache (evictable) instead of RSS-pinned RAM.
-            loader::mmap_fst(&merged_path).or_else(|_| loader::ram_fst(fst_bytes))?
+            loader::mmap_fst(&merged_path)
+                .or_else(|_| loader::merge_fsts(&maps).and_then(loader::ram_fst))?
         } else {
-            loader::ram_fst(fst_bytes)?
+            // Either the merge never reached the disk, or the rename did not.
+            let bytes = match ram_bytes {
+                Some(bytes) => bytes,
+                None => loader::merge_fsts(&maps)?,
+            };
+            let _ = std::fs::remove_file(&tmp);
+            loader::ram_fst(bytes)?
         };
         Ok((fst, unique_count))
     })
@@ -1416,19 +1428,24 @@ fn build_profile_fst(id: &str, maps: Vec<FstMap>, cache_dir: &Path) -> Option<Fs
     if maps.len() == 1 {
         return maps.into_iter().next();
     }
-    let bytes = loader::merge_fsts(&maps)
-        .map_err(|e| tracing::warn!("profile '{}': FST merge failed: {}", id, e))
-        .ok()?;
     let path = cache_dir.join(format!("profile_{}.fst", refresh::sanitize_name(id)));
     let tmp = path.with_extension("fst.tmp");
-    let persisted = std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, &path).is_ok();
-    if persisted {
-        loader::mmap_fst(&path)
-            .or_else(|_| loader::ram_fst(bytes))
-            .ok()
-    } else {
-        loader::ram_fst(bytes).ok()
+    let merged = loader::merge_fsts_file(&maps, &tmp)
+        .map_err(|e| tracing::warn!("profile '{}': FST merge failed: {}", id, e))
+        .ok()?;
+    if let loader::BuiltFst::File(_) = merged
+        && std::fs::rename(&tmp, &path).is_ok()
+    {
+        return loader::mmap_fst(&path).ok();
     }
+    let _ = std::fs::remove_file(&tmp);
+    let bytes = match merged {
+        loader::BuiltFst::Ram(bytes) => bytes,
+        loader::BuiltFst::File(_) => loader::merge_fsts(&maps)
+            .map_err(|e| tracing::warn!("profile '{}': FST merge failed: {}", id, e))
+            .ok()?,
+    };
+    loader::ram_fst(bytes).ok()
 }
 
 /// mmap the per-list FSTs for `names` under `cache_dir`, skipping (with a debug
