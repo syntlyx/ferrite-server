@@ -8,7 +8,7 @@ members = ["crates/*"]
 default-members = ["crates/ferrite"]
 
 [workspace.package]
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
