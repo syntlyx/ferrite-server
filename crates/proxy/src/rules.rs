@@ -51,11 +51,11 @@ impl CompiledRule {
         if self.clients.is_empty() {
             return true;
         }
-        let ip = ip.to_ascii_lowercase();
-        let mac = mac.map(|m| m.to_ascii_lowercase());
+        // Compared in place: this runs per query for every client-scoped rule,
+        // and lowercasing both sides first allocated two strings to do it.
         self.clients
             .iter()
-            .any(|c| *c == ip || mac.as_deref() == Some(c.as_str()))
+            .any(|c| c.eq_ignore_ascii_case(ip) || mac.is_some_and(|m| c.eq_ignore_ascii_case(m)))
     }
 }
 

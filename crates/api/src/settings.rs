@@ -675,7 +675,7 @@ mod tests {
         state
             .inner
             .live_stats
-            .push_entry(entry, &state.inner.record_switches);
+            .push_entry(&entry, &state.inner.record_switches);
         assert_eq!(state.inner.live_stats.top_domains.top(10).len(), 1);
         assert_eq!(state.inner.live_stats.recent_queries.recent(10).len(), 1);
 

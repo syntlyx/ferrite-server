@@ -91,7 +91,7 @@ impl LiveStats {
     /// cleared in between. Reading at the point of use narrows that to the few
     /// instructions below — it is not a lock, and the single entry being
     /// processed at the exact moment of the flip can still survive the clear.
-    pub fn push_entry(&self, entry: QueryEntry, switches: &RecordSwitches) {
+    pub fn push_entry(&self, entry: &QueryEntry, switches: &RecordSwitches) {
         let scope = switches.scope();
 
         if scope.stats {
@@ -112,8 +112,10 @@ impl LiveStats {
                 .increment(entry.timestamp.timestamp() as u64, status);
         }
 
+        // Only the ring keeps the entry, so only the ring pays for a copy —
+        // and not at all when the query log is switched off.
         if scope.queries {
-            self.recent_queries.push(entry);
+            self.recent_queries.push(entry.clone());
         }
     }
 
@@ -204,7 +206,7 @@ mod tests {
     fn push_with(scope: RecordScope) -> Arc<LiveStats> {
         let live = LiveStats::new();
         let switches = ferrite_core::recording::RecordSwitches::new(scope);
-        live.push_entry(entry("x.test"), &switches);
+        live.push_entry(&entry("x.test"), &switches);
         live
     }
 
@@ -257,9 +259,9 @@ mod tests {
         let live = LiveStats::new();
         let switches = ferrite_core::recording::RecordSwitches::new(RecordScope::ALL);
 
-        live.push_entry(entry("first.test"), &switches);
+        live.push_entry(&entry("first.test"), &switches);
         switches.set_queries(false);
-        live.push_entry(entry("second.test"), &switches);
+        live.push_entry(&entry("second.test"), &switches);
 
         assert_eq!(live.recent_queries.recent(10).len(), 1);
         assert_eq!(live.top_domains.top(10).len(), 2, "statistics stayed on");

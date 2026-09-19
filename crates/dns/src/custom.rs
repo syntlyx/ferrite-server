@@ -100,19 +100,27 @@ impl CustomRecords {
     }
 
     /// Look up a domain + qtype and return a ready-to-send DNS response, or `None`.
-    /// `query` is decoded only if a record matches — the overwhelming majority
+    /// Look `name` up among the configured and built-in records.
+    ///
+    /// `name` must already be in the canonical form the DNS pipeline uses —
+    /// lowercase, no trailing root dot — like the blocklist's `*_normalized`
+    /// entry points. This runs on every query, and normalising a name that is
+    /// already normalised was an allocation per query for nothing.
+    ///
+    /// `query` is decoded only if a record matches: the overwhelming majority
     /// of queries match none, and they shouldn't pay for a decode to find out.
     pub fn lookup(&self, query: &LazyQuery, name: &str, qtype: u16) -> Option<DnsResponse> {
-        let name_norm = normalise(name);
         let want_type = RecordType::from(qtype);
 
-        let records = self.records.read();
-        if let Some(record) = find_record(&records, &name_norm, want_type) {
-            return build_response(query.message()?, name, record);
+        {
+            let records = self.records.read();
+            if let Some(record) = find_record(&records, name, want_type) {
+                return build_response(query.message()?, name, record);
+            }
         }
 
         let builtin_records = self.builtin_records.read();
-        let record = find_record(&builtin_records, &name_norm, want_type)?;
+        let record = find_record(&builtin_records, name, want_type)?;
 
         build_response(query.message()?, name, record)
     }

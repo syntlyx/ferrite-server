@@ -42,7 +42,7 @@ pub async fn run(ctx: WriterCtx, mut rx: mpsc::Receiver<QueryEntry>) -> anyhow::
                 // Drain any remaining entries queued before the signal.
                 while let Ok(mut entry) = rx.try_recv() {
                     tag_device(&ctx, &mut entry);
-                    ctx.live_stats.push_entry(entry.clone(), &ctx.switches);
+                    ctx.live_stats.push_entry(&entry, &ctx.switches);
                     batch.push(entry);
                 }
                 tracing::info!("stats writer flush requested, writing {} entries", batch.len());
@@ -58,7 +58,7 @@ pub async fn run(ctx: WriterCtx, mut rx: mpsc::Receiver<QueryEntry>) -> anyhow::
                     match timeout(FLUSH_INTERVAL, rx.recv()).await {
                         Ok(Some(mut entry)) => {
                             tag_device(&ctx, &mut entry);
-                            ctx.live_stats.push_entry(entry.clone(), &ctx.switches);
+                            ctx.live_stats.push_entry(&entry, &ctx.switches);
                             batch.push(entry);
                             if batch.len() >= BATCH_SIZE {
                                 break true; // flush now
