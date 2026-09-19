@@ -888,7 +888,7 @@ fn align_bucket(ts: i64) -> i64 {
 }
 
 /// Latest schema version. Bump when adding a migration step below.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Apply versioned migrations on top of the baseline `SCHEMA`.
 ///
@@ -910,6 +910,7 @@ fn run_migrations(c: &mut rusqlite::Connection) -> rusqlite::Result<()> {
             4 => migrate_v4_device_buckets(&tx)?,
             5 => migrate_v5_backfill_devices(&tx)?,
             6 => migrate_v6_drop_redundant_query_indexes(&tx)?,
+            7 => migrate_v7_drop_unused_domain_index(&tx)?,
             _ => unreachable!("no migration step for v{next}"),
         }
         // PRAGMA can't be parameter-bound; the value is our own constant.
@@ -1037,6 +1038,18 @@ fn migrate_v6_drop_redundant_query_indexes(tx: &rusqlite::Transaction) -> rusqli
          DROP INDEX IF EXISTS idx_queries_client_ip;
          DROP INDEX IF EXISTS idx_queries_status;",
     )
+}
+
+/// v7: drop `idx_queries_domain`, which every logged query paid for and no read
+/// ever used.
+///
+/// The query log's only domain filter is `domain LIKE '%…%'` — a leading
+/// wildcard, which a b-tree cannot answer, so the planner scans the timestamp
+/// index either way (pinned by the plan assertions in the migration test). Of
+/// all the indexes on this table it was the priciest to maintain: a string key
+/// arriving in random order splits pages on nearly every insert.
+fn migrate_v7_drop_unused_domain_index(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch("DROP INDEX IF EXISTS idx_queries_domain;")
 }
 
 /// v4: per-device rollup table (mirrors `client_buckets_10m`, keyed by device).
@@ -1914,11 +1927,12 @@ mod tests {
                 "idx_queries_timestamp",
                 "idx_queries_client_ip",
                 "idx_queries_status",
+                // v7: never used, see `migrate_v7_drop_unused_domain_index`.
+                "idx_queries_domain",
             ] {
                 assert!(!names.iter().any(|n| n == gone), "{gone} should be dropped");
             }
             for kept in [
-                "idx_queries_domain",
                 "idx_queries_time_id_desc",
                 "idx_queries_status_time_id_desc",
                 "idx_queries_client_time_id_desc",
@@ -1941,6 +1955,12 @@ mod tests {
                 (
                     "SELECT id FROM queries WHERE client_ip = '192.168.1.50' ORDER BY timestamp DESC, id DESC LIMIT 10",
                     "idx_queries_client_time_id_desc",
+                ),
+                // The domain search the UI sends: a leading wildcard, which is
+                // why an index on `domain` was worth nothing to it.
+                (
+                    "SELECT id FROM queries WHERE domain LIKE '%ads%' ESCAPE '\\' ORDER BY timestamp DESC, id DESC LIMIT 10",
+                    "idx_queries_time_id_desc",
                 ),
             ] {
                 let plan: String = c
