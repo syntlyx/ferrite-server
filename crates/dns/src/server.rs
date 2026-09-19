@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -38,6 +39,52 @@ pub async fn run(ctx: Arc<DnsCtx>) -> anyhow::Result<()> {
 // UDP
 // ---------------------------------------------------------------------------
 
+/// The DNS receive loop.
+///
+/// On Linux it moves datagrams in batches ([`crate::udp_batch`]): after the
+/// in-memory pipeline was cut to a few hundred nanoseconds per query, the two
+/// system calls around it are what a query mostly costs, and `recvmmsg` /
+/// `sendmmsg` amortise them over a burst. Elsewhere — and for a single
+/// datagram, where a batch holds one — it is the same loop one datagram at a
+/// time.
+#[cfg(target_os = "linux")]
+async fn udp_loop(socket: UdpSocket, ctx: Arc<DnsCtx>) -> anyhow::Result<()> {
+    use crate::udp_batch::{BATCH, UdpBatch};
+
+    let socket = Arc::new(socket);
+    let mut batch = UdpBatch::new(MAX_UDP_PAYLOAD);
+    // Answers settled from memory, sent together once the batch is worked
+    // through. Worst case every datagram in the batch is answered inline.
+    let mut replies: Vec<(Vec<u8>, SocketAddr)> = Vec::with_capacity(BATCH);
+
+    loop {
+        let received = match batch.recv(&socket).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!("UDP recvmmsg: {}", e);
+                continue;
+            }
+        };
+
+        replies.clear();
+        for i in 0..received {
+            let Some((raw, src)) = batch.datagram(i) else {
+                continue; // a source address in a family we can't answer
+            };
+            if let Some(answer) = dispatch(raw, src, &socket, &ctx) {
+                replies.push(answer);
+            }
+        }
+
+        if !replies.is_empty()
+            && let Err(e) = batch.send(&socket, &replies).await
+        {
+            tracing::warn!("UDP sendmmsg: {}", e);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
 async fn udp_loop(socket: UdpSocket, ctx: Arc<DnsCtx>) -> anyhow::Result<()> {
     let socket = Arc::new(socket);
     let mut buf = vec![0u8; MAX_UDP_PAYLOAD];
@@ -50,93 +97,82 @@ async fn udp_loop(socket: UdpSocket, ctx: Arc<DnsCtx>) -> anyhow::Result<()> {
                 continue;
             }
         };
-
-        // The in-memory half of the pipeline runs right here, on the receive
-        // loop: a cache hit, a block, a local record or a routing redirect is
-        // settled in a few hundred nanoseconds, while handing it to a task
-        // costs ~340 ns on its own — more than the answer itself. Only a query
-        // that has to wait for the network gets a task, a permit and a copy of
-        // the datagram.
-        let max_udp = client_udp_payload(&buf[..len]);
-        let pending = match crate::handler::decide(&buf[..len], src, &ctx) {
-            crate::handler::Decision::Answer(resp) => {
-                send_answer(&socket, resp, src, max_udp).await;
-                continue;
-            }
-            crate::handler::Decision::Drop => continue,
-            crate::handler::Decision::Upstream(pending) => pending,
-        };
-
-        let raw = buf[..len].to_vec();
-        let ctx = Arc::clone(&ctx);
-        let socket = Arc::clone(&socket);
-
-        // Shed load immediately if too many queries are in-flight: prevents
-        // memory exhaustion when upstream is slow (unbounded spawn otherwise).
-        let permit = match ctx.query_semaphore.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => {
-                tracing::warn!(
-                    "query concurrency limit reached, dropping UDP query from {}",
-                    src
-                );
-                // Send SERVFAIL so the client gets a response instead of timing out.
-                // We only need the query ID (bytes 0-1) to build a valid SERVFAIL.
-                if raw.len() >= 2 {
-                    let mut servfail = [
-                        raw[0], raw[1], // ID
-                        0x80,
-                        0x02, // QR=1, OPCODE=0, AA=0, TC=0, RD=0; RA=0, RCODE=SERVFAIL(2)
-                        0x00, 0x00, // QDCOUNT=0
-                        0x00, 0x00, // ANCOUNT=0
-                        0x00, 0x00, // NSCOUNT=0
-                        0x00, 0x00, // ARCOUNT=0
-                    ];
-                    // Echo RD bit from the query. Byte 2 only exists on a
-                    // header of at least 3 bytes — a 2-byte datagram passes the
-                    // guard above but has no flags byte, so bounds-check before
-                    // reading it (otherwise a 2-byte packet panics this loop).
-                    if raw.len() >= 3 && raw[2] & 0x01 != 0 {
-                        servfail[2] |= 0x01;
-                    }
-                    let _ = socket.send_to(&servfail, src).await;
-                }
-                continue;
-            }
-        };
-
-        tokio::spawn(async move {
-            let _permit = permit;
-            let resp = crate::handler::resolve_upstream(&raw, pending, &ctx).await;
-            send_answer(&socket, resp, src, max_udp).await;
-        });
+        if let Some((resp, dest)) = dispatch(&buf[..len], src, &socket, &ctx) {
+            send_datagram(&socket, &resp, dest).await;
+        }
     }
 }
 
-/// Send one answer back, truncating it first when it is larger than the client
-/// said it can accept over UDP: a TC=1 reply makes the client retry over TCP,
-/// which is better than an oversized datagram the network may silently drop
-/// (RFC 1035 §4.2.1). An empty answer means "say nothing".
-async fn send_answer(socket: &UdpSocket, resp: Vec<u8>, src: std::net::SocketAddr, max_udp: usize) {
-    if resp.is_empty() {
-        return;
-    }
-    let datagram = if resp.len() > max_udp {
-        truncate_response(&resp)
-    } else {
-        resp
-    };
-    // The socket is non-blocking and its send buffer is all but always free, so
-    // the common case never yields; `send_to` covers the moment it isn't.
-    match socket.try_send_to(&datagram, src) {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            if let Err(e) = socket.send_to(&datagram, src).await {
-                tracing::warn!("UDP send to {}: {}", src, e);
-            }
+/// Handle one received datagram.
+///
+/// The in-memory half of the pipeline runs right here, on the receive loop: a
+/// cache hit, a block, a local record or a routing redirect is settled in a few
+/// hundred nanoseconds, while handing it to a task costs ~340 ns on its own —
+/// more than the answer itself. Only a query that has to wait for the network
+/// gets a task, a permit and a copy of the datagram.
+///
+/// Returns the answer to send back, when there is one to send now; a query that
+/// went upstream answers from its own task.
+fn dispatch(
+    raw: &[u8],
+    src: SocketAddr,
+    socket: &Arc<UdpSocket>,
+    ctx: &Arc<DnsCtx>,
+) -> Option<(Vec<u8>, SocketAddr)> {
+    let max_udp = client_udp_payload(raw);
+    let pending = match crate::handler::decide(raw, src, ctx) {
+        crate::handler::Decision::Answer(resp) => {
+            return for_wire(resp, max_udp).map(|resp| (resp, src));
         }
-        Err(e) => tracing::warn!("UDP send to {}: {}", src, e),
-    }
+        crate::handler::Decision::Drop => return None,
+        crate::handler::Decision::Upstream(pending) => pending,
+    };
+
+    let raw = raw.to_vec();
+    let ctx = Arc::clone(ctx);
+    let socket = Arc::clone(socket);
+
+    // Shed load immediately if too many queries are in-flight: prevents
+    // memory exhaustion when upstream is slow (unbounded spawn otherwise).
+    let permit = match ctx.query_semaphore.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            tracing::warn!(
+                "query concurrency limit reached, dropping UDP query from {}",
+                src
+            );
+            // Send SERVFAIL so the client gets a response instead of timing out.
+            // We only need the query ID (bytes 0-1) to build a valid SERVFAIL.
+            if raw.len() >= 2 {
+                let mut servfail = [
+                    raw[0], raw[1], // ID
+                    0x80, 0x02, // QR=1, OPCODE=0, AA=0, TC=0, RD=0; RA=0, RCODE=SERVFAIL(2)
+                    0x00, 0x00, // QDCOUNT=0
+                    0x00, 0x00, // ANCOUNT=0
+                    0x00, 0x00, // NSCOUNT=0
+                    0x00, 0x00, // ARCOUNT=0
+                ];
+                // Echo RD bit from the query. Byte 2 only exists on a header of
+                // at least 3 bytes — a 2-byte datagram passes the guard above
+                // but has no flags byte, so bounds-check before reading it
+                // (otherwise a 2-byte packet panics this loop).
+                if raw.len() >= 3 && raw[2] & 0x01 != 0 {
+                    servfail[2] |= 0x01;
+                }
+                return Some((servfail.to_vec(), src));
+            }
+            return None;
+        }
+    };
+
+    tokio::spawn(async move {
+        let _permit = permit;
+        let resp = crate::handler::resolve_upstream(&raw, pending, &ctx).await;
+        if let Some(resp) = for_wire(resp, max_udp) {
+            send_datagram(&socket, &resp, src).await;
+        }
+    });
+    None
 }
 
 /// The client's maximum UDP payload size: 512 bytes by default (RFC 1035), or
@@ -175,6 +211,36 @@ fn truncate_response(resp: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Prepare an answer for the wire: nothing to send for an empty one, and an
+/// answer larger than the client said it can accept over UDP is truncated so it
+/// retries over TCP rather than receiving an oversized datagram the network may
+/// silently drop (RFC 1035 §4.2.1).
+fn for_wire(resp: Vec<u8>, max_udp: usize) -> Option<Vec<u8>> {
+    if resp.is_empty() {
+        return None;
+    }
+    Some(if resp.len() > max_udp {
+        truncate_response(&resp)
+    } else {
+        resp
+    })
+}
+
+/// Send one answer back. The socket is non-blocking and its send buffer is all
+/// but always free, so the common case never yields; `send_to` covers the
+/// moment it isn't.
+async fn send_datagram(socket: &UdpSocket, datagram: &[u8], dest: SocketAddr) {
+    match socket.try_send_to(datagram, dest) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            if let Err(e) = socket.send_to(datagram, dest).await {
+                tracing::warn!("UDP send to {}: {}", dest, e);
+            }
+        }
+        Err(e) => tracing::warn!("UDP send to {}: {}", dest, e),
+    }
 }
 
 // ---------------------------------------------------------------------------

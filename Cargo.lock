@@ -893,6 +893,7 @@ dependencies = [
  "ferrite-upstream",
  "hickory-proto",
  "hickory-resolver",
+ "libc",
  "lru",
  "parking_lot",
  "tokio",

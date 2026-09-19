@@ -7,3 +7,5 @@ pub mod query;
 pub mod resolver;
 pub mod server;
 pub mod types;
+#[cfg(target_os = "linux")]
+pub mod udp_batch;
