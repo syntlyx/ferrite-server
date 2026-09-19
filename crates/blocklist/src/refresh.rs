@@ -473,6 +473,16 @@ async fn load_stats_cache(path: &Path) -> Option<AdblockStats> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// The fingerprint recorded for `list_name`'s cached FST, when this ferrite is
+/// the one that wrote it. Synchronous on purpose: its caller is profile
+/// compilation, which runs on the blocking pool, and the sidecar is a few
+/// hundred bytes.
+pub(super) fn list_digest(dir: &Path, list_name: &str) -> Option<String> {
+    let bytes = std::fs::read(ListCache::new(dir, list_name).meta).ok()?;
+    let meta: ListMeta = serde_json::from_slice(&bytes).ok()?;
+    (meta.version == CACHE_VERSION).then_some(meta.digest)
+}
+
 /// Turn a user-supplied list name into a safe filesystem component.
 pub(super) fn sanitize_name(name: &str) -> String {
     name.chars()

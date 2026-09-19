@@ -31,11 +31,12 @@ struct ListSetRefresh {
     persisted: bool,
 }
 
-/// Sidecar next to a merged FST: the per-list fingerprints it was built from.
-/// A refresh whose lists all report the same fingerprints can serve the file as
-/// it stands — the union would only reproduce it.
+/// Sidecar next to a merged FST — the global one or a profile's — recording the
+/// per-list fingerprints it was built from. A compile whose lists all report the
+/// same fingerprints can serve the file as it stands: the union would only
+/// reproduce it.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
-struct MergedMeta {
+struct FstInputs {
     /// `(sanitised list name, digest)`, sorted — an added, removed or changed
     /// list all show up as a difference.
     inputs: Vec<(String, String)>,
@@ -1493,11 +1494,11 @@ async fn refresh_list_set(
         .map_err(|e| FeriteError::Internal(e.to_string()))??;
 
     match (persisted, fingerprint) {
-        (true, Some(inputs)) => save_merged_meta(merged_path, &MergedMeta { inputs }).await,
+        (true, Some(inputs)) => save_merged_meta(merged_path, &FstInputs { inputs }).await,
         // The file on disk isn't what we're serving, or we can't vouch for what
         // went into it — then no sidecar may claim otherwise.
         _ => {
-            let _ = tokio::fs::remove_file(merged_meta_path(merged_path)).await;
+            let _ = tokio::fs::remove_file(meta_path(merged_path)).await;
         }
     }
 
@@ -1511,18 +1512,18 @@ async fn refresh_list_set(
     })
 }
 
-/// Sidecar path for a merged FST: `blocklist.fst` → `blocklist.meta.json`.
-fn merged_meta_path(merged_path: &Path) -> PathBuf {
-    merged_path.with_extension("meta.json")
+/// Sidecar path for an FST: `blocklist.fst` → `blocklist.meta.json`.
+fn meta_path(fst_path: &Path) -> PathBuf {
+    fst_path.with_extension("meta.json")
 }
 
-async fn load_merged_meta(merged_path: &Path) -> Option<MergedMeta> {
-    let bytes = tokio::fs::read(merged_meta_path(merged_path)).await.ok()?;
+async fn load_merged_meta(merged_path: &Path) -> Option<FstInputs> {
+    let bytes = tokio::fs::read(meta_path(merged_path)).await.ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
-async fn save_merged_meta(merged_path: &Path, meta: &MergedMeta) {
-    let path = merged_meta_path(merged_path);
+async fn save_merged_meta(merged_path: &Path, meta: &FstInputs) {
+    let path = meta_path(merged_path);
     match serde_json::to_vec(meta) {
         Ok(bytes) => {
             if let Err(e) = tokio::fs::write(&path, bytes).await {
@@ -1550,10 +1551,7 @@ fn compile_profiles(
     let mut compiled: Vec<Arc<CompiledProfile>> = Vec::with_capacity(configs.len());
     for cfg in configs {
         let fst = reuse_merged(merged, &cfg.id, &cfg.lists, list_cache_dir)
-            .or_else(|| {
-                let maps = mmap_named_lists(list_cache_dir, &cfg.id, &cfg.lists);
-                build_profile_fst(&cfg.id, maps, list_cache_dir)
-            })
+            .or_else(|| build_profile_fst(&cfg.id, &cfg.lists, list_cache_dir))
             .unwrap_or_else(empty_fst);
         // Allowlist subset: named lists compile to the profile's own allow
         // FST; an empty selection means "inherit the global allow set"
@@ -1563,10 +1561,7 @@ fn compile_profiles(
         } else {
             Some(
                 reuse_merged(allow_merged, &cfg.id, &cfg.allowlists, allow_cache_dir)
-                    .or_else(|| {
-                        let maps = mmap_named_lists(allow_cache_dir, &cfg.id, &cfg.allowlists);
-                        build_profile_fst(&cfg.id, maps, allow_cache_dir)
-                    })
+                    .or_else(|| build_profile_fst(&cfg.id, &cfg.allowlists, allow_cache_dir))
                     .unwrap_or_else(empty_fst),
             )
         };
@@ -1630,9 +1625,60 @@ fn reuse_merged(
     let fst = loader::mmap_fst(&merged.path).ok()?;
     // Whatever this profile compiled to before is now dead weight, and on an SD
     // card a duplicate of the whole blocklist is tens of megabytes.
-    let stale = cache_dir.join(format!("profile_{}.fst", refresh::sanitize_name(id)));
-    let _ = std::fs::remove_file(stale);
+    discard_profile_cache(&profile_fst_path(cache_dir, id));
     Some(fst)
+}
+
+/// Where a profile keeps its own merged map, when it needs one.
+fn profile_fst_path(cache_dir: &Path, id: &str) -> PathBuf {
+    cache_dir.join(format!("profile_{}.fst", refresh::sanitize_name(id)))
+}
+
+/// Drop a profile's own map and the sidecar describing it — whenever the profile
+/// stops keeping one, or the file it should have kept never landed.
+fn discard_profile_cache(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(meta_path(path));
+}
+
+/// Fingerprints of the lists `names` selects, as the profile's sidecar records
+/// them. A list with no cached FST contributes nothing here, exactly as it
+/// contributes nothing to the merge; a list whose FST can't be vouched for
+/// yields `None`, which makes the caller merge rather than trust a match.
+fn profile_fingerprint(cache_dir: &Path, names: &[String]) -> Option<Vec<(String, String)>> {
+    let mut inputs = Vec::with_capacity(names.len());
+    for name in names {
+        let safe = refresh::sanitize_name(name);
+        if !cache_dir.join(format!("{safe}.fst")).exists() {
+            continue;
+        }
+        inputs.push((safe, refresh::list_digest(cache_dir, name)?));
+    }
+    inputs.sort();
+    inputs.dedup();
+    Some(inputs)
+}
+
+/// Read a sidecar written by [`save_fst_inputs`]. Synchronous: profile
+/// compilation runs on the blocking pool and these files are tiny.
+fn load_fst_inputs(fst_path: &Path) -> Option<FstInputs> {
+    let bytes = std::fs::read(meta_path(fst_path)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn save_fst_inputs(fst_path: &Path, inputs: &[(String, String)]) {
+    let path = meta_path(fst_path);
+    let meta = FstInputs {
+        inputs: inputs.to_vec(),
+    };
+    match serde_json::to_vec(&meta) {
+        Ok(bytes) => {
+            if let Err(e) = std::fs::write(&path, bytes) {
+                tracing::warn!("could not write profile meta {}: {}", path.display(), e);
+            }
+        }
+        Err(e) => tracing::warn!("could not serialise profile meta: {}", e),
+    }
 }
 
 /// Merge a profile's per-list FSTs and mmap the result from a
@@ -1640,16 +1686,28 @@ fn reuse_merged(
 /// if the write fails). Returns `None` when there's nothing to merge. Block
 /// and allow subsets use distinct `cache_dir`s, so the cache file name can
 /// stay the same for both.
-fn build_profile_fst(id: &str, maps: Vec<FstMap>, cache_dir: &Path) -> Option<FstMap> {
-    if maps.is_empty() {
-        return None;
+///
+/// The merge runs only when one of *this profile's* lists actually moved. Lists
+/// churn at their own pace — one that rebuilds hourly would otherwise re-merge
+/// every profile on the box, including the ones that never named it.
+fn build_profile_fst(id: &str, names: &[String], cache_dir: &Path) -> Option<FstMap> {
+    let path = profile_fst_path(cache_dir, id);
+    let fingerprint = profile_fingerprint(cache_dir, names);
+
+    if let Some(inputs) = &fingerprint
+        && load_fst_inputs(&path).is_some_and(|recorded| recorded.inputs == *inputs)
+        && let Ok(map) = loader::mmap_fst(&path)
+    {
+        return Some(map);
     }
-    // Single-list subset: no merge needed — serve the (already mmap'd)
-    // per-list FST directly instead of copying + rewriting tens of MB.
-    if maps.len() == 1 {
+
+    let maps = mmap_named_lists(cache_dir, id, names);
+    // Nothing to merge, or a single list that is already its own map: either way
+    // this profile keeps no file, so nothing on disk may claim it has one.
+    if maps.len() < 2 {
+        discard_profile_cache(&path);
         return maps.into_iter().next();
     }
-    let path = cache_dir.join(format!("profile_{}.fst", refresh::sanitize_name(id)));
     let tmp = path.with_extension("fst.tmp");
     let merged = loader::merge_fsts_file(&maps, &tmp)
         .map_err(|e| tracing::warn!("profile '{}': FST merge failed: {}", id, e))
@@ -1657,9 +1715,18 @@ fn build_profile_fst(id: &str, maps: Vec<FstMap>, cache_dir: &Path) -> Option<Fs
     if let loader::BuiltFst::File(_) = merged
         && std::fs::rename(&tmp, &path).is_ok()
     {
+        match &fingerprint {
+            Some(inputs) => save_fst_inputs(&path, inputs),
+            // Can't vouch for what went in, so nothing may claim to.
+            None => {
+                let _ = std::fs::remove_file(meta_path(&path));
+            }
+        }
         return loader::mmap_fst(&path).ok();
     }
     let _ = std::fs::remove_file(&tmp);
+    // The map never reached the disk — whatever is there does not describe it.
+    discard_profile_cache(&path);
     let bytes = match merged {
         loader::BuiltFst::Ram(bytes) => bytes,
         loader::BuiltFst::File(_) => loader::merge_fsts(&maps)
@@ -2735,6 +2802,92 @@ mod tests {
             "a changed list must rebuild the merged FST"
         );
         assert!(blocklist.is_blocked("new.example"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A profile recompiles only when its *own* lists move. Lists churn at their
+    /// own pace — easylist rebuilds upstream every hour — and without this one
+    /// such list re-merges every profile on the box, including those that never
+    /// named it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_profile_recompiles_only_when_its_own_lists_move() {
+        use ferrite_core::config::BlocklistProfileConfig;
+        use std::os::unix::fs::MetadataExt;
+
+        let fst_path = temp_fst_path("ferrite-profile-fingerprint");
+        let dir = fst_path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = |name: &str, body: &str| {
+            let path = dir.join(format!("{name}.txt"));
+            std::fs::write(&path, body).unwrap();
+            path
+        };
+        let ads = source("ads", "ads.example\n");
+        let track = source("track", "track.example\n");
+        let noisy = source("noisy", "noisy.example\n");
+
+        let list = |name: &str, path: &PathBuf| ListConfig {
+            name: name.into(),
+            url: format!("file://{}", path.display()),
+            enabled: true,
+        };
+
+        let blocklist = Blocklist::new(
+            BlocklistConfig {
+                enabled: true,
+                decision_cache_size: 1000,
+                lists: vec![
+                    list("Ads", &ads),
+                    list("Track", &track),
+                    list("Noisy", &noisy),
+                ],
+                wildcard_block: vec![],
+                whitelist: vec![],
+                client_bypass: vec![],
+                // Two of the three, so the profile keeps a map of its own rather
+                // than mapping the merged one.
+                profiles: vec![BlocklistProfileConfig {
+                    id: "kid".into(),
+                    name: "Kid".into(),
+                    lists: vec!["Ads".into(), "Track".into()],
+                    clients: vec!["10.0.0.2".into()],
+                    block: vec![],
+                    allow: vec![],
+                    allowlists: vec![],
+                    default_deny: false,
+                }],
+            },
+            AllowlistConfig::default(),
+            fst_path,
+        );
+        blocklist.refresh(false).await.unwrap();
+
+        let profile_fst = dir.join("lists").join("profile_kid.fst");
+        let compiled_at = std::fs::metadata(&profile_fst).unwrap().ino();
+
+        // The list the profile never named changes: the global set is merged
+        // again, the profile is not.
+        std::fs::write(&noisy, "noisy.example\nmore.example\n").unwrap();
+        blocklist.refresh(true).await.unwrap();
+        assert!(blocklist.is_blocked("more.example"), "the global set moved");
+        assert_eq!(
+            std::fs::metadata(&profile_fst).unwrap().ino(),
+            compiled_at,
+            "a list this profile doesn't use must not re-merge it"
+        );
+
+        // One of its own lists changes: now it must.
+        std::fs::write(&ads, "ads.example\nnew.example\n").unwrap();
+        blocklist.refresh(true).await.unwrap();
+        assert_ne!(
+            std::fs::metadata(&profile_fst).unwrap().ino(),
+            compiled_at,
+            "its own list moved, so the profile must compile again"
+        );
+        let kid = blocklist.profile_for("10.0.0.2", None);
+        assert!(blocklist.should_block_for("new.example", kid.as_deref()));
 
         std::fs::remove_dir_all(&dir).ok();
     }
