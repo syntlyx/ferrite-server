@@ -1,9 +1,11 @@
 pub mod cache;
+pub mod domains;
 pub mod engine;
 pub mod loader;
 pub mod parser;
 mod refresh;
 
+pub use domains::DomainSet;
 pub use engine::{Blocklist, CompiledProfile, normalise_domain};
 pub use parser::AdblockStats;
 

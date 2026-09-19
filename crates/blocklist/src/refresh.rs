@@ -3,6 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use fst::Map;
 
+use crate::domains::DomainSet;
 use crate::{AdblockStats, ListPolarity, loader};
 
 /// Per-list domain cache is considered fresh for 12 hours.
@@ -110,7 +111,7 @@ async fn fetch_domains(
     stats_cache: &Path,
     force: bool,
     polarity: ListPolarity,
-) -> (Vec<String>, Option<AdblockStats>) {
+) -> (DomainSet, Option<AdblockStats>) {
     if !force && let Some(domains) = load_fresh_text_cache(domains_cache).await {
         let stats = load_stats_cache(stats_cache).await;
         tracing::debug!(
@@ -132,11 +133,9 @@ async fn fetch_domains(
             tracing::error!("list '{}': fetch failed: {}", name, e);
             // Stale text cache is better than nothing.
             if let Ok(content) = tokio::fs::read_to_string(domains_cache).await {
-                let stale: Vec<String> = content
-                    .lines()
-                    .filter(|l| !l.is_empty())
-                    .map(String::from)
-                    .collect();
+                // Spans over the text just read — the cache file is already the
+                // shape a `DomainSet` holds, so nothing is copied.
+                let stale = DomainSet::from_lines(content);
                 if !stale.is_empty() {
                     let stats = load_stats_cache(stats_cache).await;
                     tracing::warn!(
@@ -147,7 +146,7 @@ async fn fetch_domains(
                     return (stale, stats);
                 }
             }
-            (vec![], None)
+            (DomainSet::new(), None)
         }
     }
 }
@@ -173,14 +172,13 @@ pub(super) async fn load_fresh_bytes(path: &Path) -> Option<Vec<u8>> {
     tokio::fs::read(path).await.ok()
 }
 
-async fn load_fresh_text_cache(path: &Path) -> Option<Vec<String>> {
+async fn load_fresh_text_cache(path: &Path) -> Option<DomainSet> {
     let bytes = load_fresh_bytes(path).await?;
     let content = String::from_utf8(bytes).ok()?;
-    let domains: Vec<String> = content
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(String::from)
-        .collect();
+    // The file is one domain per line, which is exactly how a `DomainSet` holds
+    // them — so it becomes the set's buffer as it stands, with only the spans
+    // built on top.
+    let domains = DomainSet::from_lines(content);
     if domains.is_empty() {
         None
     } else {
@@ -198,7 +196,7 @@ async fn load_fresh_text_cache(path: &Path) -> Option<Vec<String>> {
 /// it. Chunking holds 64 KB instead. Replacing by rename also means a write cut
 /// short (full disk, power loss) leaves the previous cache intact rather than a
 /// truncated list that would silently unblock everything past the cut.
-async fn save_text_cache(path: &Path, domains: &[String]) {
+async fn save_text_cache(path: &Path, domains: &DomainSet) {
     use tokio::io::AsyncWriteExt;
 
     const CHUNK_BYTES: usize = 64 * 1024;
@@ -305,19 +303,19 @@ mod tests {
         let path = dir.join("list.txt");
 
         // Well past 64 KB, so several chunks are written.
-        let domains: Vec<String> = (0..20_000)
+        let domains: DomainSet = (0..20_000)
             .map(|i| format!("host{i}.example.com"))
             .collect();
         save_text_cache(&path, &domains).await;
         assert_eq!(load_fresh_text_cache(&path).await.unwrap(), domains);
 
         // A shorter list replaces the longer one wholesale (no leftover tail).
-        let short = vec!["only.example.com".to_string()];
+        let short: DomainSet = vec!["only.example.com".to_string()].into();
         save_text_cache(&path, &short).await;
         assert_eq!(load_fresh_text_cache(&path).await.unwrap(), short);
 
         // Empty list: a file with nothing in it, and no stale temporary left behind.
-        save_text_cache(&path, &[]).await;
+        save_text_cache(&path, &DomainSet::new()).await;
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
         assert!(!path.with_extension("tmp").exists());
 

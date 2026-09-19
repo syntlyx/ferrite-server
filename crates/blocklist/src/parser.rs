@@ -1,17 +1,18 @@
+use crate::domains::DomainSet;
 /// Parse a `/etc/hosts`-style file and return all blocked domain names.
 ///
 /// Lines look like:
 ///   `0.0.0.0 ads.example.com`
 ///   `127.0.0.1 tracker.evil.com # comment`
 pub fn parse_hosts(content: &str) -> Vec<String> {
-    feed_all(HostsParser::default(), content).finish()
+    feed_all(HostsParser::default(), content).finish().to_vec()
 }
 
 /// [`parse_hosts`], fed one line at a time — so a list can be parsed as it
 /// arrives rather than held in memory whole.
 #[derive(Default)]
 pub struct HostsParser {
-    domains: Vec<String>,
+    domains: DomainSet,
 }
 
 impl HostsParser {
@@ -39,22 +40,23 @@ impl HostsParser {
         }
 
         for domain in parts {
-            let domain = domain.to_ascii_lowercase();
-            // Skip localhost aliases.
-            if domain == "localhost"
-                || domain == "localhost.localdomain"
-                || domain == "broadcasthost"
-            {
-                continue;
-            }
-            // Basic domain validation.
-            if is_valid_domain(&domain) {
-                self.domains.push(domain);
-            }
+            // Lowercased straight into the set's buffer and rolled back if it
+            // doesn't qualify — no string is allocated per candidate.
+            self.domains.push_lowercase_if(domain, |domain| {
+                // Skip localhost aliases.
+                if domain == "localhost"
+                    || domain == "localhost.localdomain"
+                    || domain == "broadcasthost"
+                {
+                    return false;
+                }
+                // Basic domain validation.
+                is_valid_domain(domain)
+            });
         }
     }
 
-    pub fn finish(self) -> Vec<String> {
+    pub fn finish(self) -> DomainSet {
         self.domains
     }
 }
@@ -114,13 +116,13 @@ pub fn is_adblock_syntax(line: &str) -> bool {
 ///   `ads.example.com`
 ///   `tracker.evil.com  # optional comment`
 pub fn parse_plain(content: &str) -> Vec<String> {
-    feed_all(PlainParser::default(), content).finish()
+    feed_all(PlainParser::default(), content).finish().to_vec()
 }
 
 /// [`parse_plain`], fed one line at a time.
 #[derive(Default)]
 pub struct PlainParser {
-    domains: Vec<String>,
+    domains: DomainSet,
 }
 
 impl PlainParser {
@@ -147,13 +149,10 @@ impl PlainParser {
         if line.is_empty() {
             return;
         }
-        let domain = line.to_ascii_lowercase();
-        if is_valid_domain(&domain) {
-            self.domains.push(domain);
-        }
+        self.domains.push_lowercase_if(line, is_valid_domain);
     }
 
-    pub fn finish(self) -> Vec<String> {
+    pub fn finish(self) -> DomainSet {
         self.domains
     }
 }
@@ -202,7 +201,8 @@ pub struct AdblockStats {
 /// deliberately do NOT let one list's exception cancel another list's block, as
 /// that cross-list interaction is opaque and surprising.
 pub fn parse_adblock(content: &str) -> (Vec<String>, AdblockStats) {
-    feed_all(AdblockParser::default(), content).finish()
+    let (domains, stats) = feed_all(AdblockParser::default(), content).finish();
+    (domains.to_vec(), stats)
 }
 
 /// [`parse_adblock`], fed one line at a time. The exception subtraction is the
@@ -210,7 +210,7 @@ pub fn parse_adblock(content: &str) -> (Vec<String>, AdblockStats) {
 /// [`Self::finish`].
 #[derive(Default)]
 pub struct AdblockParser {
-    domains: Vec<String>,
+    domains: DomainSet,
     exceptions: std::collections::HashSet<String>,
     // Diagnostics: count what we deliberately do NOT turn into block entries so
     // the volume of a filter list (e.g. EasyList) is explainable from the logs.
@@ -255,7 +255,7 @@ impl AdblockParser {
             }
 
             match adblock_rule_domain(pattern) {
-                Some(domain) => self.domains.push(domain),
+                Some(domain) => self.domains.push(&domain),
                 None => self.unsupported_skipped += 1, // wildcard/path/invalid host
             }
             return;
@@ -273,13 +273,14 @@ impl AdblockParser {
         }
     }
 
-    pub fn finish(mut self) -> (Vec<String>, AdblockStats) {
+    pub fn finish(mut self) -> (DomainSet, AdblockStats) {
         let exception_count = self.exceptions.len();
         let removed = if self.exceptions.is_empty() {
             0
         } else {
             let before = self.domains.len();
-            self.domains.retain(|d| !self.exceptions.contains(d));
+            let exceptions = &self.exceptions;
+            self.domains.retain(|d| !exceptions.contains(d));
             before - self.domains.len()
         };
 
@@ -327,13 +328,14 @@ impl LineFed for AdblockParser {
 /// Stats reuse [`AdblockStats`] with allow semantics: `kept` = allow entries
 /// emitted, `exceptions` = `@@` rules seen, `unblocked_by_exception` = 0.
 pub fn parse_adblock_exceptions(content: &str) -> (Vec<String>, AdblockStats) {
-    feed_all(AdblockExceptionsParser::default(), content).finish()
+    let (domains, stats) = feed_all(AdblockExceptionsParser::default(), content).finish();
+    (domains.to_vec(), stats)
 }
 
 /// [`parse_adblock_exceptions`], fed one line at a time.
 #[derive(Default)]
 pub struct AdblockExceptionsParser {
-    domains: Vec<String>,
+    domains: DomainSet,
     exception_rules: usize,
     scoped_skipped: usize,
     cosmetic_skipped: usize,
@@ -360,7 +362,7 @@ impl AdblockExceptionsParser {
                 return;
             }
             match adblock_rule_domain(pattern) {
-                Some(domain) => self.domains.push(domain),
+                Some(domain) => self.domains.push(&domain),
                 None => self.unsupported_skipped += 1, // wildcard/path/invalid host
             }
             return;
@@ -377,7 +379,7 @@ impl AdblockExceptionsParser {
         }
     }
 
-    pub fn finish(self) -> (Vec<String>, AdblockStats) {
+    pub fn finish(self) -> (DomainSet, AdblockStats) {
         let stats = AdblockStats {
             kept: self.domains.len(),
             exceptions: self.exception_rules,

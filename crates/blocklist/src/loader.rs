@@ -6,6 +6,7 @@ use fst::{Map, MapBuilder, Streamer};
 use reqwest::{Client, Url};
 
 use crate::ListPolarity;
+use crate::domains::DomainSet;
 use crate::parser::{self, AdblockStats};
 use ferrite_core::error::{FeriteError, Result};
 
@@ -153,7 +154,7 @@ static HTTP_CLIENT: std::sync::LazyLock<Client> = std::sync::LazyLock::new(|| {
 pub async fn load_list(
     url: &str,
     polarity: ListPolarity,
-) -> Result<(Vec<String>, Option<AdblockStats>)> {
+) -> Result<(DomainSet, Option<AdblockStats>)> {
     // Parsed as it arrives. A big subscription is 20–40 MB of text that would
     // otherwise sit in memory next to the `Vec<String>` it parses into — and
     // this runs on a box whose whole memory target is a few tens of megabytes.
@@ -334,10 +335,10 @@ impl ListParser {
         }
     }
 
-    pub fn finish(self) -> (Vec<String>, Option<AdblockStats>) {
+    pub fn finish(self) -> (DomainSet, Option<AdblockStats>) {
         match self.state {
             // Nothing but comments: no format, no domains.
-            ParserState::Detecting { .. } => (vec![], None),
+            ParserState::Detecting { .. } => (DomainSet::new(), None),
             ParserState::Hosts(p) => (p.finish(), None),
             ParserState::Plain(p) => (p.finish(), None),
             ParserState::Adblock(p) => {
@@ -376,7 +377,8 @@ pub fn parse_content(content: &str, polarity: ListPolarity) -> (Vec<String>, Opt
     for line in content.lines() {
         parser.feed(line);
     }
-    parser.finish()
+    let (domains, stats) = parser.finish();
+    (domains.to_vec(), stats)
 }
 
 /// Backing bytes for an [`fst::Map`]: an anonymous RAM buffer or a memory-mapped
@@ -509,30 +511,15 @@ pub fn merge_fsts_file<D: AsRef<[u8]>>(maps: &[Map<D>], path: &Path) -> Result<B
     }
 }
 
-/// Sort, deduplicate and normalise domains into the strictly increasing key
-/// order an FST demands.
-fn prepare_keys(domains: &mut Vec<String>) {
-    // Strip the trailing root dot so FQDN-form list entries (`ads.example.com.`)
-    // match queries, which are normalised dot-less before the FST is probed.
-    // Done before sort/dedup so equivalent dotted/undotted entries collapse.
-    for domain in domains.iter_mut() {
-        if domain.ends_with('.') {
-            domain.truncate(domain.trim_end_matches('.').len());
-        }
-    }
-    // FST requires keys in strict lexicographic order with no duplicates.
-    domains.sort_unstable();
-    domains.dedup();
-}
-
 /// Build a sorted, deduplicated FST map from domain names.
 /// All values are set to 1 (the FST is used as a set).
 /// Returns raw FST bytes ready to pass to `fst::Map::new()`.
-pub fn build_fst(mut domains: Vec<String>) -> Result<Vec<u8>> {
-    prepare_keys(&mut domains);
+pub fn build_fst(domains: impl Into<DomainSet>) -> Result<Vec<u8>> {
+    let mut domains = domains.into();
+    domains.prepare_keys();
 
     let mut builder = MapBuilder::memory();
-    for domain in &domains {
+    for domain in domains.iter() {
         builder
             .insert(domain.as_bytes(), 1)
             .map_err(|e| FeriteError::Fst(e.to_string()))?;
@@ -569,17 +556,17 @@ pub enum BuiltFst {
 ///
 /// The file is the caller's temporary path: it must still be renamed into place,
 /// because FST files are mmap'd and may only ever be replaced atomically.
-pub fn build_fst_file(mut domains: Vec<String>, path: &Path) -> Result<BuiltFst> {
+pub fn build_fst_file(mut domains: DomainSet, path: &Path) -> Result<BuiltFst> {
     use std::io::Write;
 
-    prepare_keys(&mut domains);
+    domains.prepare_keys();
     let count = domains.len();
 
     let built = (|| -> std::io::Result<()> {
         let file = std::fs::File::create(path)?;
         let mut builder = MapBuilder::new(std::io::BufWriter::new(file))
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        for domain in &domains {
+        for domain in domains.iter() {
             builder
                 .insert(domain.as_bytes(), 1)
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -605,7 +592,7 @@ pub fn build_fst_file(mut domains: Vec<String>, path: &Path) -> Result<BuiltFst>
             let _ = std::fs::remove_file(path);
             // `domains` is already prepared, so this is just the insert loop again.
             let mut builder = MapBuilder::memory();
-            for domain in &domains {
+            for domain in domains.iter() {
                 builder
                     .insert(domain.as_bytes(), 1)
                     .map_err(|err| FeriteError::Fst(err.to_string()))?;
@@ -823,7 +810,8 @@ mod stream_tests {
                     splitter.finish(|line| parser.feed(line));
                     let got = parser.finish();
                     assert_eq!(
-                        got.0, expected.0,
+                        got.0.to_vec(),
+                        expected.0,
                         "domains differ at chunk size {chunk_size} for body {body:?}"
                     );
                     assert_eq!(
