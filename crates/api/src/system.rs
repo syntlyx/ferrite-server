@@ -117,6 +117,7 @@ fn system_snapshot(global_cpu: f32, process_cpu: f32) -> Value {
     let total_mem = sys.total_memory();
     let available_mem = sys.available_memory();
     let free_mem = sys.free_memory();
+    let cache_mem = meminfo_cache_bytes();
     let total_swap = sys.total_swap();
     let used_swap = sys.used_swap();
     let uptime = System::uptime();
@@ -154,7 +155,7 @@ fn system_snapshot(global_cpu: f32, process_cpu: f32) -> Value {
     serde_json::json!({
         "cpu_usage_percent": global_cpu,
         "cpu_temp_celsius":  cpu_temp,
-        "memory": memory_snapshot(total_mem, available_mem, free_mem),
+        "memory": memory_snapshot(total_mem, available_mem, free_mem, cache_mem),
         "swap": {
             "total_bytes":  total_swap,
             "used_bytes":   used_swap,
@@ -175,12 +176,47 @@ fn system_snapshot(global_cpu: f32, process_cpu: f32) -> Value {
     })
 }
 
-fn memory_snapshot(total: u64, available: u64, free: u64) -> Value {
-    // For dashboard pressure, prefer MemAvailable semantics: reclaimable page
-    // cache should not make the machine look more loaded than it is.
-    let used = total.saturating_sub(available);
+/// Buffers + page cache + reclaimable slab — `free`'s "buff/cache" column,
+/// from `/proc/meminfo` (Linux only; `None` elsewhere). sysinfo reports
+/// MemFree and MemAvailable but not the cache, and MemAvailable alone cannot
+/// stand in for it: it is an estimate that withholds the kernel's watermark
+/// reserve and counts only the part of the cache it expects to get back, so on
+/// an idle box it sits *below* MemFree and `total - available` charges the
+/// dashboard for cache nobody asked for.
+fn meminfo_cache_bytes() -> Option<u64> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    parse_meminfo_cache(&std::fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+fn parse_meminfo_cache(text: &str) -> Option<u64> {
+    let field = |name: &str| -> Option<u64> {
+        let kb: u64 = text
+            .lines()
+            .find(|l| l.starts_with(name))?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()?;
+        Some(kb * 1024)
+    };
+    // `Cached` already includes Shmem, exactly as `free` counts it;
+    // `SReclaimable` is missing on kernels older than 2.6.19.
+    Some(field("Buffers:")? + field("Cached:")? + field("SReclaimable:").unwrap_or(0))
+}
+
+/// The memory block the dashboard draws, in `free`'s accounting: `used` is
+/// what is neither free nor cache. Page cache is the kernel making use of idle
+/// RAM and it is handed back on demand, so counting it as used makes a router
+/// doing nothing look half-loaded — the box below reported 408 MB used against
+/// `free`'s 170 MB, the difference being 221 MB of cache plus the watermark
+/// reserve. Without `/proc` (non-Linux) the MemAvailable estimate is the best
+/// available stand-in, and the arithmetic below falls back to exactly it.
+fn memory_snapshot(total: u64, available: u64, free: u64, cache: Option<u64>) -> Value {
+    let reclaimable = cache.unwrap_or_else(|| available.saturating_sub(free));
+    let used = total.saturating_sub(free).saturating_sub(reclaimable);
     let allocated = total.saturating_sub(free);
-    let reclaimable = available.saturating_sub(free);
 
     serde_json::json!({
         "total_bytes":       total,
@@ -255,9 +291,50 @@ fn collect_disk() -> Option<Value> {
 mod tests {
     use super::*;
 
+    /// The prefixes have to match whole field names: `Cached:` must not pick
+    /// up `SwapCached:`, and the sum is Buffers + Cached + SReclaimable —
+    /// `free`'s buff/cache column, 226 700 kB for this excerpt.
     #[test]
-    fn memory_snapshot_uses_available_memory_for_pressure() {
-        let memory = memory_snapshot(3_905, 3_264, 2_795);
+    fn parse_meminfo_cache_sums_the_buff_cache_column() {
+        let text = "\
+MemTotal:        3998540 kB
+MemFree:         3598416 kB
+MemAvailable:    3580652 kB
+Buffers:           21044 kB
+Cached:           185424 kB
+SwapCached:            0 kB
+Active:           142172 kB
+Shmem:             40296 kB
+SReclaimable:      20232 kB
+SUnreclaim:        19488 kB
+";
+        assert_eq!(parse_meminfo_cache(text), Some(226_700 * 1024));
+    }
+
+    /// A kernel too old to report reclaimable slab still gives buffers+cache.
+    #[test]
+    fn parse_meminfo_cache_tolerates_a_missing_sreclaimable() {
+        let text = "MemTotal: 100 kB\nBuffers: 4 kB\nCached: 8 kB\n";
+        assert_eq!(parse_meminfo_cache(text), Some(12 * 1024));
+    }
+
+    /// The numbers are one real reading from an idle router, in MiB:
+    /// `free -m` there prints 170 used, 3514 free, 221 buff/cache, 3497
+    /// available — note available *below* free, which is what made the old
+    /// `total - available` read 408.
+    #[test]
+    fn memory_snapshot_excludes_page_cache_the_way_free_does() {
+        let memory = memory_snapshot(3_905, 3_497, 3_514, Some(221));
+
+        assert_eq!(memory["used_bytes"].as_u64(), Some(170));
+        assert_eq!(memory["allocated_bytes"].as_u64(), Some(391));
+        assert_eq!(memory["reclaimable_bytes"].as_u64(), Some(221));
+    }
+
+    /// No `/proc` to read the cache from: MemAvailable carries the estimate.
+    #[test]
+    fn memory_snapshot_falls_back_to_available_memory() {
+        let memory = memory_snapshot(3_905, 3_264, 2_795, None);
 
         assert_eq!(memory["used_bytes"].as_u64(), Some(641));
         assert_eq!(memory["allocated_bytes"].as_u64(), Some(1_110));
