@@ -671,7 +671,7 @@ mod tests {
             upstream: None,
             rcode: 0,
         };
-        state.inner.live_stats.record_query(&entry);
+        state.inner.live_stats.record_query(entry.status);
         state
             .inner
             .live_stats

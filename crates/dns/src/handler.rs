@@ -14,7 +14,7 @@ use crate::ctx::DnsCtx;
 use crate::query::LazyQuery;
 use crate::types::DnsResponse;
 use ferrite_core::error::Result;
-use ferrite_core::net::unmap_v4;
+use ferrite_core::net::{ip_to_string, unmap_v4};
 use ferrite_core::types::{QueryEntry, QueryStatus};
 use ferrite_core::wire;
 
@@ -68,27 +68,32 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
     // Normalise IPv4-mapped IPv6 (::ffff:a.b.c.d) to plain IPv4 so the DB
     // stores clean addresses and PTR grouping works correctly.
     let client_addr = unmap_v4(src.ip());
-    let client_ip = client_addr.to_string();
     let blocking_enabled = ctx.blocklist.blocking_enabled();
-    // Resolve the client MAC when something keys on it: blocklist client-bypass,
-    // a per-device blocking profile, or a proxy rule scoped to specific clients.
-    // All are cheap in-memory lookups.
-    let client_mac = if (blocking_enabled
+    // Does anything below key on *which* client this is — a blocklist
+    // client-bypass, a per-device blocking profile, or a proxy rule scoped to
+    // specific clients? When nothing does, the three checks that take the
+    // client all short-circuit on the same flags, so neither the MAC lookup nor
+    // the address-as-text below has to happen.
+    let client_scoped = (blocking_enabled
         && (ctx.blocklist.has_client_bypass() || ctx.blocklist.has_profiles()))
-        || ctx.interceptor.has_client_rules()
-    {
+        || ctx.interceptor.has_client_rules();
+    let client_mac = if client_scoped {
         ctx.client_registry.get_mac(client_addr)
     } else {
         None
     };
+    // The log entry wants the address as text too, but it formats its own —
+    // inside a closure a switched-off log never runs.
+    let client_text = client_scoped.then(|| ip_to_string(client_addr));
+    let client_ip = client_text.as_deref().unwrap_or_default();
     let filtering_enabled = blocking_enabled
         && !ctx
             .blocklist
-            .client_bypasses_blocking_normalized(&client_ip, client_mac.as_deref());
+            .client_bypasses_blocking_normalized(client_ip, client_mac.as_deref());
     // The per-device profile (subset of lists) for this client, if any. When
     // present it replaces the default all-lists FST for every block check below.
     let profile = if filtering_enabled {
-        ctx.blocklist.profile_for(&client_ip, client_mac.as_deref())
+        ctx.blocklist.profile_for(client_ip, client_mac.as_deref())
     } else {
         None
     };
@@ -112,19 +117,17 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
         ctx.dns_cache
             .insert(&name, qtype, want_dnssec, custom_resp.clone());
         if !log_ignored {
-            let elapsed = start.elapsed().as_millis() as u32;
-            emit(
-                &ctx,
+            emit(&ctx, QueryStatus::Allowed, |status| {
                 make_entry(
-                    &name,
+                    name,
                     qtype,
-                    &client_ip,
-                    QueryStatus::Allowed,
-                    elapsed,
+                    client_text.unwrap_or_else(|| ip_to_string(client_addr)),
+                    status,
+                    start.elapsed().as_millis() as u32,
                     Some("custom".into()),
                     0,
-                ),
-            );
+                )
+            });
         }
         // Custom records carry an operator-chosen TTL, but they are still a
         // local override that can be edited live — cap them like everything else.
@@ -145,19 +148,17 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
     if filtering_enabled && ctx.blocklist.should_block_for(&name, profile.as_deref()) {
         tracing::debug!("blocked: {}", name);
         if !log_ignored {
-            let elapsed = start.elapsed().as_millis() as u32;
-            emit(
-                &ctx,
+            emit(&ctx, QueryStatus::Blocked, |status| {
                 make_entry(
-                    &name,
+                    name,
                     qtype,
-                    &client_ip,
-                    QueryStatus::Blocked,
-                    elapsed,
+                    client_text.unwrap_or_else(|| ip_to_string(client_addr)),
+                    status,
+                    start.elapsed().as_millis() as u32,
                     None,
                     3,
-                ),
-            );
+                )
+            });
         }
         return Ok(build_nxdomain(&query, client_ttl));
     }
@@ -169,22 +170,20 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
     // are runtime-mutable, so a cached redirect could outlive a deletion.
     if let Some(intercept) =
         ctx.interceptor
-            .maybe_intercept(&query, &name, qtype, &client_ip, client_mac.as_deref())
+            .maybe_intercept(&query, &name, qtype, client_ip, client_mac.as_deref())
     {
         if !log_ignored {
-            let elapsed = start.elapsed().as_millis() as u32;
-            emit(
-                &ctx,
+            emit(&ctx, QueryStatus::Routed, |status| {
                 make_entry(
-                    &name,
+                    name,
                     qtype,
-                    &client_ip,
-                    QueryStatus::Routed,
-                    elapsed,
+                    client_text.unwrap_or_else(|| ip_to_string(client_addr)),
+                    status,
+                    start.elapsed().as_millis() as u32,
                     Some(format!("proxy:{}", intercept.egress_id)),
                     0,
-                ),
-            );
+                )
+            });
         }
         return Ok(cap_ttls(
             patch_id(&intercept.response.bytes, query.id()),
@@ -202,37 +201,33 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
         {
             tracing::debug!("CNAME-blocked from cache: {} → {}", name, blocked_cname);
             if !log_ignored {
-                let elapsed = start.elapsed().as_millis() as u32;
-                emit(
-                    &ctx,
+                emit(&ctx, QueryStatus::Blocked, |status| {
                     make_entry(
-                        &name,
+                        name,
                         qtype,
-                        &client_ip,
-                        QueryStatus::Blocked,
-                        elapsed,
+                        client_text.unwrap_or_else(|| ip_to_string(client_addr)),
+                        status,
+                        start.elapsed().as_millis() as u32,
                         Some(format!("cname:{}", blocked_cname)),
                         3,
-                    ),
-                );
+                    )
+                });
             }
             return Ok(build_nxdomain(&query, client_ttl));
         }
 
         if !log_ignored {
-            let elapsed = start.elapsed().as_millis() as u32;
-            emit(
-                &ctx,
+            emit(&ctx, QueryStatus::Cached, |status| {
                 make_entry(
-                    &name,
+                    name,
                     qtype,
-                    &client_ip,
-                    QueryStatus::Cached,
-                    elapsed,
+                    client_text.unwrap_or_else(|| ip_to_string(client_addr)),
+                    status,
+                    start.elapsed().as_millis() as u32,
                     None,
                     0,
-                ),
-            );
+                )
+            });
         }
         return Ok(patch_cached(
             &cached.bytes,
@@ -274,19 +269,17 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
     {
         tracing::debug!("CNAME-blocked: {} → {}", name, blocked_cname);
         if !log_ignored {
-            let elapsed = start.elapsed().as_millis() as u32;
-            emit(
-                &ctx,
+            emit(&ctx, QueryStatus::Blocked, |status| {
                 make_entry(
-                    &name,
+                    name,
                     qtype,
-                    &client_ip,
-                    QueryStatus::Blocked,
-                    elapsed,
+                    client_text.unwrap_or_else(|| ip_to_string(client_addr)),
+                    status,
+                    start.elapsed().as_millis() as u32,
                     Some(format!("cname:{}", blocked_cname)),
                     3,
-                ),
-            );
+                )
+            });
         }
         return Ok(build_nxdomain(&query, client_ttl));
     }
@@ -314,19 +307,17 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
     }
 
     if !log_ignored {
-        let elapsed = start.elapsed().as_millis() as u32;
-        emit(
-            &ctx,
+        emit(&ctx, QueryStatus::Upstream, |status| {
             make_entry(
-                &name,
+                name,
                 qtype,
-                &client_ip,
-                QueryStatus::Upstream,
-                elapsed,
+                client_text.unwrap_or_else(|| ip_to_string(client_addr)),
+                status,
+                start.elapsed().as_millis() as u32,
                 upstream_label,
                 rcode,
-            ),
-        );
+            )
+        });
     }
 
     // Cap client-facing TTLs to the configured max. Cache hits are already
@@ -376,18 +367,19 @@ fn dnssec_ok(query: &LazyQuery) -> bool {
     }
 }
 
-fn emit(ctx: &DnsCtx, entry: QueryEntry) {
+fn emit(ctx: &DnsCtx, status: QueryStatus, entry: impl FnOnce(QueryStatus) -> QueryEntry) {
     // The counters are process-lifetime totals in RAM with no domain or client
     // in them, so they keep the dashboard honest even in the strictest privacy
     // mode and are always updated.
-    ctx.live_stats.record_query(&entry);
+    ctx.live_stats.record_query(status);
     // With both the query log and statistics switched off there is nothing
-    // downstream to record the entry into. The entry itself is already built by
-    // the time we get here — every call site constructs it inline — so this
-    // saves the channel hop and the writer's batch, not the allocation.
+    // downstream to record the entry into — so the entry is a closure, and a
+    // switched-off log costs the counters above and nothing else: no clock
+    // read, none of the three strings, no channel hop.
     if !ctx.record_switches.scope().records_anything() {
         return;
     }
+    let entry = entry(status);
     // try_send: if the channel is full we drop the stat rather than block DNS,
     // but count the drop and warn (rate-limited) so a stalled writer surfaces
     // instead of silently diverging the persisted log from the live counters.
@@ -402,10 +394,14 @@ fn emit(ctx: &DnsCtx, entry: QueryEntry) {
     }
 }
 
+/// The log row for a finished query. `domain` and `client_ip` are taken by
+/// value: this is the last thing a query does with either, and the entry owns
+/// them from here — copying them again is two allocations per query for
+/// nothing.
 fn make_entry(
-    domain: &str,
+    domain: String,
     query_type: u16,
-    client_ip: &str,
+    client_ip: String,
     status: QueryStatus,
     latency_ms: u32,
     upstream: Option<String>,
@@ -414,9 +410,9 @@ fn make_entry(
     QueryEntry {
         id: QUERY_COUNTER.fetch_add(1, Ordering::Relaxed),
         timestamp: Utc::now(),
-        domain: domain.to_string(),
+        domain,
         query_type,
-        client_ip: client_ip.to_string(),
+        client_ip,
         // Tagged by the stats writer at drain time (see stats/writer.rs).
         device: String::new(),
         status,
@@ -1255,14 +1251,14 @@ mod tests {
         let h = Harness::new("dns-emit-drop").await;
         // Keep the receiver alive (so try_send sees Full, not Closed) but never drain.
         let (tx, _rx) = mpsc::channel::<QueryEntry>(1);
-        let entry = || make_entry("x.test", 1, "192.0.2.1", QueryStatus::Upstream, 0, None, 0);
+        let entry = |status| make_entry("x.test".into(), 1, "192.0.2.1".into(), status, 0, None, 0);
 
         // Fill the single slot, then two further emits can't enqueue.
-        tx.try_send(entry()).unwrap();
+        tx.try_send(entry(QueryStatus::Upstream)).unwrap();
         let mut ctx = h.ctx();
         ctx.query_tx = tx.clone();
-        emit(&ctx, entry());
-        emit(&ctx, entry());
+        emit(&ctx, QueryStatus::Upstream, entry);
+        emit(&ctx, QueryStatus::Upstream, entry);
 
         assert_eq!(h.live_stats.dropped(), 2);
 
@@ -1273,12 +1269,12 @@ mod tests {
     async fn recording_switched_off_counts_the_query_but_sends_nothing() {
         let h = Harness::new("dns-emit-privacy").await;
         let (tx, mut rx) = mpsc::channel::<QueryEntry>(4);
-        let entry = || make_entry("x.test", 1, "192.0.2.1", QueryStatus::Blocked, 0, None, 0);
+        let entry = |status| make_entry("x.test".into(), 1, "192.0.2.1".into(), status, 0, None, 0);
 
         let mut ctx = h.ctx();
         ctx.query_tx = tx;
         ctx.record_switches = RecordSwitches::new(RecordScope::NONE);
-        emit(&ctx, entry());
+        emit(&ctx, QueryStatus::Blocked, entry);
 
         // The anonymous counters still move — the dashboard keeps working —
         // but nothing carrying a domain or a client reaches the pipeline.
@@ -1289,7 +1285,7 @@ mod tests {
 
         // Switched back on, the very next query flows again — no restart.
         ctx.record_switches.set_stats(true);
-        emit(&ctx, entry());
+        emit(&ctx, QueryStatus::Blocked, entry);
         assert_eq!(rx.try_recv().unwrap().domain, "x.test");
 
         cleanup_sqlite(&h.db_path);

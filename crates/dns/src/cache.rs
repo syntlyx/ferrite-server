@@ -133,6 +133,55 @@ impl DnsCache {
         key
     }
 
+    /// The longest key that fits the stack buffer below: a 255-byte name
+    /// (RFC 1035 §2.3.4) plus `/65535/do`.
+    const KEY_STACK_LEN: usize = 255 + 9;
+
+    /// Call `f` with the key for this lookup, built on the stack.
+    ///
+    /// A lookup only borrows the key to hash it, so the owned form above was an
+    /// allocation per query that the map dropped immediately — and `write!` for
+    /// the qtype cost more than the copy. An over-long name (reachable only
+    /// through escaped presentation forms) falls back to the owned key.
+    fn with_key<R>(name: &str, qtype: u16, dnssec: bool, f: impl FnOnce(&str) -> R) -> R {
+        let mut buf = [0u8; Self::KEY_STACK_LEN];
+        let mut len = name.len();
+        if len + 9 > buf.len() {
+            return f(&Self::cache_key(name, qtype, dnssec));
+        }
+        buf[..len].copy_from_slice(name.as_bytes());
+        buf[..len].make_ascii_lowercase();
+        buf[len] = b'/';
+        len += 1;
+        // The qtype, most significant digit first.
+        let mut digits = [0u8; 5];
+        let mut rest = qtype;
+        let mut count = 0;
+        loop {
+            digits[count] = b'0' + (rest % 10) as u8;
+            rest /= 10;
+            count += 1;
+            if rest == 0 {
+                break;
+            }
+        }
+        while count > 0 {
+            count -= 1;
+            buf[len] = digits[count];
+            len += 1;
+        }
+        if dnssec {
+            buf[len..len + 3].copy_from_slice(b"/do");
+            len += 3;
+        }
+        // The name is a `&str` and everything appended is ASCII, so this holds;
+        // the fallback keeps a surprise from turning into a panic.
+        match std::str::from_utf8(&buf[..len]) {
+            Ok(key) => f(key),
+            Err(_) => f(&Self::cache_key(name, qtype, dnssec)),
+        }
+    }
+
     /// Retrieve a cached entry. Returns `None` if not present or expired.
     /// Uses `peek` (shared lock, no LRU promotion) — expired entries are
     /// cleaned up by the janitor task rather than proactively here.
@@ -141,12 +190,13 @@ impl DnsCache {
     /// remaining TTL); this is retained for snapshot restore tests.
     #[allow(dead_code)]
     pub fn get(&self, name: &str, qtype: u16, dnssec: bool) -> Option<DnsResponse> {
-        let key = Self::cache_key(name, qtype, dnssec);
-        let guard = self.inner.read();
-        match guard.lru.peek(&key) {
-            Some(entry) if !entry.is_expired() => Some(entry.response.clone()),
-            _ => None,
-        }
+        Self::with_key(name, qtype, dnssec, |key| {
+            let guard = self.inner.read();
+            match guard.lru.peek(key) {
+                Some(entry) if !entry.is_expired() => Some(entry.response.clone()),
+                _ => None,
+            }
+        })
     }
 
     /// Like `get`, but also returns the entry's remaining lifetime in seconds.
@@ -158,19 +208,20 @@ impl DnsCache {
         qtype: u16,
         dnssec: bool,
     ) -> Option<(DnsResponse, u32)> {
-        let key = Self::cache_key(name, qtype, dnssec);
-        let guard = self.inner.read();
-        match guard.lru.peek(&key) {
-            Some(entry) if !entry.is_expired() => {
-                let remaining = entry
-                    .expires_at
-                    .saturating_duration_since(Instant::now())
-                    .as_secs()
-                    .min(u32::MAX as u64) as u32;
-                Some((entry.response.clone(), remaining))
+        Self::with_key(name, qtype, dnssec, |key| {
+            let guard = self.inner.read();
+            match guard.lru.peek(key) {
+                Some(entry) if !entry.is_expired() => {
+                    let remaining = entry
+                        .expires_at
+                        .saturating_duration_since(Instant::now())
+                        .as_secs()
+                        .min(u32::MAX as u64) as u32;
+                    Some((entry.response.clone(), remaining))
+                }
+                _ => None,
             }
-            _ => None,
-        }
+        })
     }
 
     /// Insert a DNS response into the cache.
@@ -204,8 +255,7 @@ impl DnsCache {
     /// Explicitly evict an entry.
     #[allow(dead_code)]
     pub fn evict(&self, name: &str, qtype: u16, dnssec: bool) {
-        let key = Self::cache_key(name, qtype, dnssec);
-        self.inner.write().pop(&key);
+        Self::with_key(name, qtype, dnssec, |key| self.inner.write().pop(key));
     }
 
     /// Total bytes currently accounted to cache entries.
@@ -334,6 +384,24 @@ pub async fn janitor(cache: std::sync::Arc<DnsCache>) {
 
 #[cfg(test)]
 mod tests {
+
+    /// The two key builders must agree exactly: a lookup uses the stack form,
+    /// the insert that stored the entry used the owned one.
+    #[test]
+    fn stack_and_owned_keys_agree() {
+        let long = "a".repeat(300);
+        for (name, qtype, dnssec) in [
+            ("example.com", 1u16, false),
+            ("Example.COM", 1, true),
+            ("a", 65_535, false),
+            ("", 0, true),
+            (long.as_str(), 28, true), // past the stack buffer → owned fallback
+        ] {
+            DnsCache::with_key(name, qtype, dnssec, |key| {
+                assert_eq!(key, DnsCache::cache_key(name, qtype, dnssec));
+            });
+        }
+    }
     use super::*;
 
     fn response(ttl: u32) -> DnsResponse {

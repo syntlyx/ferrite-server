@@ -53,10 +53,13 @@ impl LiveStats {
         })
     }
 
-    /// Called in the DNS handler hot path — only atomic ops, no locking.
-    pub fn record_query(&self, entry: &QueryEntry) {
+    /// Called in the DNS handler hot path — only atomic ops, no locking. Takes
+    /// the status alone: these counters carry no domain and no client, so they
+    /// don't need the log entry, and the entry isn't built at all when nothing
+    /// downstream is recording.
+    pub fn record_query(&self, status: QueryStatus) {
         self.total_queries.fetch_add(1, Ordering::Relaxed);
-        match entry.status {
+        match status {
             QueryStatus::Blocked => {
                 self.total_blocked.fetch_add(1, Ordering::Relaxed);
             }
@@ -92,7 +95,7 @@ impl LiveStats {
         let scope = switches.scope();
 
         if scope.stats {
-            let status = entry.status.clone();
+            let status = entry.status;
             self.top_domains.increment(&entry.domain);
             if status == QueryStatus::Blocked {
                 self.top_blocked.increment(&entry.domain);
