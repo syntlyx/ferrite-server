@@ -187,9 +187,60 @@ async fn load_fresh_text_cache(path: &Path) -> Option<Vec<String>> {
     }
 }
 
+/// Write the per-list domain cache, one bounded chunk at a time, through a
+/// sibling temporary file that replaces the cache only once it is complete.
+///
+/// `domains.join("\n")` materialised the whole list a second time: a two-million
+/// entry list is some 40 MB in one contiguous allocation, on a box whose entire
+/// memory target is 20 MB — and at the worst possible moment, with the refresh
+/// already holding the list as a `Vec<String>` and about to build an FST from
+/// it. Chunking holds 64 KB instead. Replacing by rename also means a write cut
+/// short (full disk, power loss) leaves the previous cache intact rather than a
+/// truncated list that would silently unblock everything past the cut.
 async fn save_text_cache(path: &Path, domains: &[String]) {
-    if let Err(e) = tokio::fs::write(path, domains.join("\n")).await {
+    use tokio::io::AsyncWriteExt;
+
+    const CHUNK_BYTES: usize = 64 * 1024;
+    let temp = path.with_extension("tmp");
+    let mut file = match tokio::fs::File::create(&temp).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!("could not write domain cache {}: {}", path.display(), e);
+            return;
+        }
+    };
+    let mut chunk = String::with_capacity(CHUNK_BYTES + 256);
+    let mut failed = false;
+    for (i, domain) in domains.iter().enumerate() {
+        if i > 0 {
+            chunk.push('\n');
+        }
+        chunk.push_str(domain);
+        if chunk.len() >= CHUNK_BYTES {
+            if let Err(e) = file.write_all(chunk.as_bytes()).await {
+                tracing::warn!("could not write domain cache {}: {}", path.display(), e);
+                failed = true;
+                break;
+            }
+            chunk.clear();
+        }
+    }
+    if !failed && let Err(e) = file.write_all(chunk.as_bytes()).await {
         tracing::warn!("could not write domain cache {}: {}", path.display(), e);
+        failed = true;
+    }
+    if !failed && let Err(e) = file.flush().await {
+        tracing::warn!("could not flush domain cache {}: {}", path.display(), e);
+        failed = true;
+    }
+    drop(file);
+    if failed {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return;
+    }
+    if let Err(e) = tokio::fs::rename(&temp, path).await {
+        tracing::warn!("could not replace domain cache {}: {}", path.display(), e);
+        let _ = tokio::fs::remove_file(&temp).await;
     }
 }
 
@@ -230,4 +281,45 @@ pub(super) fn sanitize_name(name: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The chunked writer must produce exactly what the reader expects, across
+    /// chunk boundaries — a separator dropped or doubled at a 64 KB edge would
+    /// quietly corrupt a cached list.
+    #[tokio::test]
+    async fn domain_cache_round_trips_across_chunk_boundaries() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrite-domain-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("list.txt");
+
+        // Well past 64 KB, so several chunks are written.
+        let domains: Vec<String> = (0..20_000)
+            .map(|i| format!("host{i}.example.com"))
+            .collect();
+        save_text_cache(&path, &domains).await;
+        assert_eq!(load_fresh_text_cache(&path).await.unwrap(), domains);
+
+        // A shorter list replaces the longer one wholesale (no leftover tail).
+        let short = vec!["only.example.com".to_string()];
+        save_text_cache(&path, &short).await;
+        assert_eq!(load_fresh_text_cache(&path).await.unwrap(), short);
+
+        // Empty list: a file with nothing in it, and no stale temporary left behind.
+        save_text_cache(&path, &[]).await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        assert!(!path.with_extension("tmp").exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
