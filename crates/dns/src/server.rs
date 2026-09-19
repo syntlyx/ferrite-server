@@ -119,14 +119,12 @@ async fn udp_loop(socket: UdpSocket, ctx: Arc<DnsCtx>) -> anyhow::Result<()> {
 /// The client's maximum UDP payload size: 512 bytes by default (RFC 1035), or
 /// the EDNS0 advertised size (clamped to our receive buffer) when the query
 /// carries an OPT record. Falls back to 512 for unparseable queries.
+///
+/// One EDNS field is not worth decoding the whole message for — this runs on
+/// every datagram, before the handler has even started — so it walks the wire
+/// bytes instead.
 fn client_udp_payload(query: &[u8]) -> usize {
-    use hickory_proto::op::Message;
-    use hickory_proto::serialize::binary::BinDecodable;
-    // `Message::max_payload()` already returns the EDNS0 advertised size with a
-    // 512-byte floor; we just cap it to our own receive buffer.
-    Message::from_bytes(query)
-        .map(|m| (m.max_payload() as usize).min(MAX_UDP_PAYLOAD))
-        .unwrap_or(512)
+    ferrite_core::wire::udp_payload(query).min(MAX_UDP_PAYLOAD)
 }
 
 /// Build a minimal truncated response from `resp`: the 12-byte header with the
@@ -145,7 +143,7 @@ fn truncate_response(resp: &[u8]) -> Vec<u8> {
     out[9] = 0; // NSCOUNT = 0
     out[10] = 0;
     out[11] = 0; // ARCOUNT = 0
-    match ferrite_core::types::question_end(resp) {
+    match ferrite_core::wire::question_end(resp) {
         Some(end) => out.extend_from_slice(&resp[12..end]),
         // No parseable question — keep the header consistent by zeroing QDCOUNT.
         None => {
@@ -288,7 +286,7 @@ mod udp_tests {
         // A "response": query bytes with QR set and a fake oversized answer tail.
         let mut resp = query_no_edns();
         resp[2] |= 0x80; // QR
-        let q_end = ferrite_core::types::question_end(&resp).unwrap();
+        let q_end = ferrite_core::wire::question_end(&resp).unwrap();
         resp.truncate(q_end);
         resp.extend_from_slice(&[0xFF; 200]); // pretend answer payload
 

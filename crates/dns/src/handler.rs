@@ -5,8 +5,8 @@ use std::time::Instant;
 
 use chrono::Utc;
 use hickory_proto::op::{Edns, Message, OpCode, ResponseCode};
-use hickory_proto::rr::RData;
 use hickory_proto::rr::rdata::opt::EdnsCode;
+use hickory_proto::rr::{RData, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use tokio::sync::mpsc;
 
@@ -15,6 +15,7 @@ use crate::types::DnsResponse;
 use ferrite_core::error::Result;
 use ferrite_core::net::unmap_v4;
 use ferrite_core::types::{QueryEntry, QueryStatus};
+use ferrite_core::wire;
 
 static QUERY_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -158,7 +159,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
                 ),
             );
         }
-        return Ok(build_nxdomain(&query, client_ttl));
+        return Ok(build_nxdomain(&query, &raw, client_ttl));
     }
 
     // ── Step 3: Selective routing / proxy interception ────────────────────
@@ -215,7 +216,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
                     ),
                 );
             }
-            return Ok(build_nxdomain(&query, client_ttl));
+            return Ok(build_nxdomain(&query, &raw, client_ttl));
         }
 
         if !log_ignored {
@@ -250,7 +251,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
             // Only trust a response we can actually decode. Unparseable bytes
             // are turned into SERVFAIL so they're never cached (step 6 caches
             // rcode==0 only) or served as if they were a valid NOERROR answer.
-            Ok((bytes, label)) => match parse_rcode(&bytes) {
+            Ok((bytes, label)) => match wire::rcode(&bytes) {
                 Some(rc) => (bytes, rc, Some(label)),
                 None => {
                     tracing::warn!("undecodable response from upstream {} for {}", label, name);
@@ -287,7 +288,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
                 ),
             );
         }
-        return Ok(build_nxdomain(&query, client_ttl));
+        return Ok(build_nxdomain(&query, &raw, client_ttl));
     }
 
     // ── Step 7: Cache NOERROR responses ───────────────────────────────────
@@ -296,7 +297,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
     // responses are cached under the RFC 2308 negative TTL from the authority
     // SOA, or skipped when no SOA is present.
     if rcode == 0 && !response_bytes.is_empty() {
-        match cache_ttl(&response_bytes) {
+        match wire::cache_ttl(&response_bytes) {
             Some(ttl) => {
                 ctx.dns_cache.insert(
                     &name,
@@ -390,6 +391,11 @@ fn make_entry(
     }
 }
 
+/// The synthetic SOA's MNAME and RNAME, wire-encoded. Only the TTL and MINIMUM
+/// carry meaning for a resolver; the names are cosmetic, and `.invalid`
+/// (RFC 2606) can never collide with a real zone.
+const SOA_ADMIN_NAME: &[u8] = b"\x07ferrite\x07invalid\x00";
+
 /// NXDOMAIN for a blocked name, carrying an SOA in the authority section so the
 /// client's *negative* caching is bounded by `ttl` too.
 ///
@@ -399,7 +405,45 @@ fn make_entry(
 /// the whitelist) apply instantly on the server and stay broken on a device for
 /// an unpredictable while. The SOA's own TTL and its MINIMUM field are both set
 /// to `ttl`, since the negative-cache lifetime is the smaller of the two.
-fn build_nxdomain(query: &Message, ttl: u32) -> Vec<u8> {
+fn build_nxdomain(query: &Message, raw: &[u8], ttl: u32) -> Vec<u8> {
+    // A block is the one answer ferrite invents on its own, and on a filtered
+    // network it invents a great many of them — so it is written straight onto
+    // the wire. The response builder would otherwise re-parse `ferrite.invalid.`
+    // into labels, clone the question's name and re-encode the whole message on
+    // every blocked query. Anything but the single-question shape every resolver
+    // actually sends falls through to that builder below.
+    if let Some(q_end) = wire::question_end(raw)
+        && u16::from_be_bytes([raw[4], raw[5]]) == 1
+    {
+        // MNAME, an RNAME pointing at it, and the five 32-bit fields.
+        let rdata_len = SOA_ADMIN_NAME.len() + 2 + 20;
+        let mut out = Vec::with_capacity(q_end + 12 + rdata_len);
+        out.extend_from_slice(&raw[..q_end]); // header + question, ID included
+        // QR=1, opcode QUERY, AA=1, TC=0, RD echoed (RFC 1035 §4.1.1).
+        out[2] = 0b1000_0100 | (raw[2] & 0x01);
+        // RA=1 — we do recurse — and RCODE=NXDOMAIN.
+        out[3] = 0b1000_0000 | ResponseCode::NXDomain.low();
+        // ANCOUNT=0, NSCOUNT=1 (the SOA below), ARCOUNT=0.
+        out[6..12].copy_from_slice(&[0, 0, 0, 1, 0, 0]);
+        // Authority SOA, owner = the queried name as a pointer to the question.
+        out.extend_from_slice(&[0xC0, wire::HEADER_LEN as u8]);
+        out.extend_from_slice(&u16::from(RecordType::SOA).to_be_bytes());
+        out.extend_from_slice(&1u16.to_be_bytes()); // CLASS = IN
+        out.extend_from_slice(&ttl.to_be_bytes());
+        out.extend_from_slice(&(rdata_len as u16).to_be_bytes());
+        // MNAME, then RNAME as a pointer to it — the same name twice, and the
+        // encoder would compress it the same way.
+        let mname_off = (q_end + 12) as u16;
+        out.extend_from_slice(SOA_ADMIN_NAME);
+        out.extend_from_slice(&(0xC000 | mname_off).to_be_bytes());
+        out.extend_from_slice(&1u32.to_be_bytes()); // serial
+        // refresh, retry, expire, and MINIMUM — one half of the negative-cache
+        // lifetime, the other being the record TTL above.
+        for field in [ttl; 4] {
+            out.extend_from_slice(&field.to_be_bytes());
+        }
+        return out;
+    }
     let mut resp = Message::response(query.metadata.id, OpCode::Query);
     resp.metadata.authoritative = true;
     // RFC 1035 §4.1.1: RD must be echoed; RA indicates we support recursion.
@@ -462,6 +506,32 @@ fn cname_blocked_target(
     if blocklist.is_allowed_for(queried_name, profile) {
         return None;
     }
+    // Walk the answer section where it lies. This check runs on every cache hit
+    // and every upstream answer, and the overwhelming majority carry no CNAME
+    // at all — decoding the whole message to find that out costs more than the
+    // check itself.
+    match wire::find_cname_target(response_bytes, |target| {
+        blocklist.should_block_for(target, profile)
+    }) {
+        wire::CnameScan::Matched(target) => Some(target),
+        wire::CnameScan::NoMatch => None,
+        // An IDN or otherwise escaped target: only the full parser renders it
+        // the way every other domain in ferrite is spelled, so defer to it
+        // rather than match the blocklist against a second spelling.
+        wire::CnameScan::Unsupported => {
+            cname_blocked_target_decoded(response_bytes, blocklist, profile)
+        }
+    }
+}
+
+/// [`cname_blocked_target`]'s fallback for answers the wire walker won't render
+/// (IDN labels, labels needing escapes). Decodes the message so the target is
+/// spelled exactly as `Name::to_utf8` would.
+fn cname_blocked_target_decoded(
+    response_bytes: &[u8],
+    blocklist: &ferrite_blocklist::Blocklist,
+    profile: Option<&ferrite_blocklist::CompiledProfile>,
+) -> Option<String> {
     let msg = Message::from_bytes(response_bytes).ok()?;
     for record in &msg.answers {
         if let RData::CNAME(cname) = &record.data {
@@ -475,22 +545,10 @@ fn cname_blocked_target(
     None
 }
 
-/// Extract RCODE from raw DNS response bytes, or `None` if the bytes can't be
-/// decoded as a DNS message (so the caller can avoid trusting/caching garbage).
-fn parse_rcode(bytes: &[u8]) -> Option<u8> {
-    Message::from_bytes(bytes)
-        .ok()
-        .map(|m| u16::from(m.metadata.response_code).min(255) as u8)
-}
-
 /// Patch the DNS message ID in raw wire bytes (bytes 0-1 = ID, big-endian).
 fn patch_id(bytes: &[u8], id: u16) -> Vec<u8> {
     let mut out = bytes.to_vec();
-    if out.len() >= 2 {
-        let [hi, lo] = id.to_be_bytes();
-        out[0] = hi;
-        out[1] = lo;
-    }
+    wire::set_id(&mut out, id);
     out
 }
 
@@ -500,56 +558,32 @@ fn patch_id(bytes: &[u8], id: u16) -> Vec<u8> {
 /// 3600 and served 3500s later would still advertise 3600, causing downstream
 /// clients to over-cache well past the authoritative expiry (RFC 2181 §5.1).
 ///
-/// EDNS OPT records live in `Message::edns`, not in `answers`, so rewriting
-/// answer TTLs never corrupts the OPT pseudo-record. If the bytes can't be
-/// decoded we fall back to an ID-only patch.
+/// Both rewrites happen on the copy itself — this is the hottest path in the
+/// whole pipeline, and decoding the entry only to re-encode it costs more than
+/// everything else a cache hit does put together. TTLs are rewritten in every
+/// record section (answers, authority SOA, additionals) so downstream resolvers
+/// don't over-cache past the entry's expiry — in particular the SOA
+/// negative-cache TTL for NODATA responses, which lives in the authority
+/// section. The EDNS OPT pseudo-record is skipped: its TTL slot is
+/// flags/version, not a lifetime. Bytes that don't walk cleanly keep their
+/// TTLs and get the ID patch alone.
 fn patch_cached(bytes: &[u8], id: u16, remaining_ttl: u32) -> Vec<u8> {
-    match Message::from_bytes(bytes) {
-        Ok(mut msg) => {
-            msg.metadata.id = id;
-            // Rewrite TTLs in every record section (answers, authority SOA,
-            // additionals) so downstream resolvers don't over-cache past the
-            // entry's expiry — in particular the SOA negative-cache TTL for
-            // NODATA responses, which lives in the authority section.
-            for rr in msg
-                .answers
-                .iter_mut()
-                .chain(msg.authorities.iter_mut())
-                .chain(msg.additionals.iter_mut())
-            {
-                rr.ttl = remaining_ttl;
-            }
-            msg.to_bytes().unwrap_or_else(|_| patch_id(bytes, id))
-        }
-        Err(_) => patch_id(bytes, id),
-    }
+    let mut out = bytes.to_vec();
+    wire::set_id(&mut out, id);
+    wire::set_ttls(&mut out, remaining_ttl);
+    out
 }
 
 /// Cap every record TTL in a response to `max_ttl` so no client caches an answer
-/// longer than the operator's ceiling. Returns the bytes unchanged when nothing
-/// exceeds the cap (the common case — only reserializes when needed) or the
-/// message can't be decoded. EDNS OPT lives in `Message::edns`, not the record
-/// sections, so its pseudo-TTL (flags/version) is never touched.
-fn cap_ttls(bytes: Vec<u8>, max_ttl: u32) -> Vec<u8> {
-    let Ok(mut msg) = Message::from_bytes(&bytes) else {
-        return bytes;
-    };
-    let mut changed = false;
-    for rr in msg
-        .answers
-        .iter_mut()
-        .chain(msg.authorities.iter_mut())
-        .chain(msg.additionals.iter_mut())
-    {
-        if rr.ttl > max_ttl {
-            rr.ttl = max_ttl;
-            changed = true;
-        }
-    }
-    if !changed {
-        return bytes;
-    }
-    msg.to_bytes().unwrap_or(bytes)
+/// longer than the operator's ceiling. Rewritten in place, so what the client
+/// receives is the upstream's own answer with shorter lifetimes — not a
+/// re-encoding of it, which is free to compress names differently or lose a
+/// record type hickory has no model for. Bytes that don't walk cleanly are
+/// returned untouched. The EDNS OPT pseudo-record is skipped: its TTL slot is
+/// flags/version, not a lifetime.
+fn cap_ttls(mut bytes: Vec<u8>, max_ttl: u32) -> Vec<u8> {
+    wire::cap_ttls(&mut bytes, max_ttl);
+    bytes
 }
 
 /// Returns true if the domain should be silently dropped from the query log.
@@ -571,25 +605,13 @@ fn is_log_ignored(name: &str, patterns: &[String]) -> bool {
     false
 }
 
-/// TTL (seconds) to cache a NOERROR response under, or `None` to skip caching.
-///
-/// Positive answers use the minimum answer-record TTL. Empty (NODATA) answers
-/// use the RFC 2308 negative-cache TTL derived from the authority-section SOA
-/// (the lesser of the SOA record TTL and its MINIMUM field). A TTL of 0 — or a
-/// NODATA response with no SOA to bound it — is not cached.
-fn cache_ttl(bytes: &[u8]) -> Option<u32> {
-    let msg = Message::from_bytes(bytes).ok()?;
-    if !msg.answers.is_empty() {
-        let min = msg.answers.iter().map(|rr| rr.ttl).min()?;
-        return (min > 0).then_some(min);
-    }
-    // NODATA: the negative-cache lifetime lives in the authority-section SOA.
-    let neg = msg.authorities.iter().find_map(|rr| match &rr.data {
-        RData::SOA(soa) => Some(rr.ttl.min(soa.minimum)),
-        _ => None,
-    })?;
-    (neg > 0).then_some(neg)
-}
+/// Payload size advertised upstream when we ask for DNSSEC: the DNS-flag-day-2020
+/// / RFC 8900 anti-fragmentation value. It overrides whatever the client
+/// advertised in both directions — a tiny client buffer (e.g. 512) would force
+/// the resolver to truncate every signed answer, costing a TCP round trip per
+/// query; an oversized one (e.g. 4096) risks IP fragmentation on the path to the
+/// upstream, which is both unreliable and a cache-poisoning vector.
+const UPSTREAM_UDP_PAYLOAD: u16 = 1232;
 
 /// Harden a client query before it leaves ferrite: with `strip_ecs`, drop the
 /// EDNS Client Subnet option (so the upstream resolver never learns the client's
@@ -602,6 +624,23 @@ fn cache_ttl(bytes: &[u8]) -> Option<u32> {
 /// same name must never share an entry. Returns the original bytes on any
 /// parse/encode error — a sanitization hiccup must never break forwarding.
 fn sanitize_query(raw: &[u8], strip_ecs: bool, want_do: bool) -> Vec<u8> {
+    // Fast path: both fields we normally touch — the DO bit and the advertised
+    // payload size — live in the OPT pseudo-record's fixed part, so they can be
+    // overwritten where they sit. Only dropping an ECS option (just the clients
+    // that send one) or adding a missing OPT record needs the encoder.
+    match wire::edns(raw) {
+        wire::EdnsScan::Opt(opt) if !(strip_ecs && opt.has_ecs) => {
+            let mut out = raw.to_vec();
+            wire::set_dnssec_ok(&mut out, &opt, want_do);
+            if want_do {
+                wire::set_udp_payload(&mut out, &opt, UPSTREAM_UDP_PAYLOAD);
+            }
+            return out;
+        }
+        // No OPT record and none wanted: the query already says what we mean.
+        wire::EdnsScan::None if !want_do => return raw.to_vec(),
+        _ => {}
+    }
     let Ok(mut msg) = Message::from_bytes(raw) else {
         return raw.to_vec();
     };
@@ -609,15 +648,8 @@ fn sanitize_query(raw: &[u8], strip_ecs: bool, want_do: bool) -> Vec<u8> {
         edns.options_mut().remove(EdnsCode::Subnet);
     }
     if want_do {
-        // Request DNSSEC (DO bit) and normalize the upstream UDP payload to 1232
-        // bytes — the DNS-flag-day-2020 / RFC 8900 anti-fragmentation value. We
-        // override whatever the client advertised in both directions: a tiny
-        // client buffer (e.g. 512) would force the resolver to truncate every
-        // signed answer, costing a TCP round trip per query; an oversized buffer
-        // (e.g. 4096) risks IP fragmentation on the path to the upstream, which
-        // is both unreliable and a cache-poisoning vector. 1232 is the sweet spot.
         let edns = msg.edns.get_or_insert_with(Edns::new);
-        edns.set_max_payload(1232);
+        edns.set_max_payload(UPSTREAM_UDP_PAYLOAD);
         edns.set_dnssec_ok(true);
     } else if let Some(edns) = msg.edns.as_mut() {
         // No DNSSEC wanted for this query (client didn't ask, or the feature is
@@ -933,16 +965,52 @@ mod tests {
 
     #[test]
     fn nxdomain_response_echoes_query_context() {
-        let bytes = build_nxdomain(&query("blocked.test", RecordType::A), 60);
-        let msg = Message::from_bytes(&bytes).unwrap();
+        let q = query("blocked.test", RecordType::A);
+        let raw = q.to_bytes().unwrap();
+        // The wire-built answer and the encoder-built one (reached by handing
+        // the builder bytes it can't read a question out of) are the same
+        // answer down to the byte — the fallback is the reference
+        // implementation, and this is what pins the hand-written one to it.
+        assert_eq!(build_nxdomain(&q, &raw, 60), build_nxdomain(&q, &[], 60));
+        for bytes in [build_nxdomain(&q, &raw, 60), build_nxdomain(&q, &[], 60)] {
+            let msg = Message::from_bytes(&bytes).unwrap();
 
-        assert_eq!(msg.metadata.id, 0xCAFE);
-        assert_eq!(msg.metadata.response_code, ResponseCode::NXDomain);
-        assert!(msg.metadata.authoritative);
-        assert!(msg.metadata.recursion_desired);
+            assert_eq!(msg.metadata.id, 0xCAFE);
+            assert_eq!(msg.metadata.response_code, ResponseCode::NXDomain);
+            assert!(msg.metadata.authoritative);
+            assert!(msg.metadata.recursion_desired);
+            assert!(msg.metadata.recursion_available);
+            assert_eq!(msg.queries.len(), 1);
+            assert_eq!(msg.queries[0].name().to_utf8(), "blocked.test.");
+            assert_eq!(msg.queries[0].query_type(), RecordType::A);
+            assert!(msg.answers.is_empty());
+
+            // The SOA is what bounds the client's negative caching.
+            assert_eq!(msg.authorities.len(), 1);
+            let soa_rr = &msg.authorities[0];
+            assert_eq!(soa_rr.name.to_utf8(), "blocked.test.");
+            assert_eq!(soa_rr.ttl, 60);
+            let RData::SOA(soa) = &soa_rr.data else {
+                panic!("authority is not an SOA");
+            };
+            assert_eq!(soa.mname.to_utf8(), "ferrite.invalid.");
+            assert_eq!(soa.rname.to_utf8(), "ferrite.invalid.");
+            assert_eq!(soa.minimum, 60);
+            assert_eq!(soa.serial, 1);
+            assert_eq!(soa.refresh, 60);
+            assert_eq!(soa.retry, 60);
+            assert_eq!(soa.expire, 60);
+        }
+    }
+
+    #[test]
+    fn nxdomain_echoes_a_cleared_recursion_desired_bit() {
+        let mut q = query("blocked.test", RecordType::A);
+        q.metadata.recursion_desired = false;
+        let raw = q.to_bytes().unwrap();
+        let msg = Message::from_bytes(&build_nxdomain(&q, &raw, 60)).unwrap();
+        assert!(!msg.metadata.recursion_desired);
         assert!(msg.metadata.recursion_available);
-        assert_eq!(msg.queries.len(), 1);
-        assert_eq!(msg.queries[0].name().to_utf8(), "blocked.test.");
     }
 
     #[test]
@@ -968,11 +1036,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_rcode_reads_response_code_from_wire_bytes() {
+    fn rcode_reads_response_code_from_wire_bytes() {
         let bytes = build_servfail(&query("broken.test", RecordType::A));
 
-        assert_eq!(parse_rcode(&bytes), Some(2));
-        assert_eq!(parse_rcode(b"not dns"), None);
+        assert_eq!(wire::rcode(&bytes), Some(2));
+        assert_eq!(wire::rcode(b"not dns"), None);
     }
 
     #[test]
@@ -991,7 +1059,7 @@ mod tests {
             RData::A(A(Ipv4Addr::new(192, 0, 2, 2))),
         ));
 
-        assert_eq!(cache_ttl(&resp.to_bytes().unwrap()), Some(45));
+        assert_eq!(wire::cache_ttl(&resp.to_bytes().unwrap()), Some(45));
     }
 
     #[test]
@@ -1005,7 +1073,7 @@ mod tests {
             RData::A(A(Ipv4Addr::new(192, 0, 2, 1))),
         ));
 
-        assert_eq!(cache_ttl(&resp.to_bytes().unwrap()), None);
+        assert_eq!(wire::cache_ttl(&resp.to_bytes().unwrap()), None);
     }
 
     #[test]
@@ -1029,7 +1097,7 @@ mod tests {
         resp.authorities.push(soa_rr);
 
         // min(record TTL 120, SOA MINIMUM 30) = 30.
-        assert_eq!(cache_ttl(&resp.to_bytes().unwrap()), Some(30));
+        assert_eq!(wire::cache_ttl(&resp.to_bytes().unwrap()), Some(30));
     }
 
     #[test]
@@ -1038,7 +1106,7 @@ mod tests {
         let mut resp = Message::response(query.metadata.id, OpCode::Query);
         resp.add_queries(query.queries.iter().cloned());
 
-        assert_eq!(cache_ttl(&resp.to_bytes().unwrap()), None);
+        assert_eq!(wire::cache_ttl(&resp.to_bytes().unwrap()), None);
     }
 
     #[test]
