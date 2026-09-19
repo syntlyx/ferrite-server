@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use dashmap::{DashMap, DashSet};
 use ring::rand::{SecureRandom, SystemRandom};
 
+use ferrite_core::recording::RecordSwitches;
 use ferrite_storage::Storage;
 use ferrite_upstream::ZoneRouter;
 
@@ -88,6 +89,12 @@ pub struct ClientRegistry {
     last_binding_touch: AtomicI64,
     upstream: Arc<ZoneRouter>,
     storage: Arc<dyn Storage>,
+    /// The same switches the query log and statistics answer to. A device
+    /// inventory — which MACs are on this network, and what they are called —
+    /// is not query history, but it is still a record of the household, and
+    /// "record nothing" has to mean nothing. In memory it keeps working (names
+    /// in the UI, device attribution); what stops is writing it down.
+    switches: Arc<RecordSwitches>,
 }
 
 // ── Public utilities ──────────────────────────────────────────────────────────

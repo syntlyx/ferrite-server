@@ -151,6 +151,12 @@ pub trait Storage: Send + Sync {
     /// and manual aliases intact; used when the query log is cleared.
     async fn delete_all_ip_bindings(&self) -> Result<()>;
 
+    /// Drop every learned device name. Manual aliases are configuration and
+    /// survive; this is for the privacy switches, where a list of the MACs on
+    /// the network and what they call themselves is exactly what "record
+    /// nothing" must not leave behind.
+    async fn delete_all_devices(&self) -> Result<()>;
+
     /// Refresh `last_seen = now` for the given IPs (currently-present devices), so
     /// age-based pruning keeps live bindings and only expires long-absent ones.
     /// No-op on an empty slice.

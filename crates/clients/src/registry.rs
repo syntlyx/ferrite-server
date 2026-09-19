@@ -12,7 +12,12 @@ use ferrite_core::net::{format_mac, parse_ip, parse_mac, unmap_v4};
 use super::{BINDING_RETENTION, BINDING_TOUCH_INTERVAL, ClientRegistry, DashMap, DashSet};
 
 impl ClientRegistry {
-    pub async fn new(upstream: Arc<ZoneRouter>, storage: Arc<dyn Storage>) -> Arc<Self> {
+    pub async fn new(
+        upstream: Arc<ZoneRouter>,
+        storage: Arc<dyn Storage>,
+        switches: Arc<ferrite_core::recording::RecordSwitches>,
+    ) -> Arc<Self> {
+        let recording = switches.scope().records_anything();
         let registry = Arc::new(Self {
             ptr_cache: DashMap::new(),
             ip_aliases: DashMap::new(),
@@ -24,6 +29,7 @@ impl ClientRegistry {
             last_binding_touch: std::sync::atomic::AtomicI64::new(0),
             upstream,
             storage,
+            switches,
         });
 
         match registry.storage.load_client_aliases().await {
@@ -49,6 +55,15 @@ impl ClientRegistry {
                 );
             }
             Err(e) => tracing::warn!("failed to load client aliases: {}", e),
+        }
+
+        // With recording switched off the inventory on disk is not ours to read
+        // back: "off stops recording and stops serving what was recorded" holds
+        // for devices the same as it does for the query log. Manual aliases
+        // above are configuration, not a record, and always load.
+        if !recording {
+            tracing::info!("recording disabled — device inventory not restored");
+            return registry;
         }
 
         // Restore learned device identities. Names are inserted already-expired
@@ -244,6 +259,23 @@ impl ClientRegistry {
         self.ptr_cache.clear();
         self.ip_to_mac.clear();
         self.mac_to_ips.clear();
+        Ok(())
+    }
+
+    /// Forget the learned device inventory entirely — bindings, names, and the
+    /// PTR cache — on disk and in memory. Manual aliases are configuration and
+    /// stay.
+    ///
+    /// Called when the privacy switches go to "record nothing": a household's
+    /// device list is not query history, but it is still a record, and leaving
+    /// it behind would make the switch a half-truth.
+    pub async fn forget_learned_devices(&self) -> Result<()> {
+        self.storage.delete_all_ip_bindings().await?;
+        self.storage.delete_all_devices().await?;
+        self.ptr_cache.clear();
+        self.ip_to_mac.clear();
+        self.mac_to_ips.clear();
+        self.mac_to_name.clear();
         Ok(())
     }
 
@@ -444,6 +476,13 @@ mod tests {
     }
 
     async fn registry(db: &std::path::Path) -> Arc<ClientRegistry> {
+        registry_with(db, ferrite_core::recording::RecordScope::ALL).await
+    }
+
+    async fn registry_with(
+        db: &std::path::Path,
+        scope: ferrite_core::recording::RecordScope,
+    ) -> Arc<ClientRegistry> {
         let storage = SqliteStorage::open(db).await.unwrap();
         let upstream = ZoneRouter::new(
             &[],
@@ -458,7 +497,12 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        ClientRegistry::new(upstream, storage as Arc<dyn Storage>).await
+        ClientRegistry::new(
+            upstream,
+            storage as Arc<dyn Storage>,
+            ferrite_core::recording::RecordSwitches::new(scope),
+        )
+        .await
     }
 
     /// The reverse index has to answer exactly what a scan of `ip_to_mac`
@@ -499,6 +543,66 @@ mod tests {
         reg.clear_learned_ips().await.unwrap();
         assert!(reg.addrs_for_device(&format_mac(&laptop)).is_empty());
         assert!(reg.ip_to_mac.is_empty());
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// "Record nothing" has to cover the device inventory too: with both
+    /// switches off, nothing a device tells us about itself reaches the disk,
+    /// and what an earlier session wrote is not read back.
+    #[tokio::test]
+    async fn recording_off_keeps_the_device_inventory_off_disk() {
+        use ferrite_core::recording::RecordScope;
+
+        let db = temp_db("clients-recording-off");
+        let laptop = [0xaa, 0xbb, 0xcc, 0x11, 0x22, 0x33];
+        let ip: IpAddr = "192.168.1.10".parse().unwrap();
+
+        // Recording on: the inventory is written, as it always was.
+        {
+            let reg = registry_with(&db, RecordScope::ALL).await;
+            reg.persist_binding(ip, laptop).await;
+            reg.cache_mac(laptop, "laptop").await;
+            let storage = SqliteStorage::open(&db).await.unwrap();
+            assert_eq!(storage.load_ip_bindings().await.unwrap().len(), 1);
+            assert_eq!(storage.load_devices().await.unwrap().len(), 1);
+        }
+
+        // Recording off: nothing new is written…
+        {
+            let reg = registry_with(&db, RecordScope::NONE).await;
+            let phone = [0xaa, 0xbb, 0xcc, 0x44, 0x55, 0x66];
+            reg.persist_binding("192.168.1.11".parse().unwrap(), phone)
+                .await;
+            reg.cache_mac(phone, "phone").await;
+            let storage = SqliteStorage::open(&db).await.unwrap();
+            assert_eq!(
+                storage.load_ip_bindings().await.unwrap().len(),
+                1,
+                "a binding was written while recording was off"
+            );
+            assert_eq!(
+                storage.load_devices().await.unwrap().len(),
+                1,
+                "a device name was written while recording was off"
+            );
+
+            // …and what the earlier session wrote is not served back.
+            assert!(reg.get_mac(ip).is_none(), "an old binding was restored");
+            assert!(
+                reg.get_name(ip).is_none(),
+                "an old device name was restored"
+            );
+        }
+
+        // And the explicit scrub takes the earlier session's inventory with it.
+        {
+            let reg = registry_with(&db, RecordScope::ALL).await;
+            reg.forget_learned_devices().await.unwrap();
+            let storage = SqliteStorage::open(&db).await.unwrap();
+            assert!(storage.load_ip_bindings().await.unwrap().is_empty());
+            assert!(storage.load_devices().await.unwrap().is_empty());
+        }
 
         let _ = std::fs::remove_file(&db);
     }

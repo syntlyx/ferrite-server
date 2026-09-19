@@ -139,8 +139,12 @@ port    = 53
 #
 # With both off ferrite records nothing about what was resolved — including the
 # warm-restart snapshot, which stops storing cached domains (so a restart starts
-# with a cold cache). Existing data is not deleted: use the Clear button in the
-# UI, or DELETE /api/queries, which also vacuums the database.
+# with a cold cache), and the learned device inventory: no IP->MAC bindings and
+# no device names are written or read back, so the database stops describing who
+# is on the network as well as what they looked up. Switching both off also
+# drops the inventory already stored. Manual client aliases are configuration,
+# not a record, and are kept. Other existing data is not deleted: use the Clear
+# button in the UI, or DELETE /api/queries, which also vacuums the database.
 # log_queries = true
 # keep_stats = true
 

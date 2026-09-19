@@ -923,8 +923,12 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-            let client_registry =
-                ClientRegistry::new(Arc::clone(&upstream), Arc::clone(&storage) as _).await;
+            let client_registry = ClientRegistry::new(
+                Arc::clone(&upstream),
+                Arc::clone(&storage) as _,
+                RecordSwitches::new(RecordScope::ALL),
+            )
+            .await;
             let (query_tx, rx) = mpsc::channel(8_192);
             Self {
                 // Deliberately not the production default, so a test asserting a

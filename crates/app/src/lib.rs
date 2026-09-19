@@ -398,14 +398,19 @@ impl AppState {
             }
         }
 
-        // Client registry — PTR resolver + manual aliases.
-        let client_registry =
-            ClientRegistry::new(Arc::clone(&upstream_pool), Arc::clone(&storage)).await;
-
-        // The privacy switches are built before the proxy: its per-egress
-        // routed-domain table is one of the surfaces they gate, so it needs the
-        // same handle the DNS handler and the stats writer read.
+        // The privacy switches are built before anything they gate: the proxy's
+        // per-egress routed-domain table, the stats writer, the DNS handler —
+        // and the client registry, whose device inventory is written down only
+        // while something is being recorded.
         let record_switches = RecordSwitches::new(config.storage.record_scope());
+
+        // Client registry — PTR resolver + manual aliases.
+        let client_registry = ClientRegistry::new(
+            Arc::clone(&upstream_pool),
+            Arc::clone(&storage),
+            Arc::clone(&record_switches),
+        )
+        .await;
 
         // Selective routing / proxy. Egresses resolve real hosts through this
         // same upstream pool (never the OS resolver, which would loop back into

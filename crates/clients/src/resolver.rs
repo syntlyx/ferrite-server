@@ -170,6 +170,9 @@ impl ClientRegistry {
     /// Best-effort persistence of a device's last-known hostname. Never blocks
     /// resolution: a failed write is logged and dropped.
     async fn persist_device(&self, mac: [u8; 6], name: &str) {
+        if !self.switches.scope().records_anything() {
+            return;
+        }
         if let Err(e) = self
             .storage
             .upsert_device(&ferrite_core::net::format_mac(&mac), Some(name))
@@ -181,6 +184,9 @@ impl ClientRegistry {
 
     /// Best-effort persistence of an IP→MAC binding.
     pub(super) async fn persist_binding(&self, ip: IpAddr, mac: [u8; 6]) {
+        if !self.switches.scope().records_anything() {
+            return;
+        }
         if let Err(e) = self
             .storage
             .upsert_ip_binding(&ip.to_string(), &ferrite_core::net::format_mac(&mac))

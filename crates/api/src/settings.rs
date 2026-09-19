@@ -438,6 +438,16 @@ pub async fn update_settings(
             Ok(()) => tracing::info!("recording disabled, snapshot rewritten without the cache"),
             Err(e) => tracing::warn!("recording disabled, but rewriting the snapshot failed: {e}"),
         }
+        // The same reasoning covers the learned device inventory: the query log
+        // is gone, the aggregates are gone, and a table of every MAC on the
+        // network with the name it answers to would be the last thing left
+        // describing the household. Manual aliases are configuration and stay.
+        match state.inner.client_registry.forget_learned_devices().await {
+            Ok(()) => tracing::info!("recording disabled, learned device inventory dropped"),
+            Err(e) => {
+                tracing::warn!("recording disabled, but dropping the device inventory failed: {e}")
+            }
+        }
     }
 
     if let Some(enabled) = blocklist_enabled_to_apply {

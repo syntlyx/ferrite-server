@@ -696,6 +696,16 @@ impl Storage for SqliteStorage {
             .map_err(FeriteError::TokioDatabase)
     }
 
+    async fn delete_all_devices(&self) -> Result<()> {
+        self.conn
+            .call(|c| {
+                c.execute("DELETE FROM devices", [])?;
+                Ok(())
+            })
+            .await
+            .map_err(FeriteError::TokioDatabase)
+    }
+
     async fn touch_ip_bindings(&self, ips: &[String]) -> Result<()> {
         if ips.is_empty() {
             return Ok(());
