@@ -328,7 +328,11 @@ impl DnsCache {
 
     /// Restore entries from a snapshot, skipping any that have already expired.
     /// `entries` is a list of (key, bytes, ttl, expires_unix_secs).
-    pub fn restore(&self, entries: &[(String, Vec<u8>, u32, i64)]) {
+    /// Takes its entries by value: the response buffers come from a snapshot
+    /// that is discarded straight after, so they are moved in rather than
+    /// copied — a restore used to duplicate the whole cache twice over on the
+    /// way back into it.
+    pub fn restore(&self, entries: Vec<(String, bytes::Bytes, u32, i64)>) {
         let now_instant = std::time::Instant::now();
         let now_unix = chrono::Utc::now().timestamp();
         let mut guard = self.inner.write();
@@ -339,13 +343,10 @@ impl DnsCache {
             }
             let expires_at = now_instant + std::time::Duration::from_secs(remaining_secs as u64);
             let entry = CacheEntry {
-                response: DnsResponse {
-                    bytes: bytes::Bytes::copy_from_slice(bytes),
-                    ttl: *ttl,
-                },
+                response: DnsResponse { bytes, ttl },
                 expires_at,
             };
-            guard.put(key.clone(), entry, self.max_bytes);
+            guard.put(key, entry, self.max_bytes);
         }
     }
 }

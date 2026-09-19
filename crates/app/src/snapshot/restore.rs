@@ -52,12 +52,13 @@ pub fn load_snapshot(path: &Path) -> Result<Option<StateSnapshot>> {
 ///   values newer than the storage seed.
 pub fn apply_snapshot(dns_cache: &DnsCache, live: &LiveStats, snapshot: &StateSnapshot) {
     // Restore DNS cache.
-    let entries: Vec<(String, Vec<u8>, u32, i64)> = snapshot
+    // `bytes.clone()` is a refcount bump, not a copy of the answer.
+    let entries: Vec<(String, bytes::Bytes, u32, i64)> = snapshot
         .dns_cache
         .iter()
         .map(|e| (e.key.clone(), e.bytes.clone(), e.ttl, e.expires_at))
         .collect();
-    dns_cache.restore(&entries);
+    dns_cache.restore(entries);
 
     // Restore live stats (only if snapshot was from the same day).
     let snapshot_day = chrono::DateTime::from_timestamp(snapshot.created_at, 0)
@@ -102,7 +103,7 @@ mod tests {
             created_at: 1_735_689_600,
             dns_cache: vec![DnsCacheEntry {
                 key: "example.com/1".to_string(),
-                bytes: vec![0xde, 0xad, 0xbe, 0xef],
+                bytes: bytes::Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
                 ttl: 300,
                 expires_at: 1_735_689_900,
             }],
@@ -120,7 +121,7 @@ mod tests {
         assert_eq!(loaded.created_at, snapshot.created_at);
         assert_eq!(loaded.dns_cache.len(), 1);
         assert_eq!(loaded.dns_cache[0].key, "example.com/1");
-        assert_eq!(loaded.dns_cache[0].bytes, vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(loaded.dns_cache[0].bytes, &[0xde, 0xad, 0xbe, 0xef][..]);
         assert_eq!(loaded.total_queries, 42);
 
         let _ = std::fs::remove_file(path);
@@ -175,13 +176,13 @@ mod tests {
             dns_cache: vec![
                 DnsCacheEntry {
                     key: "fresh.test/1".to_string(),
-                    bytes: b"fresh".to_vec(),
+                    bytes: bytes::Bytes::from_static(b"fresh"),
                     ttl: 120,
                     expires_at: now + 120,
                 },
                 DnsCacheEntry {
                     key: "expired.test/1".to_string(),
-                    bytes: b"expired".to_vec(),
+                    bytes: bytes::Bytes::from_static(b"expired"),
                     ttl: 120,
                     expires_at: now - 1,
                 },

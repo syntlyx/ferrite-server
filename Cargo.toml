@@ -89,7 +89,7 @@ serde_json = "1"     # JSON API payloads
 toml = "1"           # config file parsing (config.toml)
 postcard = { version = "1", default-features = false, features = ["use-std"] }  # compact binary state snapshots (snapshot/)
 chrono = { version = "0.4", features = ["serde"] }  # timestamps
-bytes = "1"          # zero-copy byte buffers for DNS wire data
+bytes = { version = "1", features = ["serde"] }  # zero-copy byte buffers for DNS wire data (serde: the state snapshot writes them straight out)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 tracing = "0.1"

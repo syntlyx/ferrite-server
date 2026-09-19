@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
@@ -36,7 +37,7 @@ pub fn build_snapshot(dns_cache: &DnsCache, live: &LiveStats, scope: RecordScope
                     .unwrap_or(0);
                 DnsCacheEntry {
                     key,
-                    bytes: response.bytes.to_vec(),
+                    bytes: response.bytes,
                     ttl: response.ttl,
                     expires_at: now_unix + remaining,
                 }
@@ -75,14 +76,18 @@ pub fn save_snapshot(snapshot: &StateSnapshot, path: &Path) -> Result<()> {
             .map(|d| d.as_nanos())
             .unwrap_or_default()
     ));
-    let payload = postcard::to_stdvec(snapshot)?;
-
-    // Prepend magic bytes so we can detect and reject incompatible formats.
-    let mut bytes = Vec::with_capacity(SNAPSHOT_MAGIC.len() + payload.len());
-    bytes.extend_from_slice(SNAPSHOT_MAGIC);
-    bytes.extend_from_slice(&payload);
-
-    std::fs::write(&tmp, &bytes)?;
+    // Straight into the file, through a buffer: `to_stdvec` would hold the
+    // whole serialized cache in memory, and prepending the magic to it a second
+    // copy on top — several megabytes of transient allocation every five
+    // minutes, on a box whose entire memory target is a few tens of them.
+    {
+        let file = std::fs::File::create(&tmp)?;
+        let mut out = std::io::BufWriter::new(file);
+        // Magic first, so an incompatible format is detected before decoding.
+        out.write_all(SNAPSHOT_MAGIC)?;
+        postcard::to_io(snapshot, &mut out).map_err(ferrite_core::error::FeriteError::from)?;
+        out.flush()?;
+    }
     std::fs::rename(&tmp, path)?;
 
     tracing::info!(
