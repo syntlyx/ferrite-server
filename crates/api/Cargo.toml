@@ -40,4 +40,5 @@ x509-parser.workspace = true
 
 [dev-dependencies]
 ferrite-app = { workspace = true, features = ["testutil"] }
+ferrite-blocklist = { workspace = true, features = ["testutil"] }
 tower.workspace = true
