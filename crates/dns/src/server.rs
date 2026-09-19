@@ -51,6 +51,22 @@ async fn udp_loop(socket: UdpSocket, ctx: Arc<DnsCtx>) -> anyhow::Result<()> {
             }
         };
 
+        // The in-memory half of the pipeline runs right here, on the receive
+        // loop: a cache hit, a block, a local record or a routing redirect is
+        // settled in a few hundred nanoseconds, while handing it to a task
+        // costs ~340 ns on its own — more than the answer itself. Only a query
+        // that has to wait for the network gets a task, a permit and a copy of
+        // the datagram.
+        let max_udp = client_udp_payload(&buf[..len]);
+        let pending = match crate::handler::decide(&buf[..len], src, &ctx) {
+            crate::handler::Decision::Answer(resp) => {
+                send_answer(&socket, resp, src, max_udp).await;
+                continue;
+            }
+            crate::handler::Decision::Drop => continue,
+            crate::handler::Decision::Upstream(pending) => pending,
+        };
+
         let raw = buf[..len].to_vec();
         let ctx = Arc::clone(&ctx);
         let socket = Arc::clone(&socket);
@@ -91,28 +107,35 @@ async fn udp_loop(socket: UdpSocket, ctx: Arc<DnsCtx>) -> anyhow::Result<()> {
 
         tokio::spawn(async move {
             let _permit = permit;
-            // Capture the client's advertised UDP buffer size before `raw` is
-            // moved into the handler (512 without EDNS0, larger if advertised).
-            let max_udp = client_udp_payload(&raw);
-            match crate::handler::handle_query(raw, src, Arc::clone(&ctx)).await {
-                Ok(resp) if !resp.is_empty() => {
-                    // If the answer is larger than the client can accept over
-                    // UDP, send a truncated (TC=1) reply so it retries over TCP
-                    // rather than receiving an oversized datagram the network may
-                    // silently drop (RFC 1035 §4.2.1).
-                    let datagram = if resp.len() > max_udp {
-                        truncate_response(&resp)
-                    } else {
-                        resp
-                    };
-                    if let Err(e) = socket.send_to(&datagram, src).await {
-                        tracing::warn!("UDP send to {}: {}", src, e);
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => tracing::warn!("handle_query (UDP) for {}: {}", src, e),
-            }
+            let resp = crate::handler::resolve_upstream(&raw, pending, &ctx).await;
+            send_answer(&socket, resp, src, max_udp).await;
         });
+    }
+}
+
+/// Send one answer back, truncating it first when it is larger than the client
+/// said it can accept over UDP: a TC=1 reply makes the client retry over TCP,
+/// which is better than an oversized datagram the network may silently drop
+/// (RFC 1035 §4.2.1). An empty answer means "say nothing".
+async fn send_answer(socket: &UdpSocket, resp: Vec<u8>, src: std::net::SocketAddr, max_udp: usize) {
+    if resp.is_empty() {
+        return;
+    }
+    let datagram = if resp.len() > max_udp {
+        truncate_response(&resp)
+    } else {
+        resp
+    };
+    // The socket is non-blocking and its send buffer is all but always free, so
+    // the common case never yields; `send_to` covers the moment it isn't.
+    match socket.try_send_to(&datagram, src) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            if let Err(e) = socket.send_to(&datagram, src).await {
+                tracing::warn!("UDP send to {}: {}", src, e);
+            }
+        }
+        Err(e) => tracing::warn!("UDP send to {}: {}", src, e),
     }
 }
 

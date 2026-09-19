@@ -27,8 +27,36 @@ pub fn seed_query_counter(max_persisted_id: u64) {
     QUERY_COUNTER.fetch_max(max_persisted_id + 1, Ordering::Relaxed);
 }
 
-/// DNS query pipeline (per query, runs in its own tokio task; after parsing,
-/// the steps match the `Step N` markers below):
+/// What the in-memory half of the pipeline concluded for a query.
+pub enum Decision {
+    /// An answer to send as it stands: a local record, a block, a routing
+    /// redirect, a cache hit — or SERVFAIL for a query we won't serve.
+    Answer(Vec<u8>),
+    /// Nothing in memory settles this one; it has to go upstream, which means
+    /// waiting. Carries everything [`decide`] worked out so the wait is the
+    /// only thing left to pay for.
+    Upstream(Pending),
+    /// Not a query we can read. Nothing goes back — there is no question to
+    /// echo and no transaction id worth trusting.
+    Drop,
+}
+
+/// What a query carries from the in-memory steps into the upstream leg.
+pub struct Pending {
+    name: String,
+    qtype: u16,
+    want_dnssec: bool,
+    filtering_enabled: bool,
+    profile: Option<Arc<ferrite_blocklist::CompiledProfile>>,
+    client_addr: std::net::IpAddr,
+    client_text: Option<String>,
+    log_ignored: bool,
+    client_ttl: u32,
+    start: Instant,
+}
+
+/// DNS query pipeline. Steps 1-4 are [`decide`], steps 5-7
+/// [`resolve_upstream`], and the `Step N` markers in both name them:
 ///
 ///  1. Custom DNS records — local overrides answer first.
 ///  2. Blocklist → NXDOMAIN. Runs before routing on purpose: blocking decides
@@ -40,16 +68,31 @@ pub fn seed_query_counter(max_persisted_id: u64) {
 ///  5. Forward to upstream pool.
 ///  6. CNAME inspection — walk answer section, block if any CNAME target is blocked.
 ///  7. Cache successful response; send QueryEntry to stats writer (non-blocking).
+///
+/// The split is where the waiting starts: everything above step 5 is memory
+/// and CPU, so the UDP listener runs it inline and only puts a query on a task
+/// once it has to wait for the network. TCP, already on a task of its own,
+/// runs both halves through this function.
 pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Result<Vec<u8>> {
+    Ok(match decide(&raw, src, &ctx) {
+        Decision::Answer(bytes) => bytes,
+        Decision::Upstream(pending) => resolve_upstream(&raw, pending, &ctx).await,
+        Decision::Drop => Vec::new(),
+    })
+}
+
+/// Steps 1-4 of the pipeline (see [`handle_query`]): everything that can be
+/// settled from memory. Runs on whichever thread received the datagram.
+pub fn decide(raw: &[u8], src: SocketAddr, ctx: &DnsCtx) -> Decision {
     let start = Instant::now();
 
     // The query is read off the wire and decoded only if a step has to build an
     // answer of ferrite's own (see `LazyQuery`) — the paths that just look the
     // name up and forward or serve bytes never decode anything.
-    let query = LazyQuery::new(&raw);
+    let query = LazyQuery::new(raw);
 
-    if wire::opcode(&raw) != Some(OPCODE_QUERY) {
-        return Ok(build_servfail(&query));
+    if wire::opcode(raw) != Some(OPCODE_QUERY) {
+        return Decision::Answer(build_servfail(&query));
     }
 
     let Some((name, qtype)) = question(&query) else {
@@ -57,13 +100,13 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
         // an undecodable one always was: there is no question to echo and no
         // id worth trusting. One it accepts — a query with QDCOUNT 0 — gets
         // SERVFAIL, as before.
-        return Ok(match query.message() {
-            Some(_) => build_servfail(&query),
+        return match query.message() {
+            Some(_) => Decision::Answer(build_servfail(&query)),
             None => {
                 tracing::debug!("malformed DNS message from {}", src);
-                vec![]
+                Decision::Drop
             }
-        });
+        };
     };
     // Normalise IPv4-mapped IPv6 (::ffff:a.b.c.d) to plain IPv4 so the DB
     // stores clean addresses and PTR grouping works correctly.
@@ -117,7 +160,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
         ctx.dns_cache
             .insert(&name, qtype, want_dnssec, custom_resp.clone());
         if !log_ignored {
-            emit(&ctx, QueryStatus::Allowed, |status| {
+            emit(ctx, QueryStatus::Allowed, |status| {
                 make_entry(
                     name,
                     qtype,
@@ -131,7 +174,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
         }
         // Custom records carry an operator-chosen TTL, but they are still a
         // local override that can be edited live — cap them like everything else.
-        return Ok(cap_ttls(
+        return Decision::Answer(cap_ttls(
             patch_id(&custom_resp.bytes, query.id()),
             client_ttl,
         ));
@@ -148,7 +191,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
     if filtering_enabled && ctx.blocklist.should_block_for(&name, profile.as_deref()) {
         tracing::debug!("blocked: {}", name);
         if !log_ignored {
-            emit(&ctx, QueryStatus::Blocked, |status| {
+            emit(ctx, QueryStatus::Blocked, |status| {
                 make_entry(
                     name,
                     qtype,
@@ -160,7 +203,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
                 )
             });
         }
-        return Ok(build_nxdomain(&query, client_ttl));
+        return Decision::Answer(build_nxdomain(&query, client_ttl));
     }
 
     // ── Step 3: Selective routing / proxy interception ────────────────────
@@ -173,7 +216,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
             .maybe_intercept(&query, &name, qtype, client_ip, client_mac.as_deref())
     {
         if !log_ignored {
-            emit(&ctx, QueryStatus::Routed, |status| {
+            emit(ctx, QueryStatus::Routed, |status| {
                 make_entry(
                     name,
                     qtype,
@@ -185,7 +228,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
                 )
             });
         }
-        return Ok(cap_ttls(
+        return Decision::Answer(cap_ttls(
             patch_id(&intercept.response.bytes, query.id()),
             client_ttl,
         ));
@@ -201,7 +244,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
         {
             tracing::debug!("CNAME-blocked from cache: {} → {}", name, blocked_cname);
             if !log_ignored {
-                emit(&ctx, QueryStatus::Blocked, |status| {
+                emit(ctx, QueryStatus::Blocked, |status| {
                     make_entry(
                         name,
                         qtype,
@@ -213,11 +256,11 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
                     )
                 });
             }
-            return Ok(build_nxdomain(&query, client_ttl));
+            return Decision::Answer(build_nxdomain(&query, client_ttl));
         }
 
         if !log_ignored {
-            emit(&ctx, QueryStatus::Cached, |status| {
+            emit(ctx, QueryStatus::Cached, |status| {
                 make_entry(
                     name,
                     qtype,
@@ -229,18 +272,50 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
                 )
             });
         }
-        return Ok(patch_cached(
+        return Decision::Answer(patch_cached(
             &cached.bytes,
             query.id(),
             remaining_ttl.min(client_ttl),
         ));
     }
 
+    Decision::Upstream(Pending {
+        name,
+        qtype,
+        want_dnssec,
+        filtering_enabled,
+        profile,
+        client_addr,
+        client_text,
+        log_ignored,
+        client_ttl,
+        start,
+    })
+}
+
+/// Steps 5-7 of the pipeline: ask upstream, inspect the CNAME chain, cache and
+/// log. Separate from [`decide`] so a datagram only reaches a task — and pays
+/// for one — when it actually has to wait for the network.
+pub async fn resolve_upstream(raw: &[u8], pending: Pending, ctx: &DnsCtx) -> Vec<u8> {
+    let Pending {
+        name,
+        qtype,
+        want_dnssec,
+        filtering_enabled,
+        profile,
+        client_addr,
+        client_text,
+        log_ignored,
+        client_ttl,
+        start,
+    } = pending;
+    let query = LazyQuery::new(raw);
+
     // ── Step 5: Forward to upstream ───────────────────────────────────────
     // Harden the outbound query: drop EDNS Client Subnet (so the resolver never
     // learns the client's subnet) and set the upstream DO bit to `want_dnssec`
     // (honor this client's request, or strip it when the feature is off).
-    let upstream_query = sanitize_query(&raw, ctx.dns_config.strip_ecs, want_dnssec);
+    let upstream_query = sanitize_query(raw, ctx.dns_config.strip_ecs, want_dnssec);
     let (response_bytes, rcode, upstream_label) =
         match ctx.upstream_pool.resolve_raw(upstream_query).await {
             // Only trust a response we can actually decode. Unparseable bytes
@@ -269,7 +344,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
     {
         tracing::debug!("CNAME-blocked: {} → {}", name, blocked_cname);
         if !log_ignored {
-            emit(&ctx, QueryStatus::Blocked, |status| {
+            emit(ctx, QueryStatus::Blocked, |status| {
                 make_entry(
                     name,
                     qtype,
@@ -281,7 +356,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
                 )
             });
         }
-        return Ok(build_nxdomain(&query, client_ttl));
+        return build_nxdomain(&query, client_ttl);
     }
 
     // ── Step 7: Cache NOERROR responses ───────────────────────────────────
@@ -307,7 +382,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
     }
 
     if !log_ignored {
-        emit(&ctx, QueryStatus::Upstream, |status| {
+        emit(ctx, QueryStatus::Upstream, |status| {
             make_entry(
                 name,
                 qtype,
@@ -325,7 +400,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
     // covers the first, uncached lookup so `max_ttl` reliably bounds what every
     // client caches — e.g. how long a client clings to a pre-rule direct answer
     // before re-querying and getting routed.
-    Ok(cap_ttls(response_bytes, client_ttl))
+    cap_ttls(response_bytes, client_ttl)
 }
 
 // ---------------------------------------------------------------------------
