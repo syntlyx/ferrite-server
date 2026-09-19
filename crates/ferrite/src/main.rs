@@ -293,11 +293,37 @@ async fn periodic_snapshot(state: ferrite_app::AppState) -> anyhow::Result<()> {
     }
 }
 
+/// A database worth mentioning when nothing is pruning it. A quarter of a
+/// gigabyte is a few months of a household's query log — enough to notice on
+/// the SD card these boxes usually boot from, and far enough above idle that
+/// the line is never just noise.
+const LARGE_DATABASE_BYTES: u64 = 250_000_000;
+
 /// Delete query log entries older than `log_retention_days`.
 /// Runs once shortly after startup, then every 24 hours.
 /// Reads `log_retention_days` from `live_config` on each iteration — changes
 /// made via PATCH /api/settings take effect without restart.
 async fn log_retention_loop(state: ferrite_app::AppState) {
+    // Say what the policy is before acting on it. The default is 30 days, so an
+    // install that never set the key will start pruning here — this line is how
+    // its operator finds out, and how they learn to turn it off.
+    let configured = state.live_config.read().storage.log_retention_days;
+    match configured {
+        0 => match state.inner.storage.database_bytes().await {
+            // Keeping everything is a valid choice; a database that has grown
+            // past the size of a small SD card's free space is worth a word.
+            Ok(bytes) if bytes > LARGE_DATABASE_BYTES => tracing::warn!(
+                "query log retention is off and the database is {} MB — set storage.log_retention_days to prune it",
+                bytes / 1_000_000
+            ),
+            _ => tracing::info!("query log retention is off — entries are kept forever"),
+        },
+        days => tracing::info!(
+            "query log retention: {} days (set storage.log_retention_days = 0 to keep everything)",
+            days
+        ),
+    }
+
     // Small initial delay so startup I/O settles first.
     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 

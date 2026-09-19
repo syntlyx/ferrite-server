@@ -204,7 +204,12 @@ pub struct StorageConfig {
     /// SQLite database path.
     pub path: PathBuf,
     /// Automatically delete query log entries older than this many days.
-    /// 0 = disabled (default). Applied once at startup and then every 24 hours.
+    /// 0 keeps them forever. Applied once at startup and then every 24 hours.
+    ///
+    /// The default is 30 days rather than "forever": a household resolves tens
+    /// of thousands of names a day, which is on the order of a gigabyte of log
+    /// a quarter — on a box whose database usually lives on an SD card. A month
+    /// is longer than anyone looks back for, and set it to 0 to keep the lot.
     #[serde(skip_serializing_if = "is_retention_disabled")]
     pub log_retention_days: u32,
     /// Record one row per DNS query — the query log behind the Queries page.
@@ -219,6 +224,10 @@ pub struct StorageConfig {
     /// Hot-patchable, and serialized for the same reason as `log_queries`.
     pub keep_stats: bool,
 }
+
+/// How long the query log is kept when the config does not say. See
+/// [`StorageConfig::log_retention_days`] for why it is not "forever".
+pub const DEFAULT_LOG_RETENTION_DAYS: u32 = 30;
 
 fn is_retention_disabled(d: &u32) -> bool {
     *d == 0
@@ -590,7 +599,7 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             path: data_dir().join("ferrite.db"),
-            log_retention_days: 0,
+            log_retention_days: DEFAULT_LOG_RETENTION_DAYS,
             log_queries: true,
             keep_stats: true,
         }

@@ -115,7 +115,10 @@ port    = 53
 # path = "/var/lib/ferrite/ferrite.db"
 
 # Automatically delete query log entries older than this many days.
-# 0 (default) keeps them forever.
+# Default: 30. A busy household writes on the order of a gigabyte of query log a
+# quarter, and the database usually sits on an SD card; a month is longer than
+# anyone looks back for. Set it to 0 to keep every entry forever — ferrite then
+# warns once at startup if the database has grown large.
 # log_retention_days = 30
 
 # Privacy switches — both default to true, both apply without a restart.

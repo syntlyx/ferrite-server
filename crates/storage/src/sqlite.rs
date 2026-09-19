@@ -696,6 +696,17 @@ impl Storage for SqliteStorage {
             .map_err(FeriteError::TokioDatabase)
     }
 
+    async fn database_bytes(&self) -> Result<u64> {
+        self.conn
+            .call(|c| {
+                let pages: i64 = c.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+                let page_size: i64 = c.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+                Ok((pages.max(0) as u64) * (page_size.max(0) as u64))
+            })
+            .await
+            .map_err(FeriteError::TokioDatabase)
+    }
+
     async fn delete_all_devices(&self) -> Result<()> {
         self.conn
             .call(|c| {

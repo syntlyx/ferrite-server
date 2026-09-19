@@ -151,6 +151,11 @@ pub trait Storage: Send + Sync {
     /// and manual aliases intact; used when the query log is cleared.
     async fn delete_all_ip_bindings(&self) -> Result<()>;
 
+    /// How much room the database takes, as SQLite accounts for it (page count
+    /// × page size). The write-ahead log is not counted — it is checkpointed
+    /// back into the file — so this is the durable size, not the peak.
+    async fn database_bytes(&self) -> Result<u64>;
+
     /// Drop every learned device name. Manual aliases are configuration and
     /// survive; this is for the privacy switches, where a list of the MACs on
     /// the network and what they call themselves is exactly what "record
