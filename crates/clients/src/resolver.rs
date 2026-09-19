@@ -143,7 +143,7 @@ impl ClientRegistry {
             Some(m) => {
                 if self.ip_to_mac.get(&ip).map(|e| *e) != Some(m) {
                     tracing::debug!("learned MAC {:02x?} for {}", m, ip);
-                    self.ip_to_mac.insert(ip, m);
+                    self.bind_ip(ip, m);
                     self.persist_binding(ip, m).await;
                 }
                 Some(m)

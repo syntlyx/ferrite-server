@@ -73,6 +73,15 @@ pub struct ClientRegistry {
     mac_aliases: DashMap<[u8; 6], String>,
     mac_to_name: DashMap<[u8; 6], (String, Instant)>,
     ip_to_mac: DashMap<IpAddr, [u8; 6]>,
+    /// The reverse of `ip_to_mac`, kept in step by [`ClientRegistry::bind_ip`]
+    /// and [`ClientRegistry::unbind_ip`]. "Which addresses does this device
+    /// hold?" is asked for every device on every dashboard and clients poll,
+    /// and answering it by scanning every address the box has ever seen made
+    /// that poll proportional to the whole history — tens of thousands of
+    /// entries once privacy addresses have been rotating for a while. The
+    /// index costs one `IpAddr` per binding on top and is bounded by the same
+    /// retention prune.
+    mac_to_ips: DashMap<[u8; 6], Vec<IpAddr>>,
     in_flight: DashSet<IpAddr>,
     /// Unix seconds of the last `last_seen` touch of present bindings; throttles
     /// the neighbor-scan touch to [`BINDING_TOUCH_INTERVAL`] (see registry).

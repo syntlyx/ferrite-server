@@ -19,6 +19,7 @@ impl ClientRegistry {
             mac_aliases: DashMap::new(),
             mac_to_name: DashMap::new(),
             ip_to_mac: DashMap::new(),
+            mac_to_ips: DashMap::new(),
             in_flight: DashSet::new(),
             last_binding_touch: std::sync::atomic::AtomicI64::new(0),
             upstream,
@@ -71,7 +72,7 @@ impl ClientRegistry {
             Ok(bindings) => {
                 for (ip_s, mac_s) in bindings {
                     if let (Some(ip), Some(mac)) = (parse_ip(&ip_s), parse_mac(&mac_s)) {
-                        registry.ip_to_mac.insert(unmap_v4(ip), mac);
+                        registry.bind_ip(unmap_v4(ip), mac);
                     }
                 }
             }
@@ -181,13 +182,7 @@ impl ClientRegistry {
         self.storage
             .add_client_alias(&format_mac(&mac), "mac", &name)
             .await?;
-        let to_remove: Vec<IpAddr> = self
-            .ip_to_mac
-            .iter()
-            .filter(|e| *e.value() == mac)
-            .map(|e| *e.key())
-            .collect();
-        for ip in to_remove {
+        for ip in self.addrs_for_device(&format_mac(&mac)) {
             self.ptr_cache.remove(&ip);
         }
         self.mac_aliases.insert(mac, name);
@@ -248,7 +243,46 @@ impl ClientRegistry {
         self.storage.delete_all_ip_bindings().await?;
         self.ptr_cache.clear();
         self.ip_to_mac.clear();
+        self.mac_to_ips.clear();
         Ok(())
+    }
+
+    // ── IP ↔ MAC bindings ──────────────────────────────────────────────────────
+
+    /// Record that `ip` currently belongs to `mac`, in both directions. An
+    /// address that moves to another device is taken off the old one's list, so
+    /// the reverse index never reports an address a device no longer holds.
+    pub(crate) fn bind_ip(&self, ip: IpAddr, mac: [u8; 6]) {
+        match self.ip_to_mac.insert(ip, mac) {
+            Some(previous) if previous == mac => return,
+            Some(previous) => self.forget_reverse(ip, previous),
+            None => {}
+        }
+        let mut ips = self.mac_to_ips.entry(mac).or_default();
+        if !ips.contains(&ip) {
+            ips.push(ip);
+        }
+    }
+
+    /// Drop a binding from both directions.
+    fn unbind_ip(&self, ip: IpAddr) {
+        if let Some((_, mac)) = self.ip_to_mac.remove(&ip) {
+            self.forget_reverse(ip, mac);
+        }
+    }
+
+    /// Remove `ip` from `mac`'s address list, dropping the device's entry once
+    /// it holds nothing — otherwise a churning device would leave an empty list
+    /// behind for every MAC it ever had.
+    fn forget_reverse(&self, ip: IpAddr, mac: [u8; 6]) {
+        let mut empty = false;
+        if let Some(mut ips) = self.mac_to_ips.get_mut(&mac) {
+            ips.retain(|held| *held != ip);
+            empty = ips.is_empty();
+        }
+        if empty {
+            self.mac_to_ips.remove_if(&mac, |_, ips| ips.is_empty());
+        }
     }
 
     // ── Device-token helpers (MAC or IP fallback) ───────────────────────────────
@@ -256,16 +290,24 @@ impl ClientRegistry {
     /// All IPs currently mapped to this device (for MAC tokens, every IP whose
     /// learned binding points at the MAC; for IP tokens, just that IP).
     fn ips_for_device(&self, device: &str) -> Vec<String> {
+        self.addrs_for_device(device)
+            .iter()
+            .map(|ip| ip.to_string())
+            .collect()
+    }
+
+    /// The same set as [`Self::ips_for_device`], unformatted — for callers that
+    /// only want to look the addresses up again.
+    fn addrs_for_device(&self, device: &str) -> Vec<IpAddr> {
         if let Some(mac) = parse_mac(device) {
             return self
-                .ip_to_mac
-                .iter()
-                .filter(|e| *e.value() == mac)
-                .map(|e| e.key().to_string())
-                .collect();
+                .mac_to_ips
+                .get(&mac)
+                .map(|ips| ips.clone())
+                .unwrap_or_default();
         }
         parse_ip(device)
-            .map(|ip| vec![unmap_v4(ip).to_string()])
+            .map(|ip| vec![unmap_v4(ip)])
             .unwrap_or_default()
     }
 
@@ -303,10 +345,8 @@ impl ClientRegistry {
 
     /// Schedule background resolution for every IP currently tied to a device.
     pub fn trigger_resolve_device(registry: &Arc<Self>, device: &str) {
-        for ip in registry.ips_for_device(device) {
-            if let Some(addr) = parse_ip(&ip) {
-                Self::trigger_resolve(registry, addr);
-            }
+        for addr in registry.addrs_for_device(device) {
+            Self::trigger_resolve(registry, addr);
         }
     }
 
@@ -325,7 +365,7 @@ impl ClientRegistry {
             // the `.await` below (parking_lot is not reentrant — see freeze notes).
             let changed = self.ip_to_mac.get(&ip).map(|e| *e) != Some(mac);
             if changed {
-                self.ip_to_mac.insert(ip, mac);
+                self.bind_ip(ip, mac);
                 self.persist_binding(ip, mac).await;
                 learned += 1;
             }
@@ -372,7 +412,7 @@ impl ClientRegistry {
             Ok(deleted) => {
                 for ip_s in &deleted {
                     if let Some(ip) = parse_ip(ip_s) {
-                        self.ip_to_mac.remove(&unmap_v4(ip));
+                        self.unbind_ip(unmap_v4(ip));
                     }
                 }
                 if !deleted.is_empty() {
@@ -385,5 +425,81 @@ impl ClientRegistry {
         // an in-memory prune independent of the binding table above).
         let now = Instant::now();
         self.ptr_cache.retain(|_, e| e.expires_at > now);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrite_core::config::UpstreamConfig;
+    use ferrite_storage::SqliteStorage;
+    use ferrite_upstream::{UpstreamPool, no_proxy};
+
+    fn temp_db(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ferrite-{name}-{}-{nanos}.db", std::process::id()))
+    }
+
+    async fn registry(db: &std::path::Path) -> Arc<ClientRegistry> {
+        let storage = SqliteStorage::open(db).await.unwrap();
+        let upstream = ZoneRouter::new(
+            &[],
+            UpstreamPool::from_config(
+                &[UpstreamConfig::Plain {
+                    address: "127.0.0.1".to_string(),
+                    port: 53,
+                    egress: None,
+                }],
+                no_proxy(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        ClientRegistry::new(upstream, storage as Arc<dyn Storage>).await
+    }
+
+    /// The reverse index has to answer exactly what a scan of `ip_to_mac`
+    /// would: every address currently bound to the device, and nothing a
+    /// device has since lost.
+    #[tokio::test]
+    async fn reverse_index_follows_every_binding_change() {
+        let db = temp_db("clients-reverse-index");
+        let reg = registry(&db).await;
+        let laptop = [0xaa, 0xbb, 0xcc, 0x11, 0x22, 0x33];
+        let phone = [0xaa, 0xbb, 0xcc, 0x44, 0x55, 0x66];
+        let v4: IpAddr = "192.168.1.10".parse().unwrap();
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+
+        reg.bind_ip(v4, laptop);
+        reg.bind_ip(v6, laptop);
+        reg.bind_ip(v4, laptop); // idempotent
+        let mut held = reg.addrs_for_device(&format_mac(&laptop));
+        held.sort();
+        assert_eq!(held, vec![v4, v6]);
+
+        // The address moves to another device: gone from the old one, on the new.
+        reg.bind_ip(v4, phone);
+        assert_eq!(reg.addrs_for_device(&format_mac(&laptop)), vec![v6]);
+        assert_eq!(reg.addrs_for_device(&format_mac(&phone)), vec![v4]);
+
+        // Unbinding the last address drops the device from the index entirely.
+        reg.unbind_ip(v4);
+        assert!(reg.addrs_for_device(&format_mac(&phone)).is_empty());
+        assert!(reg.mac_to_ips.get(&phone).is_none());
+
+        // An IP token answers for itself, whether or not it is bound.
+        assert_eq!(
+            reg.addrs_for_device("192.168.1.99"),
+            vec!["192.168.1.99".parse::<IpAddr>().unwrap()]
+        );
+
+        reg.clear_learned_ips().await.unwrap();
+        assert!(reg.addrs_for_device(&format_mac(&laptop)).is_empty());
+        assert!(reg.ip_to_mac.is_empty());
+
+        let _ = std::fs::remove_file(&db);
     }
 }
