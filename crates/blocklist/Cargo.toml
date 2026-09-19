@@ -15,10 +15,17 @@ parking_lot.workspace = true
 psl.workspace = true
 regex.workspace = true
 reqwest.workspace = true
+ring.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# The binary installs the process-wide rustls provider at startup
+# (`ferrite_upstream::install_default_crypto`); a test that builds the HTTP
+# client has to stand in for it, or `Client::builder()` panics.
+tokio-rustls.workspace = true
 
 [features]
 # Un-gates in-crate test helpers (is_whitelisted*) so other crates' tests can use them.

@@ -4,10 +4,17 @@ use std::time::{Duration, SystemTime};
 use fst::Map;
 
 use crate::domains::DomainSet;
+use crate::loader::{FetchedList, ListValidators};
 use crate::{AdblockStats, ListPolarity, loader};
 
 /// Per-list domain cache is considered fresh for 12 hours.
 pub(super) const LIST_CACHE_TTL: Duration = Duration::from_secs(12 * 3600);
+
+/// Stamped into every cache sidecar. A cached `.fst` is this crate's *output*,
+/// not the file upstream served, so artifacts another ferrite built are never
+/// reused — a parser change must reach them. Costs one full rebuild on the first
+/// refresh after an upgrade, and nothing after that.
+const CACHE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Where a resolved per-list FST lives. `File` is the normal case — the merge
 /// step mmaps it, so the k-way union never holds every list's bytes in RAM at
@@ -17,137 +24,334 @@ pub(super) enum ListFst {
     Ram(Vec<u8>),
 }
 
-/// Resolve a single list to a per-list FST binary.
-///
-/// Cache layers (fastest first):
-///   1. Fresh `.fst` binary on disk             → return immediately
-///   2. Fresh `.domains` text on disk           → build FST, save `.fst`
-///   3. Network fetch                           → save `.domains`, build FST, save `.fst`
-///   4. Stale `.fst` on disk (network failed)   → warn and reuse
-///
-/// When `force` is set, the fresh-cache fast paths (1 and 2) are skipped so the
-/// list is always re-fetched and re-parsed; the stale-cache fallbacks still
-/// apply if the network fetch fails. Use it for operator-triggered refreshes.
-///
-/// Returns `(name, fst_source, unique_domain_count, stats)`. On unrecoverable
-/// failure name is returned as an empty string so the caller can skip the entry.
-pub(super) async fn load_or_build_list_fst(
-    name: String,
-    url: String,
-    fst_cache: PathBuf,
-    domains_cache: PathBuf,
-    stats_cache: PathBuf,
-    force: bool,
-    polarity: ListPolarity,
-) -> (String, ListFst, usize, Option<AdblockStats>) {
-    // Fast path: fresh per-list FST on disk. The parse stats can't be recovered
-    // from the binary FST, so they ride along in a sidecar written at parse time.
-    if !force
-        && is_fresh(&fst_cache).await
-        && let Ok(map) = loader::mmap_fst(&fst_cache)
-    {
-        let count = map.len();
-        let stats = load_stats_cache(&stats_cache).await;
-        tracing::info!("list '{}': {} domains from FST cache", name, count);
-        return (name, ListFst::File(fst_cache), count, stats);
-    }
+/// The files one list keeps between refreshes, all named after the list.
+pub(super) struct ListCache {
+    /// The built map — what the merge step mmaps.
+    pub(super) fst: PathBuf,
+    /// The parsed domains, one per line, exactly as the FST was built from them.
+    domains: PathBuf,
+    /// Adblock parse breakdown (Adblock-format lists only).
+    stats: PathBuf,
+    /// What produced the files above: fingerprint + the validators to replay.
+    meta: PathBuf,
+}
 
-    // Slow path: load/fetch domain text, then build FST.
-    let (domains, stats) =
-        fetch_domains(&name, &url, &domains_cache, &stats_cache, force, polarity).await;
-
-    if domains.is_empty() {
-        if let Ok(map) = loader::mmap_fst(&fst_cache) {
-            let count = map.len();
-            let stats = load_stats_cache(&stats_cache).await;
-            tracing::warn!("list '{}': using stale FST ({} domains)", name, count);
-            return (name, ListFst::File(fst_cache), count, stats);
-        }
-        tracing::error!("list '{}': no domains available, skipping", name);
-        return (String::new(), ListFst::Ram(Vec::new()), 0, None);
-    }
-
-    let fst_cache2 = fst_cache.clone();
-    // tmp + rename: FST files are mmap'd (at merge time and by the explain
-    // scan), so they must only ever be replaced atomically, never written in
-    // place. The map is built straight into the temporary file — it would
-    // otherwise exist in memory as well, next to the domain list it came from.
-    let tmp = fst_cache2.with_extension("fst.tmp");
-    let build_into = tmp.clone();
-    match tokio::task::spawn_blocking(move || loader::build_fst_file(domains, &build_into)).await {
-        Ok(Ok(loader::BuiltFst::File(count))) => match tokio::fs::rename(&tmp, &fst_cache2).await {
-            Ok(()) => (name, ListFst::File(fst_cache2), count, stats),
-            Err(e) => {
-                tracing::warn!("list '{}': could not save FST cache: {}", name, e);
-                let _ = tokio::fs::remove_file(&tmp).await;
-                (String::new(), ListFst::Ram(Vec::new()), 0, None)
-            }
-        },
-        // The disk refused it; serve this refresh from memory.
-        Ok(Ok(loader::BuiltFst::Ram(bytes))) => {
-            let count = Map::new(bytes.as_slice()).map(|m| m.len()).unwrap_or(0);
-            (name, ListFst::Ram(bytes), count, stats)
-        }
-        Ok(Err(e)) => {
-            tracing::error!("list '{}': FST build failed: {}", name, e);
-            (String::new(), ListFst::Ram(Vec::new()), 0, None)
-        }
-        Err(e) => {
-            tracing::error!("list '{}': FST build task panicked: {}", name, e);
-            (String::new(), ListFst::Ram(Vec::new()), 0, None)
+impl ListCache {
+    pub(super) fn new(dir: &Path, list_name: &str) -> Self {
+        let safe = sanitize_name(list_name);
+        Self {
+            fst: dir.join(format!("{safe}.fst")),
+            domains: dir.join(format!("{safe}.domains")),
+            stats: dir.join(format!("{safe}.stats.json")),
+            meta: dir.join(format!("{safe}.meta.json")),
         }
     }
 }
 
-/// Fetch domain names for a single list: fresh text cache first, then network.
+/// Sidecar next to a per-list `.fst`, describing what it was built from.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ListMeta {
+    /// [`CACHE_VERSION`] at build time.
+    version: String,
+    /// Digest of the bytes the cached FST was parsed from.
+    digest: String,
+    /// What upstream answered with, replayed on the next fetch.
+    #[serde(default)]
+    validators: ListValidators,
+}
+
+/// One list's contribution to a refresh.
+pub(super) struct ListOutcome {
+    /// Empty when the list failed and nothing cached could stand in for it.
+    pub(super) name: String,
+    pub(super) fst: ListFst,
+    pub(super) count: usize,
+    pub(super) stats: Option<AdblockStats>,
+    /// Fingerprint of what `fst` holds, when it can be proven. The merge step
+    /// compares these against the fingerprints the merged FST on disk was built
+    /// from and skips the union when every one of them still matches; `None`
+    /// means "can't prove it", which forces the merge.
+    pub(super) digest: Option<String>,
+}
+
+/// Resolve a single list to a per-list FST binary.
 ///
-/// Returns the domains plus the Adblock parse breakdown when the list is an
-/// Adblock-format list. Stats are produced only by a fresh parse; on a cache
-/// hit they are reloaded from the sidecar so the API can keep reporting them.
-async fn fetch_domains(
-    name: &str,
-    url: &str,
-    domains_cache: &Path,
-    stats_cache: &Path,
+/// Cache layers (cheapest first):
+///   1. Fresh `.fst` binary on disk             → return immediately
+///   2. Upstream confirms nothing changed        → keep the cached `.fst`
+///   3. Fresh `.domains` text on disk           → build FST, save `.fst`
+///   4. Network fetch                           → save `.domains`, build FST, save `.fst`
+///   5. Stale cache on disk (network failed)    → warn and reuse
+///
+/// `force` skips the *time-based* layers 1 and 3, so an operator-triggered
+/// refresh always asks upstream. It deliberately does not skip layer 2: when
+/// upstream answers 304, or returns the very bytes the cached FST was built
+/// from, rebuilding can only produce that same FST again. A ferrite that would
+/// parse those bytes differently carries a different [`CACHE_VERSION`], and that
+/// does rebuild everything.
+///
+/// On unrecoverable failure the name comes back empty so the caller can skip the
+/// entry.
+pub(super) async fn load_or_build_list_fst(
+    name: String,
+    url: String,
+    cache: ListCache,
     force: bool,
     polarity: ListPolarity,
-) -> (DomainSet, Option<AdblockStats>) {
-    if !force && let Some(domains) = load_fresh_text_cache(domains_cache).await {
-        let stats = load_stats_cache(stats_cache).await;
+) -> ListOutcome {
+    // Sidecars written by another ferrite are ignored wholesale — see
+    // `CACHE_VERSION`. With no usable sidecar nothing below can take a shortcut.
+    let meta = load_meta(&cache.meta)
+        .await
+        .filter(|m| m.version == CACHE_VERSION);
+    let cached_fst = loader::mmap_fst(&cache.fst).ok();
+
+    // (1) Fresh per-list FST on disk. The parse stats can't be recovered from
+    // the binary FST, so they ride along in a sidecar written at parse time.
+    if !force
+        && let Some(map) = &cached_fst
+        && meta.is_some()
+        && is_fresh(&cache.fst).await
+    {
+        let count = map.len();
+        tracing::info!("list '{}': {} domains from FST cache", name, count);
+        return ListOutcome {
+            name,
+            fst: ListFst::File(cache.fst),
+            count,
+            stats: load_stats_cache(&cache.stats).await,
+            digest: meta.map(|m| m.digest),
+        };
+    }
+
+    // (3) The text is fresh but the binary isn't (a previous FST write failed):
+    // rebuild it without going back to the network. The sidecar still describes
+    // this text, so the rebuilt FST inherits its fingerprint.
+    if !force
+        && cached_fst.is_none()
+        && let Some(domains) = load_fresh_text_cache(&cache.domains).await
+    {
         tracing::debug!(
             "list '{}': {} domains from domain cache",
             name,
             domains.len()
         );
-        return (domains, stats);
+        let stats = load_stats_cache(&cache.stats).await;
+        return build_list_fst(name, domains, stats, &cache, meta).await;
     }
 
-    match loader::load_list(url, polarity).await {
-        Ok((domains, stats)) => {
-            tracing::info!("list '{}': fetched {} domains", name, domains.len());
-            save_text_cache(domains_cache, &domains).await;
-            save_stats_cache(stats_cache, stats).await;
-            (domains, stats)
+    // (2)/(4) Ask upstream, replaying the validators from the last fetch. Only
+    // conditional while a cached FST is actually there to keep: a 304 with
+    // nothing on disk would leave this list with nothing to serve.
+    let prior = cached_fst
+        .as_ref()
+        .and(meta.as_ref())
+        .map(|m| m.validators.clone())
+        .filter(|v| !v.is_empty());
+
+    match loader::load_list(&url, polarity, prior.as_ref()).await {
+        // (2) Unchanged upstream — the cached binary is still the answer.
+        Ok(FetchedList::NotModified) if cached_fst.is_some() => {
+            let count = cached_fst.map(|m| m.len()).unwrap_or(0);
+            tracing::info!(
+                "list '{}': unchanged upstream, {} domains kept",
+                name,
+                count
+            );
+            ListOutcome {
+                name,
+                fst: ListFst::File(cache.fst),
+                count,
+                stats: load_stats_cache(&cache.stats).await,
+                digest: meta.map(|m| m.digest),
+            }
         }
-        Err(e) => {
-            tracing::error!("list '{}': fetch failed: {}", name, e);
-            // Stale text cache is better than nothing.
-            if let Ok(content) = tokio::fs::read_to_string(domains_cache).await {
-                // Spans over the text just read — the cache file is already the
-                // shape a `DomainSet` holds, so nothing is copied.
-                let stale = DomainSet::from_lines(content);
-                if !stale.is_empty() {
-                    let stats = load_stats_cache(stats_cache).await;
-                    tracing::warn!(
-                        "list '{}': using stale domain cache ({} domains)",
-                        name,
-                        stale.len()
-                    );
-                    return (stale, stats);
+        Ok(FetchedList::Parsed {
+            domains,
+            stats,
+            digest,
+            validators,
+        }) if !domains.is_empty() => {
+            tracing::info!("list '{}': fetched {} domains", name, domains.len());
+            let unchanged = meta.as_ref().is_some_and(|m| m.digest == digest);
+            let meta = ListMeta {
+                version: CACHE_VERSION.to_string(),
+                digest,
+                validators,
+            };
+            // (2) Same bytes as last time under a moved (or absent) ETag: the
+            // build would reproduce the cached FST byte for byte. Only the
+            // validators are worth writing back.
+            if unchanged && let Some(map) = cached_fst {
+                let count = map.len();
+                tracing::info!("list '{}': content unchanged, {} domains kept", name, count);
+                let digest = Some(meta.digest.clone());
+                save_meta(&cache.meta, &meta).await;
+                return ListOutcome {
+                    name,
+                    fst: ListFst::File(cache.fst),
+                    count,
+                    // The sidecar holds this very parse; falling back to the one
+                    // just made keeps the breakdown alive if it went missing.
+                    stats: load_stats_cache(&cache.stats).await.or(stats),
+                    digest,
+                };
+            }
+            save_text_cache(&cache.domains, &domains).await;
+            save_stats_cache(&cache.stats, stats).await;
+            build_list_fst(name, domains, stats, &cache, Some(meta)).await
+        }
+        // (5) Nothing usable arrived — an error, an empty body, or a 304 whose
+        // cached binary has gone missing. Stale beats blank.
+        outcome => {
+            match &outcome {
+                Ok(_) => tracing::warn!("list '{}': upstream returned nothing usable", name),
+                Err(e) => tracing::error!("list '{}': fetch failed: {}", name, e),
+            }
+            stale_fallback(name, cache, meta).await
+        }
+    }
+}
+
+/// Build the per-list FST from `domains` and replace the cache atomically.
+///
+/// `meta` is the sidecar to record — `Some` only when the fingerprint of what
+/// went in is known. It is written *after* the FST is in place, and removed when
+/// it isn't: a sidecar that describes a file which never landed would let the
+/// next refresh keep a stale list believing it was current.
+async fn build_list_fst(
+    name: String,
+    domains: DomainSet,
+    stats: Option<AdblockStats>,
+    cache: &ListCache,
+    meta: Option<ListMeta>,
+) -> ListOutcome {
+    let fst_path = cache.fst.clone();
+    // tmp + rename: FST files are mmap'd (at merge time and by the explain
+    // scan), so they must only ever be replaced atomically, never written in
+    // place. The map is built straight into the temporary file — it would
+    // otherwise exist in memory as well, next to the domain list it came from.
+    let tmp = fst_path.with_extension("fst.tmp");
+    let build_into = tmp.clone();
+    let built =
+        tokio::task::spawn_blocking(move || loader::build_fst_file(domains, &build_into)).await;
+
+    match built {
+        Ok(Ok(loader::BuiltFst::File(count))) => match tokio::fs::rename(&tmp, &fst_path).await {
+            Ok(()) => {
+                let digest = match meta {
+                    Some(meta) => {
+                        save_meta(&cache.meta, &meta).await;
+                        Some(meta.digest)
+                    }
+                    None => {
+                        // Nothing provable about this build — make sure no older
+                        // sidecar claims otherwise.
+                        let _ = tokio::fs::remove_file(&cache.meta).await;
+                        None
+                    }
+                };
+                ListOutcome {
+                    name,
+                    fst: ListFst::File(fst_path),
+                    count,
+                    stats,
+                    digest,
                 }
             }
-            (DomainSet::new(), None)
+            Err(e) => {
+                tracing::warn!("list '{}': could not save FST cache: {}", name, e);
+                let _ = tokio::fs::remove_file(&tmp).await;
+                let _ = tokio::fs::remove_file(&cache.meta).await;
+                ListOutcome::skipped()
+            }
+        },
+        // The disk refused it; serve this refresh from memory. The on-disk FST
+        // is now whatever it was before, so no sidecar may vouch for it.
+        Ok(Ok(loader::BuiltFst::Ram(bytes))) => {
+            let _ = tokio::fs::remove_file(&cache.meta).await;
+            let count = Map::new(bytes.as_slice()).map(|m| m.len()).unwrap_or(0);
+            ListOutcome {
+                name,
+                fst: ListFst::Ram(bytes),
+                count,
+                stats,
+                digest: None,
+            }
         }
+        Ok(Err(e)) => {
+            tracing::error!("list '{}': FST build failed: {}", name, e);
+            ListOutcome::skipped()
+        }
+        Err(e) => {
+            tracing::error!("list '{}': FST build task panicked: {}", name, e);
+            ListOutcome::skipped()
+        }
+    }
+}
+
+/// Serve a failed refresh from whatever the disk still holds: the built FST
+/// first, then the parsed text it came from. Both keep their fingerprint — they
+/// are exactly what the last successful refresh recorded.
+async fn stale_fallback(name: String, cache: ListCache, meta: Option<ListMeta>) -> ListOutcome {
+    if let Ok(map) = loader::mmap_fst(&cache.fst) {
+        let count = map.len();
+        tracing::warn!("list '{}': using stale FST ({} domains)", name, count);
+        return ListOutcome {
+            name,
+            fst: ListFst::File(cache.fst),
+            count,
+            stats: load_stats_cache(&cache.stats).await,
+            digest: meta.map(|m| m.digest),
+        };
+    }
+    if let Ok(content) = tokio::fs::read_to_string(&cache.domains).await {
+        // Spans over the text just read — the cache file is already the shape a
+        // `DomainSet` holds, so nothing is copied.
+        let stale = DomainSet::from_lines(content);
+        if !stale.is_empty() {
+            tracing::warn!(
+                "list '{}': using stale domain cache ({} domains)",
+                name,
+                stale.len()
+            );
+            let stats = load_stats_cache(&cache.stats).await;
+            return build_list_fst(name, stale, stats, &cache, meta).await;
+        }
+    }
+    tracing::error!("list '{}': no domains available, skipping", name);
+    ListOutcome::skipped()
+}
+
+impl ListOutcome {
+    /// The "this list contributed nothing" outcome: an empty name tells the
+    /// caller to drop it from this refresh.
+    pub(super) fn skipped() -> Self {
+        Self {
+            name: String::new(),
+            fst: ListFst::Ram(Vec::new()),
+            count: 0,
+            stats: None,
+            digest: None,
+        }
+    }
+}
+
+/// Read the cache sidecar, if any.
+async fn load_meta(path: &Path) -> Option<ListMeta> {
+    let bytes = tokio::fs::read(path).await.ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Write the cache sidecar, replacing whatever was there.
+async fn save_meta(path: &Path, meta: &ListMeta) {
+    match serde_json::to_vec(meta) {
+        Ok(bytes) => {
+            if let Err(e) = tokio::fs::write(path, bytes).await {
+                tracing::warn!("could not write cache meta {}: {}", path.display(), e);
+            }
+        }
+        Err(e) => tracing::warn!("could not serialise cache meta: {}", e),
     }
 }
 

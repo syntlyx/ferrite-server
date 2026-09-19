@@ -143,44 +143,135 @@ static HTTP_CLIENT: std::sync::LazyLock<Client> = std::sync::LazyLock::new(|| {
         .expect("failed to build HTTP client")
 });
 
+/// Cache validators a list answered with last time, replayed on the next fetch
+/// so an unchanged subscription costs one round trip instead of tens of
+/// megabytes — and, more to the point, no parse and no FST rebuild.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ListValidators {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_modified: Option<String>,
+}
+
+/// Longest validator header value kept. Real ETags are tens of bytes; the cap
+/// only stops a hostile server from growing our sidecar without end.
+const MAX_VALIDATOR_LEN: usize = 512;
+
+impl ListValidators {
+    fn from_headers(headers: &reqwest::header::HeaderMap) -> Self {
+        let read = |name: reqwest::header::HeaderName| -> Option<String> {
+            let value = headers.get(name)?.to_str().ok()?;
+            (!value.is_empty() && value.len() <= MAX_VALIDATOR_LEN).then(|| value.to_owned())
+        };
+        Self {
+            etag: read(reqwest::header::ETAG),
+            last_modified: read(reqwest::header::LAST_MODIFIED),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.etag.is_none() && self.last_modified.is_none()
+    }
+}
+
+/// What a (possibly conditional) list fetch produced.
+pub enum FetchedList {
+    /// The server answered `304 Not Modified` — what is cached is still current,
+    /// and no body was transferred.
+    NotModified,
+    /// A body arrived and was parsed. `digest` fingerprints the bytes it came
+    /// from, so a list that carries no validators — or one whose ETag moved over
+    /// identical content — is still recognised as unchanged.
+    Parsed {
+        domains: DomainSet,
+        stats: Option<AdblockStats>,
+        digest: String,
+        validators: ListValidators,
+    },
+}
+
 /// Fetch a subscription list from `url` and return parsed domain names.
 ///
 /// Supports:
 /// - `file:///path` — read from local filesystem
-/// - `http://` / `https://` — HTTP GET
+/// - `http://` / `https://` — HTTP GET, conditional when `prior` validators are given
 ///
 /// Format is auto-detected from content (hosts vs. Adblock); `polarity` decides
 /// how Adblock-format content is read (block rules vs `@@` exception rules).
 pub async fn load_list(
     url: &str,
     polarity: ListPolarity,
-) -> Result<(DomainSet, Option<AdblockStats>)> {
+    prior: Option<&ListValidators>,
+) -> Result<FetchedList> {
     // Parsed as it arrives. A big subscription is 20–40 MB of text that would
     // otherwise sit in memory next to the `Vec<String>` it parses into — and
     // this runs on a box whose whole memory target is a few tens of megabytes.
+    // The digest is taken over that same stream, so fingerprinting a list costs
+    // one pass over bytes already in hand and never a second copy of them.
     let mut parser = ListParser::new(polarity);
-    let mut lines = LineSplitter::default();
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
 
-    if let Some(path) = url.strip_prefix("file://") {
+    let validators = if let Some(path) = url.strip_prefix("file://") {
         tracing::info!("reading list from file {}", path);
         use tokio::io::AsyncBufReadExt;
         let file = tokio::fs::File::open(path).await?;
         let mut reader = tokio::io::BufReader::new(file).lines();
         while let Some(line) = reader.next_line().await? {
+            // Hashed as normalised lines rather than raw bytes: a local file has
+            // no validators, so this digest is its only change signal, and it
+            // shouldn't flip on a CRLF rewrite that changes no domain.
+            digest.update(line.as_bytes());
+            digest.update(b"\n");
             parser.feed(&line);
         }
+        ListValidators::default()
     } else {
         tracing::info!("fetching list from {}", url);
-        let mut resp = HTTP_CLIENT.get(url).send().await?.error_for_status()?;
+        let mut request = HTTP_CLIENT.get(url);
+        if let Some(prior) = prior {
+            if let Some(etag) = &prior.etag {
+                request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+            }
+            if let Some(modified) = &prior.last_modified {
+                request = request.header(reqwest::header::IF_MODIFIED_SINCE, modified);
+            }
+        }
+        let resp = request.send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+            tracing::info!("list unchanged upstream (304): {}", url);
+            return Ok(FetchedList::NotModified);
+        }
+        let mut resp = resp.error_for_status()?;
+        let validators = ListValidators::from_headers(resp.headers());
+        let mut lines = LineSplitter::default();
         while let Some(chunk) = resp.chunk().await? {
+            digest.update(&chunk);
             lines.push(&chunk, |line| parser.feed(line));
         }
         lines.finish(|line| parser.feed(line));
-    }
+        validators
+    };
 
     let (domains, stats) = parser.finish();
     tracing::info!("parsed {} domains from {}", domains.len(), url);
-    Ok((domains, stats))
+    Ok(FetchedList::Parsed {
+        domains,
+        stats,
+        digest: hex(digest.finish().as_ref()),
+        validators,
+    })
+}
+
+/// Lowercase hex, for the digest that lands in a cache sidecar.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, b| {
+            let _ = write!(out, "{b:02x}");
+            out
+        })
 }
 
 /// Splits a byte stream into lines across chunk boundaries, exactly as
@@ -608,6 +699,67 @@ pub fn build_fst_file(mut domains: DomainSet, path: &Path) -> Result<BuiltFst> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The conditional-fetch contract end to end: the first fetch records the
+    /// validator upstream sent, the second replays it and is told the list has
+    /// not moved — which is what spares the parse, the FST build and the merge.
+    #[tokio::test]
+    async fn conditional_fetch_replays_the_etag_and_takes_304() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Stand in for the binary's startup, which installs this process-wide.
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+
+        // A two-request HTTP/1.1 server: 200 with an ETag, then 304 to whoever
+        // sends that ETag back. `Connection: close` keeps the two exchanges on
+        // separate sockets, so the second one is a fresh accept.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 2048];
+                let read = sock.read(&mut buf).await.unwrap();
+                let request = String::from_utf8_lossy(&buf[..read]).to_lowercase();
+                let response = if request.contains("if-none-match: \"v1\"") {
+                    "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                } else {
+                    let body = "ads.example\n";
+                    format!(
+                        "HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                sock.write_all(response.as_bytes()).await.unwrap();
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let url = format!("http://{addr}/list.txt");
+        let FetchedList::Parsed {
+            domains,
+            validators,
+            digest,
+            ..
+        } = load_list(&url, ListPolarity::Block, None).await.unwrap()
+        else {
+            panic!("the first fetch should carry a body");
+        };
+        assert_eq!(domains.to_vec(), vec!["ads.example"]);
+        assert_eq!(validators.etag.as_deref(), Some("\"v1\""));
+        assert_eq!(digest.len(), 64, "sha256, hex");
+
+        assert!(
+            matches!(
+                load_list(&url, ListPolarity::Block, Some(&validators))
+                    .await
+                    .unwrap(),
+                FetchedList::NotModified
+            ),
+            "a replayed ETag must come back as 304, not a second download"
+        );
+    }
 
     /// Helper: validation must reject this URL.
     async fn assert_rejected(url: &str) {
