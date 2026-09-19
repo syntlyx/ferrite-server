@@ -19,10 +19,13 @@ CREATE TABLE IF NOT EXISTS queries (
     rcode       INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE INDEX IF NOT EXISTS idx_queries_timestamp  ON queries (timestamp);
+-- Every row here is one DNS query, so each index is maintained on the hot
+-- write path. There is deliberately no single-column index on `timestamp`,
+-- `client_ip` or `status`: each is the leading column of one of the composites
+-- below, and SQLite uses a leftmost prefix (in either scan direction), so they
+-- cost three extra b-tree writes per query and bought nothing. `domain` has no
+-- composite to lean on, so it keeps its own.
 CREATE INDEX IF NOT EXISTS idx_queries_domain     ON queries (domain);
-CREATE INDEX IF NOT EXISTS idx_queries_client_ip  ON queries (client_ip);
-CREATE INDEX IF NOT EXISTS idx_queries_status     ON queries (status);
 CREATE INDEX IF NOT EXISTS idx_queries_time_id_desc
     ON queries (timestamp DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_queries_status_time_id_desc

@@ -888,7 +888,7 @@ fn align_bucket(ts: i64) -> i64 {
 }
 
 /// Latest schema version. Bump when adding a migration step below.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Apply versioned migrations on top of the baseline `SCHEMA`.
 ///
@@ -909,6 +909,7 @@ fn run_migrations(c: &mut rusqlite::Connection) -> rusqlite::Result<()> {
             3 => migrate_v3_device_column(&tx)?,
             4 => migrate_v4_device_buckets(&tx)?,
             5 => migrate_v5_backfill_devices(&tx)?,
+            6 => migrate_v6_drop_redundant_query_indexes(&tx)?,
             _ => unreachable!("no migration step for v{next}"),
         }
         // PRAGMA can't be parameter-bound; the value is our own constant.
@@ -1021,6 +1022,21 @@ fn migrate_v3_device_column(tx: &rusqlite::Transaction) -> rusqlite::Result<()> 
              ON queries (device, timestamp DESC, id DESC)",
     )?;
     Ok(())
+}
+
+/// v6: drop the single-column `queries` indexes that a composite already covers.
+///
+/// `timestamp`, `client_ip` and `status` each lead one of the `…_time_id_desc`
+/// composites, and SQLite answers a lookup from a leftmost prefix — so those
+/// three indexes only added b-tree writes to every logged query and bytes to
+/// the file. Dropping them is safe to repeat and safe on a database that never
+/// had them.
+fn migrate_v6_drop_redundant_query_indexes(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "DROP INDEX IF EXISTS idx_queries_timestamp;
+         DROP INDEX IF EXISTS idx_queries_client_ip;
+         DROP INDEX IF EXISTS idx_queries_status;",
+    )
 }
 
 /// v4: per-device rollup table (mirrors `client_buckets_10m`, keyed by device).
@@ -1881,6 +1897,58 @@ mod tests {
         };
         assert_eq!(version, SCHEMA_VERSION);
         assert!(has_device);
+
+        // v6 removed the single-column indexes a composite already covers, and
+        // left the ones that carry their own lookups. Checked on a database
+        // that pre-dates them too: dropping what was never there must not fail.
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            let names: Vec<String> = c
+                .prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='queries'")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            for gone in [
+                "idx_queries_timestamp",
+                "idx_queries_client_ip",
+                "idx_queries_status",
+            ] {
+                assert!(!names.iter().any(|n| n == gone), "{gone} should be dropped");
+            }
+            for kept in [
+                "idx_queries_domain",
+                "idx_queries_time_id_desc",
+                "idx_queries_status_time_id_desc",
+                "idx_queries_client_time_id_desc",
+                "idx_queries_device_time_id_desc",
+            ] {
+                assert!(names.iter().any(|n| n == kept), "{kept} should remain");
+            }
+
+            // And the lookups those single-column indexes used to serve still
+            // go through an index, not a table scan.
+            for (sql, expect) in [
+                (
+                    "SELECT id FROM queries WHERE timestamp > 0 ORDER BY timestamp DESC, id DESC LIMIT 10",
+                    "idx_queries_time_id_desc",
+                ),
+                (
+                    "SELECT id FROM queries WHERE status = 'blocked' ORDER BY timestamp DESC, id DESC LIMIT 10",
+                    "idx_queries_status_time_id_desc",
+                ),
+                (
+                    "SELECT id FROM queries WHERE client_ip = '192.168.1.50' ORDER BY timestamp DESC, id DESC LIMIT 10",
+                    "idx_queries_client_time_id_desc",
+                ),
+            ] {
+                let plan: String = c
+                    .query_row(&format!("EXPLAIN QUERY PLAN {sql}"), [], |r| r.get(3))
+                    .unwrap();
+                assert!(plan.contains(expect), "{sql}\n  planned as: {plan}");
+            }
+        }
 
         // client_aliases upgraded to (key, key_type) without losing data.
         assert_eq!(
