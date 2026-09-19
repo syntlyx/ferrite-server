@@ -60,6 +60,18 @@ pub async fn get_system_stats(State(state): State<AppState>) -> Result<Json<Valu
 /// NOT residency: on overcommit Linux it can sit far above `rss_anonymous`
 /// (observed 98 MB vs 16 MB resident) and behaves as a high-water mark of
 /// arena slice usage. Watch its trend, never subtract it from RSS.
+///
+/// And before reading a large `rss_anonymous` as a problem: on a machine with
+/// free memory the allocator keeps pages it no longer needs, because nothing
+/// is asking for them back. Measured on Linux/musl with a million-domain
+/// blocklist — the heaviest thing ferrite does — `rss_anonymous` settles
+/// anywhere between 4 MB and 140 MB from run to run while `heap_live` stays at
+/// 1.6 MB; the same build under a 24 MB cgroup limit refreshes that same list
+/// and serves it in ~15 MB RSS. What the process *needs* is the transient
+/// demand of a refresh, not the number RSS shows when memory is free. Chase
+/// `heap_live` and `heap_peak`; treat a large `rss_anonymous` with a flat
+/// `heap_live` as retention, and confirm it with a memory limit before
+/// believing it is a leak.
 fn ferrite_internals(state: &AppState) -> Value {
     let (ptr_cache, ip_to_mac) = state.inner.client_registry.cache_sizes();
     let rss = ferrite_core::memstats::smaps_rollup();
