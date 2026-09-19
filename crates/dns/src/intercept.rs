@@ -7,8 +7,7 @@
 //! narrow contract ([`DnsInterceptor`]), the proxy implements it, and the
 //! composition root wires the two together.
 
-use hickory_proto::op::Message;
-
+use crate::query::LazyQuery;
 use crate::types::DnsResponse;
 
 /// A decision to route a query: the synthetic DNS answer plus which egress the
@@ -26,10 +25,11 @@ pub trait DnsInterceptor: Send + Sync {
 
     /// Returns an answer pointing at the proxy's advertise IP when `name`
     /// should be routed for this client, else `None`. Hot path: one lock-free
-    /// snapshot load, nothing held across an `.await`.
+    /// snapshot load, nothing held across an `.await`, and `query` decoded only
+    /// once a rule has matched and there is an answer to synthesise.
     fn maybe_intercept(
         &self,
-        query: &Message,
+        query: &LazyQuery,
         name: &str,
         qtype: u16,
         client_ip: &str,

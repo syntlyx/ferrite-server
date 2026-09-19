@@ -68,6 +68,12 @@ pub fn question_end(msg: &[u8]) -> Option<usize> {
     (end <= msg.len()).then_some(end)
 }
 
+/// The message's OPCODE (RFC 1035 §4.1.1: bits 1-4 of the flags), or `None` if
+/// there is no header to read it from. 0 is a standard query.
+pub fn opcode(msg: &[u8]) -> Option<u8> {
+    msg.get(2).map(|flags| (flags >> 3) & 0x0F)
+}
+
 /// Rewrite the transaction ID (bytes 0-1, big-endian). A message too short to
 /// hold a header is left alone.
 pub fn set_id(msg: &mut [u8], id: u16) {
@@ -461,6 +467,43 @@ pub fn set_dnssec_ok(msg: &mut [u8], opt: &EdnsRef, want: bool) {
 /// located OPT record.
 pub fn set_udp_payload(msg: &mut [u8], opt: &EdnsRef, payload: u16) {
     msg[opt.payload_off..opt.payload_off + 2].copy_from_slice(&payload.to_be_bytes());
+}
+
+/// What reading the first question produced.
+pub enum QuestionScan {
+    /// The queried name — lowercase, no trailing root dot — and its QTYPE.
+    Found { name: String, qtype: u16 },
+    /// The name isn't a plain LDH one (an IDN `xn--` label, or one holding
+    /// bytes a text form has to escape). The full parser spells those the way
+    /// the rest of ferrite does, so the caller defers to it — see
+    /// [`CnameScan::Unsupported`], which draws the same line for the same
+    /// reason.
+    Unsupported,
+    /// No question to read: QDCOUNT is 0, or the message doesn't walk.
+    Missing,
+}
+
+/// Read the first question of a query without decoding the message.
+pub fn question(msg: &[u8]) -> QuestionScan {
+    if msg.len() < HEADER_LEN || u16::from_be_bytes([msg[4], msg[5]]) == 0 {
+        return QuestionScan::Missing;
+    }
+    let mut name = String::new();
+    if read_name_lower(msg, HEADER_LEN, &mut name).is_none() {
+        // Either unrenderable or malformed; `question_end` tells the two apart,
+        // and only a walkable question is worth handing to the full parser.
+        return match question_end(msg) {
+            Some(_) => QuestionScan::Unsupported,
+            None => QuestionScan::Missing,
+        };
+    }
+    let Some(end) = question_end(msg) else {
+        return QuestionScan::Missing;
+    };
+    QuestionScan::Found {
+        name,
+        qtype: u16::from_be_bytes([msg[end - 4], msg[end - 3]]),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -901,6 +944,42 @@ mod tests {
             find_cname_target(&looped, |_| true),
             CnameScan::Unsupported
         ));
+    }
+
+    #[test]
+    fn reads_the_question_off_the_wire() {
+        let msg = Msg::new([1, 0, 0, 0], 0)
+            .question("WWW.Example.COM", 28)
+            .build();
+        let QuestionScan::Found { name, qtype } = question(&msg) else {
+            panic!("question not found");
+        };
+        assert_eq!(name, "www.example.com");
+        assert_eq!(qtype, 28);
+        assert_eq!(opcode(&msg), Some(0));
+
+        // The root: one empty name, and the log spells it "".
+        let root = Msg::new([1, 0, 0, 0], 0).question("", 48).build();
+        assert!(matches!(
+            question(&root),
+            QuestionScan::Found { ref name, qtype: 48 } if name.is_empty()
+        ));
+
+        // An IDN question goes to the full parser, like an IDN CNAME target.
+        let idn = Msg::new([1, 0, 0, 0], 0)
+            .question("xn--80ak6aa92e.com", 1)
+            .build();
+        assert!(matches!(question(&idn), QuestionScan::Unsupported));
+
+        // Nothing to read: no question at all, and a truncated one.
+        let none = Msg::new([0, 0, 0, 0], 0).build();
+        assert!(matches!(question(&none), QuestionScan::Missing));
+        assert!(matches!(
+            question(&msg[..msg.len() - 6]),
+            QuestionScan::Missing
+        ));
+        assert!(matches!(question(&[]), QuestionScan::Missing));
+        assert_eq!(opcode(&[]), None);
     }
 
     #[test]

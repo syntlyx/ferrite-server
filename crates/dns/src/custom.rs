@@ -9,6 +9,7 @@ use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinEncodable;
 use parking_lot::RwLock;
 
+use crate::query::LazyQuery;
 use crate::types::DnsResponse;
 use ferrite_core::config::CustomRecordConfig;
 use ferrite_core::error::{FeriteError, Result};
@@ -99,19 +100,21 @@ impl CustomRecords {
     }
 
     /// Look up a domain + qtype and return a ready-to-send DNS response, or `None`.
-    pub fn lookup(&self, query: &Message, name: &str, qtype: u16) -> Option<DnsResponse> {
+    /// `query` is decoded only if a record matches — the overwhelming majority
+    /// of queries match none, and they shouldn't pay for a decode to find out.
+    pub fn lookup(&self, query: &LazyQuery, name: &str, qtype: u16) -> Option<DnsResponse> {
         let name_norm = normalise(name);
         let want_type = RecordType::from(qtype);
 
         let records = self.records.read();
         if let Some(record) = find_record(&records, &name_norm, want_type) {
-            return build_response(query, name, record);
+            return build_response(query.message()?, name, record);
         }
 
         let builtin_records = self.builtin_records.read();
         let record = find_record(&builtin_records, &name_norm, want_type)?;
 
-        build_response(query, name, record)
+        build_response(query.message()?, name, record)
     }
 }
 
@@ -262,11 +265,12 @@ mod tests {
         }
     }
 
-    fn query(name: &str, record_type: RecordType) -> Message {
+    /// A query on the wire, the form the pipeline hands to `lookup`.
+    fn query(name: &str, record_type: RecordType) -> Vec<u8> {
         let mut msg = Message::new(0, hickory_proto::op::MessageType::Query, OpCode::Query);
         let name = Name::from_str(&format!("{}.", name)).unwrap();
         msg.add_query(Query::query(name, record_type));
-        msg
+        msg.to_bytes().unwrap()
     }
 
     fn answer_a(resp: &DnsResponse) -> Ipv4Addr {
@@ -284,7 +288,7 @@ mod tests {
 
         assert!(records.list().is_empty());
 
-        let resp = records.lookup(&query("fe.te", RecordType::A), "fe.te", 1);
+        let resp = records.lookup(&LazyQuery::new(&query("fe.te", RecordType::A)), "fe.te", 1);
         assert_eq!(
             resp.map(|r| answer_a(&r)),
             Some("192.168.1.10".parse().unwrap())
@@ -307,7 +311,11 @@ mod tests {
         // With both a CNAME and a direct A, an A query must get the A record,
         // not the bare CNAME (which would be cached under the A key).
         let resp = records
-            .lookup(&query("host.test", RecordType::A), "host.test", 1)
+            .lookup(
+                &LazyQuery::new(&query("host.test", RecordType::A)),
+                "host.test",
+                1,
+            )
             .unwrap();
         assert_eq!(answer_type(&resp), RecordType::A);
         assert_eq!(answer_a(&resp), "192.168.1.5".parse::<Ipv4Addr>().unwrap());
@@ -322,7 +330,11 @@ mod tests {
 
         // No direct A — the CNAME is a legitimate fallback for the chain.
         let resp = records
-            .lookup(&query("cn.test", RecordType::A), "cn.test", 1)
+            .lookup(
+                &LazyQuery::new(&query("cn.test", RecordType::A)),
+                "cn.test",
+                1,
+            )
             .unwrap();
         assert_eq!(answer_type(&resp), RecordType::CNAME);
     }
@@ -333,7 +345,7 @@ mod tests {
         records.load_builtin(&[cfg("fe.te", "A", "192.168.1.10")]);
         records.add(&cfg("fe.te", "A", "192.168.1.20")).unwrap();
 
-        let resp = records.lookup(&query("fe.te", RecordType::A), "fe.te", 1);
+        let resp = records.lookup(&LazyQuery::new(&query("fe.te", RecordType::A)), "fe.te", 1);
         assert_eq!(
             resp.map(|r| answer_a(&r)),
             Some("192.168.1.20".parse().unwrap())

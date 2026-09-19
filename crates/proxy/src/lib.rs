@@ -47,6 +47,7 @@ use ferrite_clients::ClientRegistry;
 use ferrite_core::config::{Config, EgressConfig, ProxyConfig};
 use ferrite_core::recording::RecordSwitches;
 use ferrite_dns::intercept::{DnsInterceptor, Intercept};
+use ferrite_dns::query::LazyQuery;
 use ferrite_dns::types::{DnsResponse, qtype as qt};
 use ferrite_upstream::{EgressConnectError, EgressConnectFuture, EgressConnector, ZoneRouter};
 
@@ -352,7 +353,7 @@ impl DnsInterceptor for ProxyState {
     /// One ArcSwap load, no lock held across an `.await`.
     fn maybe_intercept(
         &self,
-        query: &Message,
+        query: &LazyQuery,
         name: &str,
         qtype: u16,
         client_ip: &str,
@@ -370,7 +371,14 @@ impl DnsInterceptor for ProxyState {
         // also be scoped to specific clients (by IP/MAC).
         let rule = snap.route(name, client_ip, client_mac)?;
         let egress_id = snap.egresses[rule.egress_idx].id().to_string();
-        let response = synth_response(query, qtype, snap.advertise_ipv4, snap.advertise_ipv6);
+        // Decoded only now: the query has to be echoed into an answer, which
+        // is the one thing the wire form can't do for us.
+        let response = synth_response(
+            query.message()?,
+            qtype,
+            snap.advertise_ipv4,
+            snap.advertise_ipv6,
+        );
         Some(Intercept {
             response,
             egress_id,
@@ -600,14 +608,15 @@ mod tests {
         ProxyState::from_config(&cfg, upstream(), all_recording())
     }
 
-    fn query(name: &str, rt: RecordType) -> Message {
+    /// A query on the wire, the form the DNS pipeline hands to the hook.
+    fn query(name: &str, rt: RecordType) -> Vec<u8> {
         let mut m = Message::new(0xABCD, MessageType::Query, OpCode::Query);
         m.metadata.recursion_desired = true;
         m.add_query(Query::query(
             Name::from_str(&format!("{name}.")).unwrap(),
             rt,
         ));
-        m
+        m.to_bytes().unwrap()
     }
 
     #[test]
@@ -615,7 +624,13 @@ mod tests {
         let proxy = state(true);
         let q = query("www.example.com", RecordType::A);
         let hit = proxy
-            .maybe_intercept(&q, "www.example.com", qtype::A, "0.0.0.0", None)
+            .maybe_intercept(
+                &LazyQuery::new(&q),
+                "www.example.com",
+                qtype::A,
+                "0.0.0.0",
+                None,
+            )
             .expect("should route");
         assert_eq!(hit.egress_id, "t");
         let msg = Message::from_bytes(&hit.response.bytes).unwrap();
@@ -631,7 +646,7 @@ mod tests {
         let q = query("other.test", RecordType::A);
         assert!(
             proxy
-                .maybe_intercept(&q, "other.test", qtype::A, "0.0.0.0", None)
+                .maybe_intercept(&LazyQuery::new(&q), "other.test", qtype::A, "0.0.0.0", None)
                 .is_none()
         );
     }
@@ -642,7 +657,13 @@ mod tests {
         let q = query("www.example.com", RecordType::A);
         assert!(
             proxy
-                .maybe_intercept(&q, "www.example.com", qtype::A, "0.0.0.0", None)
+                .maybe_intercept(
+                    &LazyQuery::new(&q),
+                    "www.example.com",
+                    qtype::A,
+                    "0.0.0.0",
+                    None
+                )
                 .is_none()
         );
     }
@@ -652,7 +673,13 @@ mod tests {
         let proxy = state(true);
         let q = query("www.example.com", RecordType::AAAA);
         let hit = proxy
-            .maybe_intercept(&q, "www.example.com", qtype::AAAA, "0.0.0.0", None)
+            .maybe_intercept(
+                &LazyQuery::new(&q),
+                "www.example.com",
+                qtype::AAAA,
+                "0.0.0.0",
+                None,
+            )
             .expect("should still intercept");
         let msg = Message::from_bytes(&hit.response.bytes).unwrap();
         // NODATA: NoError with no answers, so the client falls back to IPv4.
@@ -790,7 +817,13 @@ mod tests {
         let proxy = state(true);
         let q = query("www.example.com", RecordType::from(qtype::HTTPS));
         let hit = proxy
-            .maybe_intercept(&q, "www.example.com", qtype::HTTPS, "0.0.0.0", None)
+            .maybe_intercept(
+                &LazyQuery::new(&q),
+                "www.example.com",
+                qtype::HTTPS,
+                "0.0.0.0",
+                None,
+            )
             .expect("should intercept type 65");
         let msg = Message::from_bytes(&hit.response.bytes).unwrap();
         assert_eq!(msg.metadata.response_code, ResponseCode::NoError);
