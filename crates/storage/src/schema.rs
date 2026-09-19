@@ -50,6 +50,12 @@ CREATE TABLE IF NOT EXISTS query_buckets_10m (
     upstream  INTEGER NOT NULL DEFAULT 0
 );
 
+-- One upsert per distinct domain per flush, so the same rule as the query log
+-- applies: only indexes a read uses. The primary key serves every read there
+-- is (`WHERE bucket BETWEEN ? AND ? GROUP BY domain`); nothing looks a single
+-- domain up, so there is no `(domain, bucket)` index — it doubled the cost of
+-- an upsert and the size of the table for nobody. `device_buckets_10m` below
+-- does have one, because per-device stats really are read that way.
 CREATE TABLE IF NOT EXISTS domain_buckets_10m (
     bucket   INTEGER NOT NULL,
     domain   TEXT    NOT NULL,
@@ -57,8 +63,6 @@ CREATE TABLE IF NOT EXISTS domain_buckets_10m (
     blocked  INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (bucket, domain)
 );
-CREATE INDEX IF NOT EXISTS idx_domain_buckets_domain_bucket
-    ON domain_buckets_10m (domain, bucket);
 
 CREATE TABLE IF NOT EXISTS client_buckets_10m (
     bucket     INTEGER NOT NULL,
