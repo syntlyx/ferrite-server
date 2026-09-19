@@ -75,7 +75,10 @@ fn matched_key(domain: &str, contains: impl Fn(&str) -> bool) -> Option<String> 
     let mut rest = domain;
     while let Some(dot) = rest.find('.') {
         rest = &rest[dot + 1..];
-        if is_registrable_or_deeper(rest) && contains(rest) {
+        // Membership first, public-suffix guard second: both have to hold, and
+        // the guard is the more expensive of the two (see the walk in
+        // `is_whitelisted_for_normalized`).
+        if contains(rest) && is_registrable_or_deeper(rest) {
             return Some(rest.to_string());
         }
     }
@@ -626,7 +629,7 @@ impl Blocklist {
             let mut rest = domain;
             while let Some(dot) = rest.find('.') {
                 rest = &rest[dot + 1..];
-                if is_registrable_or_deeper(rest) && blacklist.contains(rest) {
+                if blacklist.contains(rest) && is_registrable_or_deeper(rest) {
                     return true;
                 }
             }
@@ -656,7 +659,7 @@ impl Blocklist {
         let mut rest = domain;
         while let Some(dot) = rest.find('.') {
             rest = &rest[dot + 1..];
-            if is_registrable_or_deeper(rest) && fst.contains_key(rest.as_bytes()) {
+            if fst.contains_key(rest.as_bytes()) && is_registrable_or_deeper(rest) {
                 return true;
             }
         }
@@ -778,7 +781,11 @@ impl Blocklist {
             let mut rest = domain;
             while let Some(dot) = rest.find('.') {
                 rest = &rest[dot + 1..];
-                if is_registrable_or_deeper(rest) && whitelist.contains(rest) {
+                // Set lookup before the public-suffix guard: both must hold, and
+                // this one is a hash (free on the empty set every unconfigured
+                // install has) where the guard is a trie walk. This runs
+                // uncached on every single query, unlike the FST tier below it.
+                if whitelist.contains(rest) && is_registrable_or_deeper(rest) {
                     return true;
                 }
             }
