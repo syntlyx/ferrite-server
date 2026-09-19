@@ -1836,4 +1836,61 @@ mod tests {
 
         cleanup_sqlite(&h.db_path);
     }
+
+    /// What one query costs end to end, with no sockets in the way — the number
+    /// every optimisation on this path moves, and the one that quietly comes
+    /// back if someone reintroduces a decode or an allocation.
+    ///
+    /// Ignored by default (it is a measurement, not an assertion):
+    /// `cargo test --release -p ferrite-dns -- --ignored --nocapture pipeline_cost`
+    ///
+    /// For reference, on an M-series laptop: ~360 ns for a cache hit and ~230 ns
+    /// for a block. It was 1365 / 1244 ns before the 2026-09 pass, so a result
+    /// in that range means something was undone.
+    #[tokio::test]
+    #[ignore]
+    async fn pipeline_cost() {
+        use std::time::Instant;
+
+        let h = Harness::new("dns-pipeline-cost").await;
+        h.blocklist.add_blacklist("ads.test").unwrap();
+        h.dns_cache.insert(
+            "cached.test",
+            1,
+            false,
+            DnsResponse {
+                bytes: bytes::Bytes::from(a_response(
+                    0x2222,
+                    "cached.test",
+                    Ipv4Addr::new(192, 0, 2, 8),
+                    3600,
+                )),
+                ttl: 3600,
+            },
+        );
+        let ctx = Arc::new(h.ctx());
+        let src = SocketAddr::from(([192, 0, 2, 10], 53_000));
+        let cached = raw_query("cached.test", RecordType::A);
+        let blocked = raw_query("ads.test", RecordType::A);
+
+        const ROUNDS: u32 = 50_000;
+        for raw in [&cached, &blocked] {
+            for _ in 0..2_000 {
+                let _ = handle_query(raw.clone(), src, Arc::clone(&ctx)).await;
+            }
+        }
+        for (label, raw) in [("cache hit", &cached), ("blocked", &blocked)] {
+            let start = Instant::now();
+            for _ in 0..ROUNDS {
+                let answer = handle_query(raw.clone(), src, Arc::clone(&ctx)).await;
+                std::hint::black_box(answer).unwrap();
+            }
+            println!(
+                "pipeline {label:<10} {:>7.0} ns/query",
+                start.elapsed().as_nanos() as f64 / ROUNDS as f64
+            );
+        }
+
+        cleanup_sqlite(&h.db_path);
+    }
 }
