@@ -76,6 +76,7 @@ mod nullable {
 ///                             `blocklist_enabled`, `blocklist_client_bypass`,
 ///                             `debug_logging`.
 /// Restart-required:           `storage_backend`, `storage_path`,
+///                             `blocklist_cache_dir`,
 ///                             `dns_bind_addr`, `dns_cache_size`, `dns_cache_max_mb`,
 ///                             `dns_strip_ecs`, `dns_dnssec`, `api_bind_addr`,
 ///                             `blocklist_decision_cache_size`, `upstream`, `zones`,
@@ -117,6 +118,10 @@ pub struct SettingsPatch {
     /// the *next* startup rather than this request. See
     /// `GET /api/storage/locations` for what this box offers.
     pub storage_path: Option<PathBuf>,
+    /// Directory for the compiled blocklist cache. Restart required — the
+    /// engine maps its files at startup — and validated the same way as
+    /// `storage_path`, for the same reason.
+    pub blocklist_cache_dir: Option<PathBuf>,
     pub dns_bind_addr: Option<String>,
     pub dns_cache_size: Option<usize>,
     pub dns_cache_max_mb: Option<usize>,
@@ -337,6 +342,14 @@ pub async fn update_settings(
             if path != cfg.storage.path {
                 cfg.storage.path = path;
                 restart_changed.push("storage_path");
+            }
+        }
+
+        if let Some(dir) = patch.blocklist_cache_dir.as_ref() {
+            let dir = validate_blocklist_cache_dir(dir)?;
+            if dir != cfg.storage.blocklist_cache_dir {
+                cfg.storage.blocklist_cache_dir = dir;
+                restart_changed.push("blocklist_cache_dir");
             }
         }
 
@@ -595,6 +608,23 @@ fn validate_storage_path(path: &Path) -> Result<PathBuf, ApiError> {
         .ok_or_else(|| config_error(format!("storage_path '{}' has no parent", path.display())))?;
     ensure_creatable(parent)?;
     Ok(path)
+}
+
+/// Check a proposed `storage.blocklist_cache_dir`, for the same reason as
+/// [`validate_storage_path`]. A bad one would not stop the box booting — the
+/// engine falls back to a RAM FST — but every refresh would then fail to write
+/// and the lists would be downloaded again on each start, which is a worse
+/// failure to discover than a refused request.
+fn validate_blocklist_cache_dir(dir: &Path) -> Result<PathBuf, ApiError> {
+    let dir = absolute_path("blocklist_cache_dir", dir)?;
+    if dir.exists() && !dir.is_dir() {
+        return Err(config_error(format!(
+            "blocklist_cache_dir '{}' is a file — give a directory",
+            dir.display()
+        )));
+    }
+    ensure_creatable(&dir)?;
+    Ok(dir)
 }
 
 fn config_error(msg: String) -> ApiError {
@@ -858,6 +888,63 @@ mod tests {
         let saved: Config =
             toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
         assert_eq!(saved.storage.path, target);
+
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
+        let _ = std::fs::remove_file(config_path);
+    }
+
+    /// The blocklist cache directory: a file or a relative path is refused, a
+    /// directory that does not exist yet is accepted and persisted.
+    #[tokio::test]
+    async fn blocklist_cache_dir_is_validated_then_saved() {
+        let (state, db_path, config_path) =
+            test_support::app_state_with_config_path("api-blocklist-cache-dir").await;
+        let original = state.live_config.read().storage.blocklist_cache_dir.clone();
+
+        let file = std::env::temp_dir().join(format!("ferrite-cache-file-{}", std::process::id()));
+        std::fs::write(&file, b"").unwrap();
+        for bad in [PathBuf::from("relative/cache"), file.clone()] {
+            let err = update_settings(
+                State(state.clone()),
+                Json(SettingsPatch {
+                    blocklist_cache_dir: Some(bad.clone()),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert!(err.is_err(), "'{}' should have been refused", bad.display());
+        }
+        let _ = std::fs::remove_file(&file);
+        assert_eq!(
+            state.live_config.read().storage.blocklist_cache_dir,
+            original
+        );
+
+        let target = std::env::temp_dir().join(format!("ferrite-cache-dir-{}", std::process::id()));
+        let Json(value) = update_settings(
+            State(state.clone()),
+            Json(SettingsPatch {
+                blocklist_cache_dir: Some(target.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            value["restart_changed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f == "blocklist_cache_dir")
+        );
+        let saved: Config =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(saved.storage.blocklist_cache_dir, target);
+        assert_eq!(
+            saved.storage.blocklist_fst_path(),
+            target.join("blocklist.fst")
+        );
 
         drop(state);
         test_support::cleanup_sqlite(&db_path);

@@ -276,7 +276,7 @@ impl AppState {
         ));
 
         // Blocklist engine
-        let fst_path = data_dir.join("blocklist.fst");
+        let fst_path = config.storage.blocklist_fst_path();
         let blocklist = Arc::new(Blocklist::new(
             config.blocklist.clone(),
             config.allowlist.clone(),

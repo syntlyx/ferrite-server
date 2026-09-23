@@ -127,10 +127,10 @@ port    = 53
 #   "sqlite" (default) — a database file; history survives a restart.
 #   "memory"           — RAM only. No database file, no write-ahead log, and no
 #                        disk write per query; history is lost on restart.
-#                        (The compiled blocklist cache still lives in the data
-#                        directory — it is built from downloaded lists, not from
-#                        your traffic, and is written on a refresh, not per
-#                        query.)
+#                        (The compiled blocklist cache still lives on disk — it
+#                        is built from downloaded lists, not from your traffic,
+#                        and is written on a refresh, not per query. Move it
+#                        with `blocklist_cache_dir` below.)
 #
 # Pick "memory" when the box boots off something you'd rather not spend writes
 # on (an SD card), or when the root filesystem is read-only, or simply when you
@@ -159,6 +159,21 @@ port    = 53
 # must be absolute, must not be a directory, and ferrite must be able to create
 # files along it.
 # path = "/var/lib/ferrite/ferrite.db"
+
+# Where the compiled blocklist lives: the merged and per-profile FSTs the
+# resolver maps, and the per-list caches a refresh builds them from (`lists/`,
+# `allowlists/`). Default: the data directory, ~/.local/share/ferrite.
+#
+# None of it is your data — it is all rebuilt from the list servers — and it is
+# written on a refresh, not per query; with conditional fetches, only when a
+# list actually changed. A RAM-backed mount spends no flash on it at all. What
+# that costs: the files then occupy RAM that cannot be paged out (roughly the
+# size of the lists, tens of MB for a few big ones), and after a reboot every
+# list is downloaded again before blocking is back to full strength.
+#
+# Changing this needs a restart. The old directory is left as it was — delete
+# it by hand if you want the space back. Checked before it is saved, like `path`.
+# blocklist_cache_dir = "/dev/shm/ferrite"
 
 # Automatically delete query log entries older than this many days.
 # Default: 30. A busy household writes on the order of a gigabyte of query log a

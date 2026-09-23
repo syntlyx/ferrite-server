@@ -7,6 +7,10 @@
 //! answers that: the RAM-backed mounts ferrite can actually write to, with
 //! their free space, plus the on-disk default so the way back is as visible as
 //! the way out.
+//!
+//! The compiled blocklist cache is placed from the same list: it faces the same
+//! trade (flash writes on each refresh versus RAM and a re-download after a
+//! reboot), just for data that came from list servers rather than traffic.
 
 use axum::{Json, extract::State};
 use serde::Serialize;
@@ -78,6 +82,14 @@ pub async fn list_locations(State(state): State<AppState>) -> Json<Value> {
         "current": current.display().to_string(),
         "default": default_path.display().to_string(),
         "suggestions": suggestions,
+        // The compiled blocklist picks from the same mounts — each
+        // suggestion's `dir` is what `blocklist_cache_dir` would be set to.
+        "blocklist_cache": {
+            "current": cfg.storage.blocklist_cache_dir.display().to_string(),
+            "default": default_dir.display().to_string(),
+            "available_bytes": fsinfo::space_for(&cfg.storage.blocklist_cache_dir)
+                .map(|s| s.available_bytes),
+        },
     }))
 }
 
@@ -134,6 +146,12 @@ mod tests {
 
         // Free space is reported for a path that does not exist yet.
         assert!(marked[0]["available_bytes"].as_u64().is_some());
+
+        // The blocklist cache defaults to the same directory the default
+        // database suggestion sits in, so one chip serves both fields.
+        let cache = &value["blocklist_cache"];
+        assert_eq!(cache["default"], suggestions[0]["dir"]);
+        assert!(cache["current"].as_str().is_some());
 
         drop(state);
         test_support::cleanup_sqlite(&db_path);

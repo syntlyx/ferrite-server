@@ -908,6 +908,17 @@ default and whatever is configured, and the path is typed by hand.
 }
 ```
 
+`blocklist_cache` places the compiled blocklist from the same list: each
+suggestion's `dir` is what `blocklist_cache_dir` would be set to.
+
+```json
+"blocklist_cache": {
+  "current": "/home/pi/.local/share/ferrite",
+  "default": "/home/pi/.local/share/ferrite",
+  "available_bytes": 24000000000
+}
+```
+
 `available_bytes` excludes the reserve only root may use, so it is what an
 ordinary write actually gets. Both figures are `null` if the filesystem could
 not be queried. A `ram_backed` location costs the disk no writes and is cleared
@@ -934,7 +945,8 @@ All fields are optional. Fields not provided are left unchanged.
 | `log_retention_days` | int              | Automatically delete query log entries older than N days; `0` disables retention. Applied once ~30 s after startup and every 24 h thereafter.                                                                   |
 | `log_max_mb`         | int              | Cap the query log at N MB, deleting oldest entries first; `0` (default) disables the cap. Checked every 60 s, so it takes effect within the minute. Independent of `log_retention_days` — whichever trims first wins. |
 | `storage_path`       | string           | Where the SQLite database file lives. Validated before it is saved: must be absolute, must not be a directory, and ferrite must be able to create files along it — an unusable path would otherwise only fail at the next startup, which this change itself triggers. **Restart required.** See `GET /api/storage/locations`. |
-| `storage_backend`    | `"sqlite"` \| `"memory"` | Which store holds the query log, its rollups and the device inventory. `memory` creates no database file and keeps nothing across a restart; the compiled blocklist cache still lives on disk, since it comes from downloaded lists rather than traffic. **Restart required.** Configuration is unaffected — it lives in `config.toml` either way. |
+| `blocklist_cache_dir` | string          | Directory for the compiled blocklist (merged and per-profile FSTs, per-list caches). Must be absolute, must not be a file, and ferrite must be able to create it. On a RAM-backed mount it costs no flash writes, but occupies RAM that cannot be paged out and is re-downloaded after a reboot. The old directory is left in place. **Restart required.** |
+| `storage_backend`    | `"sqlite"` \| `"memory"` | Which store holds the query log, its rollups and the device inventory. `memory` creates no database file and keeps nothing across a restart; the compiled blocklist cache still lives on disk, since it comes from downloaded lists rather than traffic — move it with `blocklist_cache_dir`. **Restart required.** Configuration is unaffected — it lives in `config.toml` either way. |
 | `log_queries`        | bool             | Privacy switch for the per-query log. `false` stops writing rows to `queries`, empties the live ring buffer, and makes `GET /api/queries` return `[]` on every branch — default page, filtered query and delta poll alike. Filtering, routing and the lifetime counters are unaffected. Existing rows stay on disk and become readable again if you switch it back on; clear them for good with `DELETE /api/queries`. |
 | `keep_stats`         | bool             | Privacy switch for the aggregates. `false` stops the 10-minute rollups, the top-N counters, the 24-hour timeseries and the per-egress routed-domain tables, drops what they already hold in memory, and stops every aggregate *read* as well: `/api/stats/top-domains`, `/api/stats/top-blocked`, `/api/stats/top-clients` and `/api/clients` return empty, and `/api/clients/{device}/stats` returns 404, however far back the window reaches. Per-egress byte and connection totals keep counting — they name no host. `/api/stats/summary` keeps serving the process-lifetime counters (`total_queries`, `blocked_queries`, …), which hold no domain or device identity. |
 | `blocklist_enabled`  | bool             | Master switch for DNS blocklist filtering. DNS resolution, custom records, caching, and logging continue to work while filtering is disabled.                                                                    |

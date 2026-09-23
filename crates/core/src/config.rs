@@ -223,6 +223,14 @@ pub struct StorageConfig {
     pub backend: StorageBackend,
     /// SQLite database path. Unused by the `memory` backend.
     pub path: PathBuf,
+    /// Directory for the compiled blocklist: the merged and per-profile FSTs
+    /// the resolver maps, and the per-list caches a refresh builds them from.
+    ///
+    /// Separate from `path` because it is a different kind of data: nothing in
+    /// it came from your traffic, all of it can be rebuilt by downloading the
+    /// lists again, and it is written on a refresh rather than per query.
+    /// Default: the data directory, which is where it always lived.
+    pub blocklist_cache_dir: PathBuf,
     /// Automatically delete query log entries older than this many days.
     /// 0 keeps them forever. Applied once at startup and then every 24 hours.
     ///
@@ -288,6 +296,11 @@ fn is_retention_disabled(d: &u32) -> bool {
 pub const BYTES_PER_MB: u64 = 1_000_000;
 
 impl StorageConfig {
+    /// The merged blocklist FST, which the engine keeps its other caches beside.
+    pub fn blocklist_fst_path(&self) -> PathBuf {
+        self.blocklist_cache_dir.join("blocklist.fst")
+    }
+
     /// The recording surfaces these settings leave enabled.
     pub fn record_scope(&self) -> RecordScope {
         RecordScope {
@@ -662,6 +675,7 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             path: data_dir().join("ferrite.db"),
+            blocklist_cache_dir: data_dir(),
             backend: StorageBackend::Sqlite,
             log_retention_days: DEFAULT_LOG_RETENTION_DAYS,
             log_max_mb: 0,
