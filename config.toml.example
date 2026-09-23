@@ -148,6 +148,16 @@ port    = 53
 
 # Where the database file lives. Default: ~/.local/share/ferrite/ferrite.db
 # (unused by the "memory" backend).
+#
+# Settable from the panel too, which lists what this box offers — including any
+# RAM-backed mounts (/dev/shm, /run, /tmp on systemd) with their free space. A
+# database on one of those costs the disk no writes at all and is cleared by a
+# reboot; `memory` above is the same trade without a file in the way, and the
+# difference is that a path on tmpfs survives a restart of ferrite itself.
+#
+# Changing this needs a restart. The path is checked before it is saved — it
+# must be absolute, must not be a directory, and ferrite must be able to create
+# files along it.
 # path = "/var/lib/ferrite/ferrite.db"
 
 # Automatically delete query log entries older than this many days.

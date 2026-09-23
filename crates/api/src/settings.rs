@@ -1,4 +1,7 @@
-use std::{net::Ipv4Addr, path::PathBuf};
+use std::{
+    net::Ipv4Addr,
+    path::{Path, PathBuf},
+};
 
 use axum::{Json, extract::State};
 use serde::Deserialize;
@@ -10,6 +13,7 @@ use crate::auth::hash_password;
 use ferrite_app::AppState;
 use ferrite_core::config::{UpstreamConfig, ZoneConfig};
 use ferrite_core::error::FeriteError;
+use ferrite_core::fsinfo;
 use ferrite_core::net::normalize_client_key;
 use ferrite_dns::cache::{MAX_TTL, MIN_TTL};
 
@@ -71,7 +75,7 @@ mod nullable {
 ///                             `log_queries`, `keep_stats`,
 ///                             `blocklist_enabled`, `blocklist_client_bypass`,
 ///                             `debug_logging`.
-/// Restart-required:           `storage_backend`,
+/// Restart-required:           `storage_backend`, `storage_path`,
 ///                             `dns_bind_addr`, `dns_cache_size`, `dns_cache_max_mb`,
 ///                             `dns_strip_ecs`, `dns_dnssec`, `api_bind_addr`,
 ///                             `blocklist_decision_cache_size`, `upstream`, `zones`,
@@ -108,6 +112,11 @@ pub struct SettingsPatch {
     /// `"sqlite"` or `"memory"` — which store holds the query log. Restart
     /// required: the store is built once, at startup.
     pub storage_backend: Option<String>,
+    /// Where the SQLite database file lives. Restart required, and validated
+    /// before it is written: a path that can't be opened would otherwise fail
+    /// the *next* startup rather than this request. See
+    /// `GET /api/storage/locations` for what this box offers.
+    pub storage_path: Option<PathBuf>,
     pub dns_bind_addr: Option<String>,
     pub dns_cache_size: Option<usize>,
     pub dns_cache_max_mb: Option<usize>,
@@ -321,6 +330,14 @@ pub async fn update_settings(
                 }
             };
             restart_changed.push("storage_backend");
+        }
+
+        if let Some(path) = patch.storage_path.as_ref() {
+            let path = validate_storage_path(path)?;
+            if path != cfg.storage.path {
+                cfg.storage.path = path;
+                restart_changed.push("storage_path");
+            }
         }
 
         if let Some(size) = patch.dns_cache_size {
@@ -555,6 +572,73 @@ fn schedule_restart(state: &AppState) {
 #[cfg(test)]
 fn schedule_restart(_state: &AppState) {}
 
+/// Check a proposed `storage.path` before it reaches the config file.
+///
+/// The failure this prevents is the nasty one: an unusable path is accepted,
+/// written to disk, and the box then refuses to come back up after the restart
+/// the change itself triggered — with the panel gone, so the only way out is a
+/// text editor on the device.
+fn validate_storage_path(path: &Path) -> Result<PathBuf, ApiError> {
+    let path = absolute_path("storage_path", path)?;
+
+    if path.is_dir() {
+        return Err(config_error(format!(
+            "storage_path '{}' is a directory — give the database file's full path, \
+             e.g. {}/ferrite.db",
+            path.display(),
+            path.display()
+        )));
+    }
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| config_error(format!("storage_path '{}' has no parent", path.display())))?;
+    ensure_creatable(parent)?;
+    Ok(path)
+}
+
+fn config_error(msg: String) -> ApiError {
+    ApiError(FeriteError::Config(msg))
+}
+
+/// Trim and require an absolute path. A relative one resolves against the
+/// working directory, which for a service is whatever the supervisor chose and
+/// can change between starts.
+fn absolute_path(field: &str, path: &Path) -> Result<PathBuf, ApiError> {
+    let raw = path.to_string_lossy();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(config_error(format!("{field} must not be empty")));
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        return Err(config_error(format!(
+            "{field} must be an absolute path, got '{}'",
+            path.display()
+        )));
+    }
+    Ok(path)
+}
+
+/// Can ferrite create `dir` (or write into it, if it exists)? The directory
+/// may not exist yet — startup creates it — so the question is whether the
+/// nearest existing ancestor would let that happen.
+fn ensure_creatable(dir: &Path) -> Result<(), ApiError> {
+    let anchor = fsinfo::nearest_existing(dir).ok_or_else(|| {
+        config_error(format!(
+            "nothing along '{}' exists, so ferrite cannot create files there",
+            dir.display()
+        ))
+    })?;
+    if !fsinfo::probe_writable(&anchor) {
+        return Err(config_error(format!(
+            "ferrite cannot write to '{}' — pick a location it owns, or fix the permissions",
+            anchor.display()
+        )));
+    }
+    Ok(())
+}
+
 fn normalize_client_bypass(entries: &[String]) -> Result<Vec<String>, ApiError> {
     let mut normalized = BTreeSet::new();
     for entry in entries {
@@ -684,6 +768,96 @@ mod tests {
         assert_eq!(saved.web_dir.as_ref(), Some(&web_dir));
         assert!(!saved.blocklist.enabled);
         assert_eq!(saved.blocklist.client_bypass, cfg.blocklist.client_bypass);
+
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
+        let _ = std::fs::remove_file(config_path);
+    }
+
+    /// A bad `storage_path` has to be refused *here*. Accepting it would write
+    /// it to the config and then restart into a box that cannot open its
+    /// database, with the panel gone — recoverable only with a text editor on
+    /// the device.
+    #[tokio::test]
+    async fn an_unusable_storage_path_is_refused_before_it_is_saved() {
+        let (state, db_path, config_path) =
+            test_support::app_state_with_config_path("api-storage-path-bad").await;
+        let original = state.live_config.read().storage.path.clone();
+
+        for bad in [
+            "",                                   // empty
+            "relative/ferrite.db",                // not absolute
+            "/ferrite-nonexistent-root/x/db.sq3", // nothing along it exists
+        ] {
+            let err = update_settings(
+                State(state.clone()),
+                Json(SettingsPatch {
+                    storage_path: Some(PathBuf::from(bad)),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert!(err.is_err(), "'{bad}' should have been refused");
+        }
+
+        // A directory is not a database file.
+        let dir = std::env::temp_dir();
+        assert!(
+            update_settings(
+                State(state.clone()),
+                Json(SettingsPatch {
+                    storage_path: Some(dir.clone()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .is_err()
+        );
+
+        // Nothing stuck to the live config through any of that.
+        assert_eq!(state.live_config.read().storage.path, original);
+
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
+        let _ = std::fs::remove_file(config_path);
+    }
+
+    /// A usable path is accepted, marked restart-required, and persisted — the
+    /// setting was previously reachable only by editing the file by hand.
+    #[tokio::test]
+    async fn a_usable_storage_path_is_saved_and_asks_for_a_restart() {
+        let (state, db_path, config_path) =
+            test_support::app_state_with_config_path("api-storage-path-good").await;
+
+        // A directory that does not exist yet: startup creates it, so this has
+        // to be accepted rather than refused for not being there.
+        let target = std::env::temp_dir()
+            .join(format!("ferrite-relocate-{}", std::process::id()))
+            .join("ferrite.db");
+
+        let Json(value) = update_settings(
+            State(state.clone()),
+            Json(SettingsPatch {
+                storage_path: Some(target.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(value["restart_required"], true);
+        assert!(
+            value["restart_changed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f == "storage_path")
+        );
+        assert_eq!(state.live_config.read().storage.path, target);
+
+        let saved: Config =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(saved.storage.path, target);
 
         drop(state);
         test_support::cleanup_sqlite(&db_path);

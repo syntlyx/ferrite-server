@@ -20,6 +20,8 @@ tokio-rusqlite.workspace = true
 # memstats: mi_process_info for allocator-retention observability.
 libmimalloc-sys.workspace = true
 dirs.workspace = true
+# fsinfo: statvfs(3) for free space on the filesystem holding the database.
+libc.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true

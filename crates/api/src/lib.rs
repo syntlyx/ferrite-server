@@ -13,6 +13,7 @@ pub mod proxy;
 pub mod queries;
 pub mod settings;
 pub mod stats;
+pub mod storage;
 pub mod system;
 pub mod tools;
 pub mod update;
@@ -95,6 +96,8 @@ pub fn build_router(state: AppState) -> Router {
         // Settings
         .route("/settings", get(settings::get_settings))
         .route("/settings", patch(settings::update_settings))
+        // Where the database can live
+        .route("/storage/locations", get(storage::list_locations))
         // Selective routing / proxy
         .route("/proxy", get(proxy::get_proxy))
         .route("/proxy", put(proxy::put_proxy))

@@ -867,6 +867,7 @@ dependencies = [
  "dirs",
  "fst",
  "hickory-resolver",
+ "libc",
  "libmimalloc-sys",
  "parking_lot",
  "postcard",

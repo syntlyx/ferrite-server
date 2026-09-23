@@ -867,6 +867,53 @@ Returns the full parsed config. Non-empty `api_key` and `password_hash` values a
 }
 ```
 
+### `GET /api/storage/locations` — where the database can live
+
+Lists the places this box offers for `storage_path`, so the panel can show them
+instead of expecting someone to recite their mount table.
+
+The on-disk default is always first (so the way back is as visible as the way
+out), followed by every RAM-backed mount ferrite can actually write to, most
+free space first. Writability is probed by creating and removing a file, not by
+reading permission bits — those say nothing about a read-only mount or a full
+filesystem. Detection of RAM mounts is Linux-only (`/proc/mounts`, `tmpfs` and
+`ramfs`, minus the kernel's own scaffolding); elsewhere the list holds just the
+default and whatever is configured, and the path is typed by hand.
+
+```json
+{
+  "backend": "sqlite",
+  "current": "/var/lib/ferrite/ferrite.db",
+  "default": "/home/pi/.local/share/ferrite/ferrite.db",
+  "suggestions": [
+    {
+      "path": "/home/pi/.local/share/ferrite/ferrite.db",
+      "dir": "/home/pi/.local/share/ferrite",
+      "fstype": "disk",
+      "ram_backed": false,
+      "total_bytes": 31000000000,
+      "available_bytes": 24000000000,
+      "current": false
+    },
+    {
+      "path": "/dev/shm/ferrite/ferrite.db",
+      "dir": "/dev/shm",
+      "fstype": "tmpfs",
+      "ram_backed": true,
+      "total_bytes": 500000000,
+      "available_bytes": 499000000,
+      "current": false
+    }
+  ]
+}
+```
+
+`available_bytes` excludes the reserve only root may use, so it is what an
+ordinary write actually gets. Both figures are `null` if the filesystem could
+not be queried. A `ram_backed` location costs the disk no writes and is cleared
+by a reboot — pair it with `storage.log_max_mb` so it cannot grow into the RAM
+the resolver needs.
+
 ---
 
 ### `PATCH /api/settings` — update settings
@@ -886,6 +933,7 @@ All fields are optional. Fields not provided are left unchanged.
 | `web_dir`            | `string \| null` | Override static web UI directory; `null` resets to `~/.local/share/ferrite/web`                                                                                                                                 |
 | `log_retention_days` | int              | Automatically delete query log entries older than N days; `0` disables retention. Applied once ~30 s after startup and every 24 h thereafter.                                                                   |
 | `log_max_mb`         | int              | Cap the query log at N MB, deleting oldest entries first; `0` (default) disables the cap. Checked every 60 s, so it takes effect within the minute. Independent of `log_retention_days` — whichever trims first wins. |
+| `storage_path`       | string           | Where the SQLite database file lives. Validated before it is saved: must be absolute, must not be a directory, and ferrite must be able to create files along it — an unusable path would otherwise only fail at the next startup, which this change itself triggers. **Restart required.** See `GET /api/storage/locations`. |
 | `storage_backend`    | `"sqlite"` \| `"memory"` | Which store holds the query log, its rollups and the device inventory. `memory` creates no database file and keeps nothing across a restart; the compiled blocklist cache still lives on disk, since it comes from downloaded lists rather than traffic. **Restart required.** Configuration is unaffected — it lives in `config.toml` either way. |
 | `log_queries`        | bool             | Privacy switch for the per-query log. `false` stops writing rows to `queries`, empties the live ring buffer, and makes `GET /api/queries` return `[]` on every branch — default page, filtered query and delta poll alike. Filtering, routing and the lifetime counters are unaffected. Existing rows stay on disk and become readable again if you switch it back on; clear them for good with `DELETE /api/queries`. |
 | `keep_stats`         | bool             | Privacy switch for the aggregates. `false` stops the 10-minute rollups, the top-N counters, the 24-hour timeseries and the per-egress routed-domain tables, drops what they already hold in memory, and stops every aggregate *read* as well: `/api/stats/top-domains`, `/api/stats/top-blocked`, `/api/stats/top-clients` and `/api/clients` return empty, and `/api/clients/{device}/stats` returns 404, however far back the window reaches. Per-egress byte and connection totals keep counting — they name no host. `/api/stats/summary` keeps serving the process-lifetime counters (`total_queries`, `blocked_queries`, …), which hold no domain or device identity. |
