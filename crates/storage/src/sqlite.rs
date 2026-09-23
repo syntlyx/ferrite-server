@@ -7,13 +7,22 @@ use rusqlite::OptionalExtension;
 use tokio_rusqlite::Connection;
 
 use crate::schema::SCHEMA;
-use crate::{ClientStats, QueryFilter, Storage, SummaryStats};
+use crate::{ClientStats, LegacyConfigRows, QueryFilter, SizeTrim, Storage, SummaryStats};
 use ferrite_core::error::{FeriteError, Result};
 use ferrite_core::recording::RecordScope;
 use ferrite_core::types::TimeseriesBucket;
 use ferrite_core::types::{QueryEntry, QueryStatus};
 
 const ROLLUP_BUCKET_SECS: i64 = 600;
+
+/// Query rows a single size-cap pass drops per round. Big enough that a
+/// database far over its cap converges in a few rounds, small enough that each
+/// DELETE holds the single connection briefly.
+const SIZE_TRIM_BATCH: i64 = 10_000;
+
+/// Rounds one size-cap pass will do before returning. Bounds how long the
+/// connection can be busy trimming; the next pass (a minute later) continues.
+const SIZE_TRIM_MAX_ROUNDS: usize = 64;
 
 pub struct SqliteStorage {
     conn: Connection,
@@ -55,6 +64,68 @@ impl SqliteStorage {
 
         tracing::info!("SQLite storage opened at {}", path.display());
         Ok(Arc::new(Self { conn }))
+    }
+}
+
+#[cfg(any(test, feature = "testutil"))]
+impl SqliteStorage {
+    /// Recreate the pre-v9 configuration tables and fill them from `rows`, so
+    /// the one-time hand-off into `config.toml` can be exercised end to end.
+    pub async fn seed_legacy_config_tables(&self, rows: &LegacyConfigRows) -> Result<()> {
+        let rows = rows.clone();
+        self.conn
+            .call(move |c| {
+                c.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS custom_entries (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         domain TEXT NOT NULL UNIQUE,
+                         entry_type TEXT NOT NULL,
+                         comment TEXT,
+                         created_at INTEGER NOT NULL);
+                     CREATE TABLE IF NOT EXISTS custom_dns_records (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         domain TEXT NOT NULL,
+                         record_type TEXT NOT NULL,
+                         value TEXT NOT NULL,
+                         ttl INTEGER NOT NULL DEFAULT 300,
+                         created_at INTEGER NOT NULL);
+                     CREATE TABLE IF NOT EXISTS client_aliases (
+                         key TEXT NOT NULL,
+                         key_type TEXT NOT NULL DEFAULT 'ip',
+                         name TEXT NOT NULL,
+                         created_at INTEGER NOT NULL,
+                         PRIMARY KEY (key, key_type));
+                     CREATE TABLE IF NOT EXISTS blocklists (id INTEGER PRIMARY KEY, name TEXT);
+                     CREATE TABLE IF NOT EXISTS settings (
+                         key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+                )?;
+                // `created_at` orders the reads back, so count the inserts.
+                for (i, (domain, entry_type)) in rows.custom_entries.iter().enumerate() {
+                    c.execute(
+                        "INSERT INTO custom_entries (domain, entry_type, created_at)
+                         VALUES (?1, ?2, ?3)",
+                        rusqlite::params![domain, entry_type, i as i64],
+                    )?;
+                }
+                for (i, r) in rows.custom_records.iter().enumerate() {
+                    c.execute(
+                        "INSERT INTO custom_dns_records
+                             (domain, record_type, value, ttl, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        rusqlite::params![r.domain, r.record_type, r.value, r.ttl as i64, i as i64],
+                    )?;
+                }
+                for (i, (key, key_type, name)) in rows.client_aliases.iter().enumerate() {
+                    c.execute(
+                        "INSERT INTO client_aliases (key, key_type, name, created_at)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![key, key_type, name, i as i64],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(FeriteError::TokioDatabase)
     }
 }
 
@@ -353,7 +424,7 @@ impl Storage for SqliteStorage {
                      FROM device_buckets_10m
                      WHERE bucket >= ?1 AND bucket <= ?2
                      GROUP BY device
-                     ORDER BY total DESC LIMIT ?3",
+                     ORDER BY total DESC, device ASC LIMIT ?3",
                 )?;
                 let rows = stmt
                     .query_map(rusqlite::params![from_bucket, to_bucket, n as i64], |row| {
@@ -442,7 +513,6 @@ impl Storage for SqliteStorage {
                     "DELETE FROM queries;
                      DELETE FROM query_buckets_10m;
                      DELETE FROM domain_buckets_10m;
-                     DELETE FROM client_buckets_10m;
                      DELETE FROM device_buckets_10m;",
                 )?;
                 Ok(())
@@ -472,81 +542,7 @@ impl Storage for SqliteStorage {
 
     async fn delete_queries_older_than(&self, cutoff_ts: i64) -> Result<u64> {
         self.conn
-            .call(move |c| {
-                let cutoff_bucket = align_bucket(cutoff_ts);
-                let tx = c.unchecked_transaction()?;
-                let n = tx.execute(
-                    "DELETE FROM queries WHERE timestamp < ?1",
-                    rusqlite::params![cutoff_ts],
-                )?;
-                tx.execute(
-                    "DELETE FROM query_buckets_10m WHERE bucket < ?1",
-                    rusqlite::params![cutoff_bucket],
-                )?;
-                tx.execute(
-                    "DELETE FROM domain_buckets_10m WHERE bucket < ?1",
-                    rusqlite::params![cutoff_bucket],
-                )?;
-                tx.execute(
-                    "DELETE FROM client_buckets_10m WHERE bucket < ?1",
-                    rusqlite::params![cutoff_bucket],
-                )?;
-                tx.execute(
-                    "DELETE FROM device_buckets_10m WHERE bucket < ?1",
-                    rusqlite::params![cutoff_bucket],
-                )?;
-                tx.commit()?;
-                Ok(n as u64)
-            })
-            .await
-            .map_err(FeriteError::TokioDatabase)
-    }
-
-    async fn add_custom_entry(&self, domain: &str, entry_type: &str) -> Result<()> {
-        let domain = domain.to_string();
-        let entry_type = entry_type.to_string();
-        let now = chrono::Utc::now().timestamp();
-        self.conn
-            .call(move |c| {
-                c.execute(
-                    "INSERT INTO custom_entries (domain, entry_type, created_at)
-                     VALUES (?1, ?2, ?3)
-                     ON CONFLICT(domain) DO UPDATE SET entry_type = excluded.entry_type",
-                    rusqlite::params![domain, entry_type, now],
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(FeriteError::TokioDatabase)
-    }
-
-    async fn remove_custom_entry(&self, domain: &str) -> Result<()> {
-        let domain = domain.to_string();
-        self.conn
-            .call(move |c| {
-                c.execute(
-                    "DELETE FROM custom_entries WHERE domain = ?1",
-                    rusqlite::params![domain],
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(FeriteError::TokioDatabase)
-    }
-
-    async fn load_custom_entries(&self) -> Result<Vec<(String, String)>> {
-        self.conn
-            .call(|c| {
-                let mut stmt = c.prepare(
-                    "SELECT domain, entry_type FROM custom_entries ORDER BY created_at ASC",
-                )?;
-                let rows = stmt
-                    .query_map([], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
-            })
+            .call(move |c| delete_before(c, cutoff_ts))
             .await
             .map_err(FeriteError::TokioDatabase)
     }
@@ -587,61 +583,6 @@ impl Storage for SqliteStorage {
             .await
             .map_err(FeriteError::TokioDatabase)?;
         Ok(result)
-    }
-
-    async fn add_client_alias(&self, key: &str, key_type: &str, name: &str) -> Result<()> {
-        let key = key.to_string();
-        let key_type = key_type.to_string();
-        let name = name.to_string();
-        let now = chrono::Utc::now().timestamp();
-        self.conn
-            .call(move |c| {
-                c.execute(
-                    "INSERT INTO client_aliases (key, key_type, name, created_at)
-                     VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(key, key_type) DO UPDATE SET name = excluded.name",
-                    rusqlite::params![key, key_type, name, now],
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(FeriteError::TokioDatabase)
-    }
-
-    async fn remove_client_alias(&self, key: &str, key_type: &str) -> Result<()> {
-        let key = key.to_string();
-        let key_type = key_type.to_string();
-        self.conn
-            .call(move |c| {
-                c.execute(
-                    "DELETE FROM client_aliases WHERE key = ?1 AND key_type = ?2",
-                    rusqlite::params![key, key_type],
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(FeriteError::TokioDatabase)
-    }
-
-    async fn load_client_aliases(&self) -> Result<Vec<(String, String, String)>> {
-        self.conn
-            .call(|c| {
-                let mut stmt = c.prepare(
-                    "SELECT key, key_type, name FROM client_aliases ORDER BY created_at ASC",
-                )?;
-                let rows = stmt
-                    .query_map([], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                        ))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
-            })
-            .await
-            .map_err(FeriteError::TokioDatabase)
     }
 
     async fn upsert_device(&self, mac: &str, hostname: Option<&str>) -> Result<()> {
@@ -790,64 +731,142 @@ impl Storage for SqliteStorage {
             .map_err(FeriteError::TokioDatabase)
     }
 
-    async fn upsert_custom_record(
-        &self,
-        domain: &str,
-        record_type: &str,
-        value: &str,
-        ttl: u32,
-    ) -> Result<()> {
-        let domain = domain.to_string();
-        let record_type = record_type.to_string();
-        let value = value.to_string();
-        let now = chrono::Utc::now().timestamp();
-        self.conn
-            .call(move |c| {
-                c.execute(
-                    "INSERT INTO custom_dns_records (domain, record_type, value, ttl, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(domain, record_type) DO UPDATE
-                         SET value = excluded.value, ttl = excluded.ttl",
-                    rusqlite::params![domain, record_type, value, ttl as i64, now],
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(FeriteError::TokioDatabase)
-    }
-
-    async fn delete_custom_record(&self, domain: &str) -> Result<()> {
-        let domain = domain.to_string();
-        self.conn
-            .call(move |c| {
-                c.execute(
-                    "DELETE FROM custom_dns_records WHERE domain = ?1",
-                    rusqlite::params![domain],
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(FeriteError::TokioDatabase)
-    }
-
-    async fn load_custom_records(&self) -> Result<Vec<ferrite_core::config::CustomRecordConfig>> {
+    async fn prepare_size_cap(&self) -> Result<bool> {
         self.conn
             .call(|c| {
-                let mut stmt = c.prepare(
-                    "SELECT domain, record_type, value, ttl FROM custom_dns_records
-                     ORDER BY created_at ASC",
-                )?;
-                let rows = stmt
-                    .query_map([], |row| {
-                        Ok(ferrite_core::config::CustomRecordConfig {
-                            domain: row.get(0)?,
-                            record_type: row.get(1)?,
-                            value: row.get(2)?,
-                            ttl: row.get::<_, i64>(3)? as u32,
-                        })
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                // 0 = none, 1 = full, 2 = incremental. Without incremental (or
+                // full) auto-vacuum, deleting rows only moves pages onto the
+                // freelist — the file never shrinks, so a size cap could never
+                // be met and would delete the whole log trying.
+                let mode: i64 = c.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+                if mode == 2 {
+                    return Ok(false);
+                }
+                // Changing it rewrites the whole file, which is why this is not
+                // done on every database — only once, for one that opts into a
+                // cap. New databases are created incremental by the schema.
+                c.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")?;
+                Ok(true)
+            })
+            .await
+            .map_err(FeriteError::TokioDatabase)
+    }
+
+    async fn enforce_size_cap(&self, max_bytes: u64) -> Result<SizeTrim> {
+        self.conn
+            .call(move |c| {
+                let bytes_before = used_bytes(c)?;
+                let mut trim = SizeTrim {
+                    rows_deleted: 0,
+                    bytes_before,
+                    bytes_after: bytes_before,
+                };
+
+                for _ in 0..SIZE_TRIM_MAX_ROUNDS {
+                    if trim.bytes_after <= max_bytes {
+                        break;
+                    }
+
+                    // The timestamp just past the oldest batch. `+ 1` so rows
+                    // sharing that second go too: without it a batch boundary
+                    // landing inside a run of equal timestamps deletes nothing
+                    // and the loop makes no progress.
+                    let cutoff: Option<i64> = c
+                        .query_row(
+                            "SELECT timestamp FROM queries
+                             ORDER BY timestamp ASC, id ASC LIMIT 1 OFFSET ?1",
+                            rusqlite::params![SIZE_TRIM_BATCH],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    // Fewer rows left than a batch: the log is not what is
+                    // taking the space. Stop rather than delete all of it.
+                    let Some(cutoff) = cutoff else { break };
+
+                    let deleted = delete_before(c, cutoff + 1)?;
+                    if deleted == 0 {
+                        break;
+                    }
+                    trim.rows_deleted += deleted;
+
+                    // Hand the freed pages back; `used_bytes` counts the
+                    // freelist out anyway, but on a RAM-backed path the file
+                    // itself has to shrink for the cap to mean anything.
+                    release_free_pages(c)?;
+                    trim.bytes_after = used_bytes(c)?;
+                }
+
+                Ok(trim)
+            })
+            .await
+            .map_err(FeriteError::TokioDatabase)
+    }
+
+    async fn load_legacy_config_rows(&self) -> Result<LegacyConfigRows> {
+        self.conn
+            .call(|c| {
+                let mut rows = LegacyConfigRows::default();
+
+                if table_exists(c, "custom_entries")? {
+                    let mut stmt = c.prepare(
+                        "SELECT domain, entry_type FROM custom_entries ORDER BY created_at ASC",
+                    )?;
+                    rows.custom_entries = stmt
+                        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                }
+
+                if table_exists(c, "custom_dns_records")? {
+                    let mut stmt = c.prepare(
+                        "SELECT domain, record_type, value, ttl FROM custom_dns_records
+                         ORDER BY created_at ASC",
+                    )?;
+                    rows.custom_records = stmt
+                        .query_map([], |r| {
+                            Ok(ferrite_core::config::CustomRecordConfig {
+                                domain: r.get(0)?,
+                                record_type: r.get(1)?,
+                                value: r.get(2)?,
+                                ttl: r.get::<_, i64>(3)? as u32,
+                            })
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                }
+
+                if table_exists(c, "client_aliases")? {
+                    let mut stmt = c.prepare(
+                        "SELECT key, key_type, name FROM client_aliases ORDER BY created_at ASC",
+                    )?;
+                    rows.client_aliases = stmt
+                        .query_map([], |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, String>(2)?,
+                            ))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                }
+
                 Ok(rows)
+            })
+            .await
+            .map_err(FeriteError::TokioDatabase)
+    }
+
+    async fn drop_legacy_config_tables(&self) -> Result<()> {
+        self.conn
+            .call(|c| {
+                // `blocklists` and `settings` never had a reader — they were
+                // created by the baseline schema and nothing ever wrote them.
+                c.execute_batch(
+                    "DROP TABLE IF EXISTS custom_entries;
+                     DROP TABLE IF EXISTS custom_dns_records;
+                     DROP TABLE IF EXISTS client_aliases;
+                     DROP TABLE IF EXISTS blocklists;
+                     DROP TABLE IF EXISTS settings;",
+                )?;
+                Ok(())
             })
             .await
             .map_err(FeriteError::TokioDatabase)
@@ -855,6 +874,68 @@ impl Storage for SqliteStorage {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Return the freelist to the filesystem, shrinking the database file.
+///
+/// `PRAGMA incremental_vacuum` yields **one row per page it frees**, so it has
+/// to be stepped to exhaustion: `execute_batch` steps a statement once, which
+/// frees a single page and looks like it worked. Draining it is the difference
+/// between a 51 MB file and an 8 MB one.
+fn release_free_pages(c: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let mut stmt = c.prepare("PRAGMA incremental_vacuum")?;
+    let mut rows = stmt.query([])?;
+    while rows.next()?.is_some() {}
+    Ok(())
+}
+
+/// Bytes the database actually holds, excluding pages already on the freelist.
+///
+/// `database_bytes` reports the file's size; this reports what is in it. The
+/// distinction is what makes a size cap terminate: right after a delete the
+/// file has not shrunk yet, and a cap compared against the file size would
+/// keep deleting rows that were already gone.
+fn used_bytes(c: &rusqlite::Connection) -> rusqlite::Result<u64> {
+    let pages: i64 = c.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+    let free: i64 = c.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+    let page_size: i64 = c.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    Ok(((pages - free).max(0) as u64) * (page_size.max(0) as u64))
+}
+
+/// Delete query rows older than `cutoff_ts` and the rollup buckets they fed.
+/// Shared by age-based retention and the size cap so the two can't drift on
+/// what "delete old history" means.
+fn delete_before(c: &rusqlite::Connection, cutoff_ts: i64) -> rusqlite::Result<u64> {
+    let cutoff_bucket = align_bucket(cutoff_ts);
+    let tx = c.unchecked_transaction()?;
+    let n = tx.execute(
+        "DELETE FROM queries WHERE timestamp < ?1",
+        rusqlite::params![cutoff_ts],
+    )?;
+    for table in [
+        "query_buckets_10m",
+        "domain_buckets_10m",
+        "device_buckets_10m",
+    ] {
+        tx.execute(
+            &format!("DELETE FROM {table} WHERE bucket < ?1"),
+            rusqlite::params![cutoff_bucket],
+        )?;
+    }
+    tx.commit()?;
+    Ok(n as u64)
+}
+
+/// Does `name` exist as a table in this database? Used wherever code has to
+/// cope with both a pre-v9 database and one created after the configuration
+/// tables were removed from the baseline schema.
+fn table_exists(c: &rusqlite::Connection, name: &str) -> rusqlite::Result<bool> {
+    c.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        rusqlite::params![name],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|n| n > 0)
+}
 
 /// The device identity token a query is written under: its tagged `device`
 /// (set by the stats writer), falling back to the client IP when untagged.
@@ -909,7 +990,7 @@ fn align_bucket(ts: i64) -> i64 {
 }
 
 /// Latest schema version. Bump when adding a migration step below.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// Apply versioned migrations on top of the baseline `SCHEMA`.
 ///
@@ -933,6 +1014,7 @@ fn run_migrations(c: &mut rusqlite::Connection) -> rusqlite::Result<()> {
             6 => migrate_v6_drop_redundant_query_indexes(&tx)?,
             7 => migrate_v7_drop_unused_domain_index(&tx)?,
             8 => migrate_v8_drop_unused_domain_bucket_index(&tx)?,
+            9 => migrate_v9_drop_unread_client_rollups(&tx)?,
             _ => unreachable!("no migration step for v{next}"),
         }
         // PRAGMA can't be parameter-bound; the value is our own constant.
@@ -946,6 +1028,12 @@ fn run_migrations(c: &mut rusqlite::Connection) -> rusqlite::Result<()> {
 
 /// v1: upgrade `client_aliases` from single `ip` PK to `(key, key_type)` PK.
 fn migrate_v1_client_aliases(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
+    // Databases created after the table moved to `config.toml` never have it,
+    // and a pre-v9 one that still does is handed over by
+    // `load_legacy_config_rows` — either way there is nothing to reshape here.
+    if !table_exists(tx, "client_aliases")? {
+        return Ok(());
+    }
     let has_key_col: bool = tx
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('client_aliases') WHERE name='key'",
@@ -993,7 +1081,6 @@ fn migrate_v2_backfill_rollups(tx: &rusqlite::Transaction) -> rusqlite::Result<(
         r#"
         DELETE FROM query_buckets_10m;
         DELETE FROM domain_buckets_10m;
-        DELETE FROM client_buckets_10m;
 
         INSERT INTO query_buckets_10m (bucket, total, blocked, cached, upstream)
         SELECT (timestamp / {bucket_secs}) * {bucket_secs} as bucket,
@@ -1011,15 +1098,6 @@ fn migrate_v2_backfill_rollups(tx: &rusqlite::Transaction) -> rusqlite::Result<(
                SUM(CASE WHEN status='blocked' THEN 1 ELSE 0 END) as blocked
         FROM queries
         GROUP BY bucket, domain;
-
-        INSERT INTO client_buckets_10m (bucket, client_ip, total, blocked, last_seen)
-        SELECT (timestamp / {bucket_secs}) * {bucket_secs} as bucket,
-               client_ip,
-               COUNT(*) as total,
-               SUM(CASE WHEN status='blocked' THEN 1 ELSE 0 END) as blocked,
-               MAX(timestamp) as last_seen
-        FROM queries
-        GROUP BY bucket, client_ip;
         "#,
         bucket_secs = ROLLUP_BUCKET_SECS
     );
@@ -1086,7 +1164,23 @@ fn migrate_v8_drop_unused_domain_bucket_index(tx: &rusqlite::Transaction) -> rus
     tx.execute_batch("DROP INDEX IF EXISTS idx_domain_buckets_domain_bucket;")
 }
 
-/// v4: per-device rollup table (mirrors `client_buckets_10m`, keyed by device).
+/// v9: drop the two client rollup tables nothing reads.
+///
+/// `client_buckets_10m` was superseded by `device_buckets_10m` in v4 — rollups
+/// keyed by device rather than by IP, so a phone keeps one row across a DHCP
+/// change. Every read moved over; the IP-keyed table kept being written and
+/// never read. `client_stats` never had a reader at all: `top_clients` and
+/// `client_stats()` both aggregate `device_buckets_10m` directly.
+fn migrate_v9_drop_unread_client_rollups(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "DROP TABLE IF EXISTS client_buckets_10m;
+         DROP TABLE IF EXISTS client_stats;",
+    )
+}
+
+/// v4: per-device rollup table — the same shape as the IP-keyed rollups it
+/// replaces, but keyed by device so a phone keeps one row across a DHCP change.
+/// The IP-keyed table is dropped in v9.
 fn migrate_v4_device_buckets(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS device_buckets_10m (
@@ -1149,10 +1243,14 @@ async fn top_domains_rollup_query(
     let to_bucket = align_bucket(to_ts);
     let value_col = if blocked_only { "blocked" } else { "total" };
     let sql = format!(
+        // `domain ASC` is not decoration: without a tiebreak, two domains on
+        // the same count come back in whatever order the scan produced, so the
+        // top list reshuffles between identical requests and the dashboard
+        // jitters. It also keeps this answer identical to the memory backend's.
         "SELECT domain, SUM({value_col}) as cnt FROM domain_buckets_10m
          WHERE bucket >= ?1 AND bucket <= ?2
          GROUP BY domain HAVING cnt > 0
-         ORDER BY cnt DESC LIMIT ?3",
+         ORDER BY cnt DESC, domain ASC LIMIT ?3",
     );
 
     let rows = conn
@@ -1276,10 +1374,16 @@ mod tests {
             .unwrap();
         assert_eq!(blocked, vec![("ads.test".to_string(), 2)]);
 
+        // Both devices sit on two queries here, so look the one up by name
+        // rather than by position — the tie order is covered where it is the
+        // thing under test (see the conformance suite).
         let clients = storage.top_clients(bucket, bucket + 599, 10).await.unwrap();
-        assert_eq!(clients[0].device, "192.168.1.11");
-        assert_eq!(clients[0].total, 2);
-        assert_eq!(clients[0].blocked, 2);
+        let noisy = clients
+            .iter()
+            .find(|c| c.device == "192.168.1.11")
+            .expect("device should be in the top list");
+        assert_eq!(noisy.total, 2);
+        assert_eq!(noisy.blocked, 2);
 
         assert_eq!(storage.summary(3600).await.unwrap(), (4, 2));
         let counts = storage.summary_counts(bucket, bucket + 599).await.unwrap();
@@ -1330,70 +1434,203 @@ mod tests {
         assert!(!first_page.iter().any(|e| e.id == next_page[0].id));
     }
 
+    /// A fresh database is created incremental-auto-vacuum, so a size cap can
+    /// hand pages back without anyone paying for a full rewrite first.
     #[tokio::test]
-    async fn custom_entries_round_trip_and_can_be_removed() {
-        let storage = SqliteStorage::open(&temp_db_path("ferrite-custom-entries"))
+    async fn a_new_database_is_ready_for_a_size_cap() {
+        let storage = SqliteStorage::open(&temp_db_path("ferrite-autovacuum"))
             .await
             .unwrap();
 
-        storage
-            .add_custom_entry("ads.test", "blacklist")
+        let mode: i64 = storage
+            .conn
+            .call(|c| {
+                Ok::<i64, tokio_rusqlite::Error>(
+                    c.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?,
+                )
+            })
             .await
             .unwrap();
-        storage
-            .add_custom_entry("safe.test", "whitelist")
-            .await
-            .unwrap();
-        storage
-            .add_custom_entry("ads.test", "whitelist")
+        assert_eq!(mode, 2, "expected INCREMENTAL auto_vacuum");
+
+        // Nothing to convert, so this is free and says so.
+        assert!(!storage.prepare_size_cap().await.unwrap());
+    }
+
+    /// The cap drops oldest-first, stops once it fits, and keeps recent
+    /// history — the whole point being to bound growth, not to empty the log.
+    #[tokio::test]
+    async fn size_cap_trims_the_oldest_queries_until_it_fits() {
+        let storage = SqliteStorage::open(&temp_db_path("ferrite-size-cap"))
             .await
             .unwrap();
 
-        let mut entries = storage.load_custom_entries().await.unwrap();
-        entries.sort();
-        assert_eq!(
-            entries,
-            vec![
-                ("ads.test".to_string(), "whitelist".to_string()),
-                ("safe.test".to_string(), "whitelist".to_string()),
-            ]
+        let base = align_bucket(chrono::Utc::now().timestamp()) - 40_000;
+        let entries: Vec<QueryEntry> = (0..25_000)
+            .map(|i| {
+                query_entry(
+                    base + i,
+                    &format!("host{i}.example.test"),
+                    "192.168.1.10",
+                    QueryStatus::Upstream,
+                )
+            })
+            .collect();
+        storage.write_batch_all(entries).await.unwrap();
+
+        let before = storage.database_bytes().await.unwrap();
+        assert!(before > 1_000_000, "test needs a database worth trimming");
+
+        // Cap at a third of what it grew to.
+        let cap = before / 3;
+        let trim = storage.enforce_size_cap(cap).await.unwrap();
+
+        assert!(trim.rows_deleted > 0);
+        assert!(
+            trim.bytes_after <= cap,
+            "still {} bytes against a {} cap",
+            trim.bytes_after,
+            cap
+        );
+        assert!(trim.bytes_after < trim.bytes_before);
+
+        // The file itself gave the space back, not just the page accounting —
+        // that is what a RAM-backed path needs, and the difference is easy to
+        // get wrong: `PRAGMA incremental_vacuum` yields one row per freed page,
+        // so a caller that doesn't drain it frees a single page and reports
+        // success. Allow one page of slack, nothing more.
+        let file_after = storage.database_bytes().await.unwrap();
+        assert!(
+            file_after <= cap + 4096,
+            "page accounting says {} but the file is still {} against a {} cap",
+            trim.bytes_after,
+            file_after,
+            cap
         );
 
-        storage.remove_custom_entry("safe.test").await.unwrap();
-        assert_eq!(
-            storage.load_custom_entries().await.unwrap(),
-            vec![("ads.test".to_string(), "whitelist".to_string())]
+        // Oldest gone, newest kept.
+        let rows = storage
+            .query_range(&QueryFilter {
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows[0].domain, "host24999.example.test");
+
+        let remaining = storage
+            .query_range(&QueryFilter {
+                domain: Some("host0.example.test".to_string()),
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            remaining.is_empty(),
+            "the oldest entry should have gone first"
         );
     }
 
+    /// Already under the cap: no deletes, no rewrite, nothing to report.
     #[tokio::test]
-    async fn client_aliases_round_trip_ip_and_mac_keys() {
-        let storage = SqliteStorage::open(&temp_db_path("ferrite-client-aliases"))
+    async fn size_cap_under_the_limit_does_nothing() {
+        let storage = SqliteStorage::open(&temp_db_path("ferrite-size-cap-noop"))
+            .await
+            .unwrap();
+        let ts = align_bucket(chrono::Utc::now().timestamp());
+        storage
+            .write_batch_all(vec![query_entry(
+                ts,
+                "example.test",
+                "192.168.1.10",
+                QueryStatus::Upstream,
+            )])
             .await
             .unwrap();
 
-        storage
-            .add_client_alias("192.168.1.10", "ip", "Laptop")
+        let trim = storage.enforce_size_cap(100_000_000).await.unwrap();
+        assert!(trim.is_noop());
+        assert_eq!(trim.rows_deleted, 0);
+
+        let rows = storage
+            .query_range(&QueryFilter {
+                limit: Some(10),
+                ..Default::default()
+            })
             .await
             .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    /// A database written before the configuration tables moved into
+    /// `config.toml` still has to hand its rows over exactly once. Read them,
+    /// drop the tables, and a second boot must find nothing left to migrate.
+    #[tokio::test]
+    async fn legacy_config_rows_are_handed_over_then_the_tables_go() {
+        let path = temp_db_path("ferrite-legacy-config");
+        let storage = SqliteStorage::open(&path).await.unwrap();
+
+        // Recreate a pre-v9 database: the five tables the baseline schema used
+        // to carry, populated the way the old write paths populated them.
         storage
-            .add_client_alias("aa:bb:cc:dd:ee:ff", "mac", "Phone")
-            .await
-            .unwrap();
-        storage
-            .add_client_alias("192.168.1.10", "ip", "Workstation")
+            .conn
+            .call(|c| {
+                c.execute_batch(
+                    "CREATE TABLE custom_entries (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         domain TEXT NOT NULL UNIQUE,
+                         entry_type TEXT NOT NULL,
+                         comment TEXT,
+                         created_at INTEGER NOT NULL);
+                     CREATE TABLE custom_dns_records (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         domain TEXT NOT NULL,
+                         record_type TEXT NOT NULL,
+                         value TEXT NOT NULL,
+                         ttl INTEGER NOT NULL DEFAULT 300,
+                         created_at INTEGER NOT NULL);
+                     CREATE TABLE client_aliases (
+                         key TEXT NOT NULL,
+                         key_type TEXT NOT NULL DEFAULT 'ip',
+                         name TEXT NOT NULL,
+                         created_at INTEGER NOT NULL,
+                         PRIMARY KEY (key, key_type));
+                     CREATE TABLE blocklists (id INTEGER PRIMARY KEY, name TEXT);
+                     CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+                     INSERT INTO custom_entries (domain, entry_type, created_at)
+                         VALUES ('ads.test', 'blacklist', 1), ('safe.test', 'whitelist', 2);
+                     INSERT INTO custom_dns_records (domain, record_type, value, ttl, created_at)
+                         VALUES ('router.lan', 'A', '192.168.1.1', 60, 1);
+                     INSERT INTO client_aliases (key, key_type, name, created_at)
+                         VALUES ('192.168.1.10', 'ip', 'Laptop', 1),
+                                ('aa:bb:cc:dd:ee:ff', 'mac', 'Phone', 2);",
+                )?;
+                Ok::<_, tokio_rusqlite::Error>(())
+            })
             .await
             .unwrap();
 
-        let mut aliases = storage.load_client_aliases().await.unwrap();
-        aliases.sort();
+        let rows = storage.load_legacy_config_rows().await.unwrap();
+        assert!(!rows.is_empty());
         assert_eq!(
-            aliases,
+            rows.custom_entries,
+            vec![
+                ("ads.test".to_string(), "blacklist".to_string()),
+                ("safe.test".to_string(), "whitelist".to_string()),
+            ]
+        );
+        assert_eq!(rows.custom_records.len(), 1);
+        assert_eq!(rows.custom_records[0].domain, "router.lan");
+        assert_eq!(rows.custom_records[0].ttl, 60);
+        assert_eq!(
+            rows.client_aliases,
             vec![
                 (
                     "192.168.1.10".to_string(),
                     "ip".to_string(),
-                    "Workstation".to_string()
+                    "Laptop".to_string()
                 ),
                 (
                     "aa:bb:cc:dd:ee:ff".to_string(),
@@ -1403,18 +1640,21 @@ mod tests {
             ]
         );
 
-        storage
-            .remove_client_alias("aa:bb:cc:dd:ee:ff", "mac")
+        storage.drop_legacy_config_tables().await.unwrap();
+        assert!(storage.load_legacy_config_rows().await.unwrap().is_empty());
+    }
+
+    /// A database created after the move never had those tables, and neither
+    /// the read nor the drop may trip over their absence.
+    #[tokio::test]
+    async fn legacy_hand_off_is_a_no_op_on_a_fresh_database() {
+        let storage = SqliteStorage::open(&temp_db_path("ferrite-legacy-fresh"))
             .await
             .unwrap();
-        assert_eq!(
-            storage.load_client_aliases().await.unwrap(),
-            vec![(
-                "192.168.1.10".to_string(),
-                "ip".to_string(),
-                "Workstation".to_string()
-            )]
-        );
+
+        assert!(storage.load_legacy_config_rows().await.unwrap().is_empty());
+        storage.drop_legacy_config_tables().await.unwrap();
+        assert!(storage.load_legacy_config_rows().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1541,44 +1781,6 @@ mod tests {
             .await
             .unwrap();
         assert!(storage.load_ip_bindings().await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn custom_dns_records_round_trip_update_and_delete_by_domain() {
-        let storage = SqliteStorage::open(&temp_db_path("ferrite-custom-records"))
-            .await
-            .unwrap();
-
-        storage
-            .upsert_custom_record("router.lan", "A", "192.168.1.1", 60)
-            .await
-            .unwrap();
-        storage
-            .upsert_custom_record("router.lan", "A", "192.168.1.2", 120)
-            .await
-            .unwrap();
-        storage
-            .upsert_custom_record("nas.lan", "CNAME", "router.lan.", 300)
-            .await
-            .unwrap();
-
-        let mut records = storage.load_custom_records().await.unwrap();
-        records.sort_by(|a, b| {
-            a.domain
-                .cmp(&b.domain)
-                .then(a.record_type.cmp(&b.record_type))
-        });
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].domain, "nas.lan");
-        assert_eq!(records[0].record_type, "CNAME");
-        assert_eq!(records[1].domain, "router.lan");
-        assert_eq!(records[1].value, "192.168.1.2");
-        assert_eq!(records[1].ttl, 120);
-
-        storage.delete_custom_record("router.lan").await.unwrap();
-        let records = storage.load_custom_records().await.unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].domain, "nas.lan");
     }
 
     #[tokio::test]
@@ -2028,9 +2230,14 @@ mod tests {
             }
         }
 
-        // client_aliases upgraded to (key, key_type) without losing data.
+        // client_aliases upgraded to (key, key_type) without losing data — read
+        // back through the hand-off, which is all that still touches the table.
         assert_eq!(
-            storage.load_client_aliases().await.unwrap(),
+            storage
+                .load_legacy_config_rows()
+                .await
+                .unwrap()
+                .client_aliases,
             vec![(
                 "192.168.1.10".to_string(),
                 "ip".to_string(),

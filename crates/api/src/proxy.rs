@@ -178,7 +178,7 @@ pub async fn put_proxy(
     // settings changed (no restart) — then persist.
     state.inner.proxy.reload(&new);
     state.live_config.write().proxy = new;
-    let saved_to = persist(&state);
+    let saved_to = state.persist_config().await;
 
     Ok(Json(json!({
         "status": "ok",
@@ -368,25 +368,6 @@ fn match_prev<'a>(old: &'a ProxyConfig, e: &EgressConfig, id: &str) -> Option<&'
             })
         }
         _ => None,
-    }
-}
-
-fn persist(state: &AppState) -> Option<String> {
-    let cfg = state.live_config.read().clone();
-    let path = state.config_path.as_ref().clone().or_else(|| {
-        ferrite_core::config::Config::config_candidates()
-            .into_iter()
-            .next()
-    })?;
-    match cfg.save(&path) {
-        Ok(()) => {
-            tracing::info!("proxy config saved to {}", path.display());
-            Some(path.display().to_string())
-        }
-        Err(e) => {
-            tracing::error!("failed to save proxy config: {}", e);
-            None
-        }
     }
 }
 

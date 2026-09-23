@@ -19,6 +19,9 @@ pub struct DomainPayload {
 pub struct DomainResponse {
     pub domain: String,
     pub status: String,
+    /// Did the change reach `config.toml`? It is already live either way; this
+    /// says whether it survives a restart.
+    pub persisted: bool,
 }
 
 /// POST /api/blocklist/blacklist
@@ -26,29 +29,23 @@ pub async fn add_blacklist(
     State(state): State<AppState>,
     Json(payload): Json<DomainPayload>,
 ) -> Result<(StatusCode, Json<DomainResponse>), ApiError> {
-    // Normalise once, identically to the engine, so the persisted key matches
-    // the engine key and the value returned by list_* (otherwise a UI-listed
-    // entry can't delete its DB row and reappears on restart).
+    // Normalise once, identically to the engine, so the entry written to the
+    // config matches the engine key and the value returned by list_*.
     let domain = ferrite_blocklist::normalise_domain(&payload.domain);
+    // Engine first: it rejects a pattern that can't be compiled, and nothing
+    // should reach the config file that the engine would refuse on reload.
     state.inner.blocklist.add_blacklist(&domain)?;
-    if let Err(e) = state
-        .inner
-        .storage
-        .add_custom_entry(&domain, "blacklist")
-        .await
-    {
-        // Roll back the in-memory engine so it can't diverge from storage.
-        state.inner.blocklist.remove_blacklist(&domain);
-        return Err(e.into());
-    }
+    add_config_domain(&state, Polarity::Block, &domain);
     // Evict cached (allowed) DNS responses so the block takes effect immediately.
     evict_domain_cache(&state, &domain);
+    let persisted = state.persist_config().await.is_some();
     tracing::info!("blacklisted '{}'", domain);
     Ok((
         StatusCode::CREATED,
         Json(DomainResponse {
             domain,
             status: "blacklisted".into(),
+            persisted,
         }),
     ))
 }
@@ -60,14 +57,13 @@ pub async fn del_blacklist(
 ) -> Result<Json<Value>, ApiError> {
     let domain = ferrite_blocklist::normalise_domain(&domain);
     state.inner.blocklist.remove_blacklist(&domain);
-    if let Err(e) = state.inner.storage.remove_custom_entry(&domain).await {
-        // Restore the engine entry so it stays in sync with the surviving row.
-        let _ = state.inner.blocklist.add_blacklist(&domain);
-        return Err(e.into());
-    }
+    remove_config_domain(&state, Polarity::Block, &domain);
     evict_domain_cache(&state, &domain);
+    let persisted = state.persist_config().await.is_some();
     tracing::info!("removed '{}' from blacklist", domain);
-    Ok(Json(json!({ "domain": domain, "status": "removed" })))
+    Ok(Json(
+        json!({ "domain": domain, "status": "removed", "persisted": persisted }),
+    ))
 }
 
 /// POST /api/blocklist/whitelist
@@ -77,25 +73,68 @@ pub async fn add_whitelist(
 ) -> Result<(StatusCode, Json<DomainResponse>), ApiError> {
     let domain = ferrite_blocklist::normalise_domain(&payload.domain);
     state.inner.blocklist.add_whitelist(&domain)?;
-    if let Err(e) = state
-        .inner
-        .storage
-        .add_custom_entry(&domain, "whitelist")
-        .await
-    {
-        state.inner.blocklist.remove_whitelist(&domain);
-        return Err(e.into());
-    }
+    add_config_domain(&state, Polarity::Allow, &domain);
     // Evict stale cached responses so the whitelist takes effect immediately.
     evict_domain_cache(&state, &domain);
+    let persisted = state.persist_config().await.is_some();
     tracing::info!("whitelisted '{}'", domain);
     Ok((
         StatusCode::CREATED,
         Json(DomainResponse {
             domain,
             status: "whitelisted".into(),
+            persisted,
         }),
     ))
+}
+
+/// DELETE /api/blocklist/whitelist/:domain
+pub async fn del_whitelist(
+    State(state): State<AppState>,
+    Path(domain): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let domain = ferrite_blocklist::normalise_domain(&domain);
+    state.inner.blocklist.remove_whitelist(&domain);
+    remove_config_domain(&state, Polarity::Allow, &domain);
+    evict_domain_cache(&state, &domain);
+    let persisted = state.persist_config().await.is_some();
+    tracing::info!("removed '{}' from whitelist", domain);
+    Ok(Json(
+        json!({ "domain": domain, "status": "removed", "persisted": persisted }),
+    ))
+}
+
+/// Which manual list a config edit targets.
+#[derive(Clone, Copy)]
+enum Polarity {
+    Block,
+    Allow,
+}
+
+/// Mirror an engine addition into `live_config`. Held only for the push — the
+/// file write happens afterwards, off the lock.
+fn add_config_domain(state: &AppState, polarity: Polarity, domain: &str) {
+    let mut cfg = state.live_config.write();
+    let target = match polarity {
+        Polarity::Block => &mut cfg.blocklist.domains,
+        Polarity::Allow => &mut cfg.allowlist.domains,
+    };
+    if !target.iter().any(|d| d == domain) {
+        target.push(domain.to_string());
+    }
+}
+
+/// Mirror an engine removal into `live_config`. Compares against the normalised
+/// form of each entry, so an entry hand-written as `Ads.Example.COM.` is still
+/// the one the UI deleted — before, a file-sourced entry survived the delete
+/// and came back on the next restart.
+fn remove_config_domain(state: &AppState, polarity: Polarity, domain: &str) {
+    let mut cfg = state.live_config.write();
+    let target = match polarity {
+        Polarity::Block => &mut cfg.blocklist.domains,
+        Polarity::Allow => &mut cfg.allowlist.domains,
+    };
+    target.retain(|d| ferrite_blocklist::normalise_domain(d) != domain);
 }
 
 /// Evict all cached DNS responses for `domain` (every qtype). A wildcard entry
@@ -106,22 +145,6 @@ fn evict_domain_cache(state: &AppState, domain: &str) {
         return;
     }
     state.inner.dns_cache.evict_domain(domain);
-}
-
-/// DELETE /api/blocklist/whitelist/:domain
-pub async fn del_whitelist(
-    State(state): State<AppState>,
-    Path(domain): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let domain = ferrite_blocklist::normalise_domain(&domain);
-    state.inner.blocklist.remove_whitelist(&domain);
-    if let Err(e) = state.inner.storage.remove_custom_entry(&domain).await {
-        let _ = state.inner.blocklist.add_whitelist(&domain);
-        return Err(e.into());
-    }
-    evict_domain_cache(&state, &domain);
-    tracing::info!("removed '{}' from whitelist", domain);
-    Ok(Json(json!({ "domain": domain, "status": "removed" })))
 }
 
 /// GET /api/blocklist/check/:domain
@@ -176,11 +199,11 @@ mod tests {
     use ferrite_app::test_support;
 
     #[tokio::test]
-    async fn whitelist_add_normalizes_so_delete_clears_storage() {
+    async fn whitelist_add_normalizes_so_delete_clears_the_config() {
         let (state, db_path) = test_support::app_state("api-wl-normalize").await;
 
-        // FQDN, mixed-case input — must be normalised identically for the engine
-        // and storage so the listed value can delete the persisted row.
+        // FQDN, mixed-case input — must be normalised identically for the
+        // engine and the config so the listed value can delete the entry.
         let _ = add_whitelist(
             State(state.clone()),
             Json(DomainPayload {
@@ -191,29 +214,81 @@ mod tests {
         .unwrap();
 
         assert!(state.inner.blocklist.is_whitelisted("ads.example.com"));
-        let entries = state.inner.storage.load_custom_entries().await.unwrap();
         assert_eq!(
-            entries,
-            vec![("ads.example.com".to_string(), "whitelist".to_string())]
+            state.live_config.read().allowlist.domains,
+            vec!["ads.example.com".to_string()]
         );
 
-        // Delete by the normalised (UI-listed) value — the DB row must be gone,
-        // so it can't resurrect on restart.
+        // Delete by the normalised (UI-listed) value — the config entry must be
+        // gone, so it can't resurrect on restart.
         let _ = del_whitelist(State(state.clone()), Path("ads.example.com".to_string()))
             .await
             .unwrap();
-        assert!(
-            state
-                .inner
-                .storage
-                .load_custom_entries()
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(state.live_config.read().allowlist.domains.is_empty());
         assert!(!state.inner.blocklist.is_whitelisted("ads.example.com"));
 
         drop(state);
         test_support::cleanup_sqlite(&db_path);
+    }
+
+    /// The bug the split caused: an entry written by hand in `config.toml` was
+    /// seeded into the engine but had no database row, so deleting it in the UI
+    /// cleared nothing and the file put it straight back on the next restart.
+    #[tokio::test]
+    async fn an_entry_from_the_config_file_can_be_deleted() {
+        let (state, db_path) = test_support::app_state("api-bl-from-file").await;
+
+        state
+            .inner
+            .blocklist
+            .add_blacklist("*.ads.example")
+            .unwrap();
+        state
+            .live_config
+            .write()
+            .blocklist
+            .domains
+            .push("*.Ads.Example.".to_string());
+
+        let _ = del_blacklist(State(state.clone()), Path("*.ads.example".to_string()))
+            .await
+            .unwrap();
+
+        assert!(state.live_config.read().blocklist.domains.is_empty());
+        assert!(
+            !state
+                .inner
+                .blocklist
+                .is_blocked_normalized("tracker.ads.example")
+        );
+
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
+    }
+
+    /// Manual entries are seeded from the config at construction, so an engine
+    /// built from a file that names them already blocks and lists them.
+    #[tokio::test]
+    async fn manual_entries_in_the_config_seed_the_engine() {
+        let (state, db_path) = test_support::app_state("api-bl-seed").await;
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
+
+        let mut cfg = ferrite_core::config::BlocklistConfig::default();
+        cfg.lists.clear();
+        cfg.domains = vec!["evil.test".to_string(), "*.ads.test".to_string()];
+        let engine = ferrite_blocklist::Blocklist::new(
+            cfg,
+            ferrite_core::config::AllowlistConfig::default(),
+            std::env::temp_dir().join("ferrite-seed-test.fst"),
+        );
+
+        assert!(engine.is_blocked_normalized("evil.test"));
+        assert!(engine.is_blocked_normalized("www.evil.test"));
+        assert!(engine.is_blocked_normalized("tracker.ads.test"));
+
+        let mut listed = engine.list_blacklist();
+        listed.sort();
+        assert_eq!(listed, vec!["*.ads.test", "evil.test"]);
     }
 }

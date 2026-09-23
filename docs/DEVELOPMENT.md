@@ -36,7 +36,7 @@ ferrite            bin: main.rs + setup.rs; wires everything together
     ├── ferrite-clients   IP↔MAC registry, PTR/mDNS resolution, aliases
     ├── ferrite-blocklist FST engine, adblock parser, list refresh, decision cache
     ├── ferrite-upstream  resolver pool, DoT/DoH/DoQ, tunneled resolver
-    ├── ferrite-storage   SQLite query log + rollups
+    ├── ferrite-storage   SQLite query log + rollups + device inventory
     └── ferrite-core      errors, config, shared record types, IP/MAC utils, log ring
 ```
 

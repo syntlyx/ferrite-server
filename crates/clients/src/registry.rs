@@ -16,6 +16,7 @@ impl ClientRegistry {
         upstream: Arc<ZoneRouter>,
         storage: Arc<dyn Storage>,
         switches: Arc<ferrite_core::recording::RecordSwitches>,
+        aliases: &[ferrite_core::config::ClientAliasConfig],
     ) -> Arc<Self> {
         let recording = switches.scope().records_anything();
         let registry = Arc::new(Self {
@@ -32,29 +33,35 @@ impl ClientRegistry {
             switches,
         });
 
-        match registry.storage.load_client_aliases().await {
-            Ok(entries) => {
-                for (key, key_type, name) in entries {
-                    match key_type.as_str() {
-                        "mac" => {
-                            if let Some(mac) = parse_mac(&key) {
-                                registry.mac_aliases.insert(mac, name);
-                            }
-                        }
-                        _ => {
-                            if let Some(ip) = parse_ip(&key) {
-                                registry.ip_aliases.insert(unmap_v4(ip), name);
-                            }
-                        }
+        // Manual aliases come from `config.toml`: they are what the operator
+        // decided to call a device, not something ferrite observed, so they are
+        // configuration and the file is their only copy.
+        for alias in aliases {
+            match (alias.mac.as_deref(), alias.ip.as_deref()) {
+                (Some(mac), _) => match parse_mac(mac) {
+                    Some(mac) => {
+                        registry.mac_aliases.insert(mac, alias.name.clone());
                     }
-                }
-                tracing::info!(
-                    "loaded {} IP aliases, {} MAC aliases",
-                    registry.ip_aliases.len(),
-                    registry.mac_aliases.len()
-                );
+                    None => tracing::warn!("client_aliases: invalid MAC '{}', skipped", mac),
+                },
+                (None, Some(ip)) => match parse_ip(ip) {
+                    Some(ip) => {
+                        registry.ip_aliases.insert(unmap_v4(ip), alias.name.clone());
+                    }
+                    None => tracing::warn!("client_aliases: invalid IP '{}', skipped", ip),
+                },
+                (None, None) => tracing::warn!(
+                    "client_aliases: entry '{}' names neither ip nor mac, skipped",
+                    alias.name
+                ),
             }
-            Err(e) => tracing::warn!("failed to load client aliases: {}", e),
+        }
+        if !aliases.is_empty() {
+            tracing::info!(
+                "loaded {} IP aliases, {} MAC aliases from config",
+                registry.ip_aliases.len(),
+                registry.mac_aliases.len()
+            );
         }
 
         // With recording switched off the inventory on disk is not ours to read
@@ -183,42 +190,32 @@ impl ClientRegistry {
 
     // ── Alias management ──────────────────────────────────────────────────────
 
-    pub async fn add_ip_alias(&self, ip: IpAddr, name: String) -> Result<()> {
+    // Aliases live in `config.toml`; these only move the in-memory copy. The
+    // API layer owns persistence, because it is the one holding the config —
+    // and it writes the file *before* calling these, so a failed save cannot
+    // leave the running registry describing a device the file doesn't.
+    pub fn set_ip_alias(&self, ip: IpAddr, name: String) {
         let ip = unmap_v4(ip);
-        self.storage
-            .add_client_alias(&ip.to_string(), "ip", &name)
-            .await?;
         self.ptr_cache.remove(&ip);
         self.ip_aliases.insert(ip, name);
-        Ok(())
     }
 
-    pub async fn add_mac_alias(&self, mac: [u8; 6], name: String) -> Result<()> {
-        self.storage
-            .add_client_alias(&format_mac(&mac), "mac", &name)
-            .await?;
+    pub fn set_mac_alias(&self, mac: [u8; 6], name: String) {
         for ip in self.addrs_for_device(&format_mac(&mac)) {
             self.ptr_cache.remove(&ip);
         }
         self.mac_aliases.insert(mac, name);
-        Ok(())
     }
 
-    pub async fn remove_ip_alias(&self, ip: IpAddr) -> Result<()> {
-        let ip = unmap_v4(ip);
-        self.storage
-            .remove_client_alias(&ip.to_string(), "ip")
-            .await?;
-        self.ip_aliases.remove(&ip);
-        Ok(())
+    pub fn remove_ip_alias(&self, ip: IpAddr) {
+        self.ip_aliases.remove(&unmap_v4(ip));
     }
 
-    pub async fn remove_mac_alias(&self, mac: [u8; 6]) -> Result<()> {
-        self.storage
-            .remove_client_alias(&format_mac(&mac), "mac")
-            .await?;
+    pub fn remove_mac_alias(&self, mac: [u8; 6]) {
+        for ip in self.addrs_for_device(&format_mac(&mac)) {
+            self.ptr_cache.remove(&ip);
+        }
         self.mac_aliases.remove(&mac);
-        Ok(())
     }
 
     pub fn list_aliases(&self) -> Vec<(String, &'static str, String)> {
@@ -501,6 +498,7 @@ mod tests {
             upstream,
             storage as Arc<dyn Storage>,
             ferrite_core::recording::RecordSwitches::new(scope),
+            &[],
         )
         .await
     }

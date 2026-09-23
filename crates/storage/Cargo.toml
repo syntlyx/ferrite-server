@@ -4,11 +4,17 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+# Exposes `SqliteStorage::seed_legacy_config_tables` so other crates can test
+# the one-time hand-off of authored state into `config.toml`.
+testutil = []
+
 [dependencies]
 ferrite-core.workspace = true
 
 async-trait.workspace = true
 chrono.workspace = true
+parking_lot.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 tokio.workspace = true

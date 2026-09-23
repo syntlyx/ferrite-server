@@ -818,6 +818,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "toml",
  "tracing",
 ]
 
@@ -957,6 +958,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "ferrite-core",
+ "parking_lot",
  "rusqlite",
  "serde",
  "tokio",

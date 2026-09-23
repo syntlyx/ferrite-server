@@ -12,7 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::ApiError;
 use ferrite_app::AppState;
 use ferrite_clients::ClientRegistry;
-use ferrite_core::net::{format_mac, parse_ip, parse_mac};
+use ferrite_core::config::ClientAliasConfig;
+use ferrite_core::net::{format_mac, parse_ip, parse_mac, unmap_v4};
 
 #[derive(Deserialize, Default)]
 pub struct ListClientsParams {
@@ -191,15 +192,25 @@ pub async fn add_alias(
                     ferrite_core::error::FeriteError::Config(format!("invalid IP: {}", ip_str))
                 })
                 .map_err(ApiError)?;
-            state
-                .inner
-                .client_registry
-                .add_ip_alias(ip, name.clone())
-                .await?;
+            set_config_alias(
+                &state,
+                ClientAliasConfig {
+                    ip: Some(ip.to_string()),
+                    mac: None,
+                    name: name.clone(),
+                },
+            );
+            state.inner.client_registry.set_ip_alias(ip, name.clone());
+            let persisted = state.persist_config().await.is_some();
             tracing::info!("IP alias set: {} → {}", ip, name);
             Ok((
                 StatusCode::CREATED,
-                Json(json!({ "ip": ip.to_string(), "name": name, "type": "ip" })),
+                Json(json!({
+                    "ip": ip.to_string(),
+                    "name": name,
+                    "type": "ip",
+                    "persisted": persisted,
+                })),
             ))
         }
         (None, Some(mac_str)) => {
@@ -208,15 +219,25 @@ pub async fn add_alias(
                     ferrite_core::error::FeriteError::Config(format!("invalid MAC: {}", mac_str))
                 })
                 .map_err(ApiError)?;
-            state
-                .inner
-                .client_registry
-                .add_mac_alias(mac, name.clone())
-                .await?;
+            set_config_alias(
+                &state,
+                ClientAliasConfig {
+                    ip: None,
+                    mac: Some(format_mac(&mac)),
+                    name: name.clone(),
+                },
+            );
+            state.inner.client_registry.set_mac_alias(mac, name.clone());
+            let persisted = state.persist_config().await.is_some();
             tracing::info!("MAC alias set: {} → {}", mac_str, name);
             Ok((
                 StatusCode::CREATED,
-                Json(json!({ "mac": format_mac(&mac), "name": name, "type": "mac" })),
+                Json(json!({
+                    "mac": format_mac(&mac),
+                    "name": name,
+                    "type": "mac",
+                    "persisted": persisted,
+                })),
             ))
         }
         _ => Err(ApiError(ferrite_core::error::FeriteError::Config(
@@ -273,23 +294,63 @@ pub async fn remove_alias(
 ) -> Result<Json<Value>, ApiError> {
     // Try parsing as MAC first, then as IP.
     if let Some(mac) = parse_mac(&key_str) {
-        state.inner.client_registry.remove_mac_alias(mac).await?;
+        state.inner.client_registry.remove_mac_alias(mac);
+        remove_config_alias(&state, |a| {
+            a.mac.as_deref().and_then(parse_mac) == Some(mac)
+        });
+        let persisted = state.persist_config().await.is_some();
         tracing::info!("MAC alias removed: {}", format_mac(&mac));
-        return Ok(Json(
-            json!({ "mac": format_mac(&mac), "status": "removed" }),
-        ));
+        return Ok(Json(json!({
+            "mac": format_mac(&mac),
+            "status": "removed",
+            "persisted": persisted,
+        })));
     }
 
     if let Some(ip) = parse_ip(&key_str) {
-        state.inner.client_registry.remove_ip_alias(ip).await?;
+        state.inner.client_registry.remove_ip_alias(ip);
+        let target = unmap_v4(ip);
+        remove_config_alias(&state, |a| {
+            a.ip.as_deref().and_then(parse_ip).map(unmap_v4) == Some(target)
+        });
+        let persisted = state.persist_config().await.is_some();
         tracing::info!("IP alias removed: {}", ip);
-        return Ok(Json(json!({ "ip": ip.to_string(), "status": "removed" })));
+        return Ok(Json(json!({
+            "ip": ip.to_string(),
+            "status": "removed",
+            "persisted": persisted,
+        })));
     }
 
     Err(ApiError(ferrite_core::error::FeriteError::Config(format!(
         "'{}' is neither a valid IP nor a MAC address",
         key_str
     ))))
+}
+
+/// Upsert an alias in `live_config`, replacing any entry for the same device.
+/// Keys are compared parsed, not as text, so `AA:BB:…` and `aa:bb:…` — or an
+/// IPv4-mapped IPv6 address and its plain form — are one device, not two.
+fn set_config_alias(state: &AppState, alias: ClientAliasConfig) {
+    let mac = alias.mac.as_deref().and_then(parse_mac);
+    let ip = alias.ip.as_deref().and_then(parse_ip).map(unmap_v4);
+    let mut cfg = state.live_config.write();
+    cfg.client_aliases.retain(|a| {
+        !(mac.is_some() && a.mac.as_deref().and_then(parse_mac) == mac)
+            && !(ip.is_some() && a.ip.as_deref().and_then(parse_ip).map(unmap_v4) == ip)
+    });
+    cfg.client_aliases.push(alias);
+}
+
+/// Drop every alias matching `pred` from `live_config`. An alias written by
+/// hand in the config file is removed by exactly the same path as one added
+/// through the UI, so a delete sticks across a restart either way.
+fn remove_config_alias(state: &AppState, pred: impl Fn(&ClientAliasConfig) -> bool) {
+    state
+        .live_config
+        .write()
+        .client_aliases
+        .retain(|a| !pred(a));
 }
 
 #[cfg(test)]

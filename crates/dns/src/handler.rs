@@ -927,6 +927,7 @@ mod tests {
                 Arc::clone(&upstream),
                 Arc::clone(&storage) as _,
                 RecordSwitches::new(RecordScope::ALL),
+                &[],
             )
             .await;
             let (query_tx, rx) = mpsc::channel(8_192);

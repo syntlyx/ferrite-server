@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod conformance;
+pub mod memory;
 pub mod schema;
 pub mod sqlite;
 
@@ -109,29 +112,20 @@ pub trait Storage: Send + Sync {
     /// Returns the number of rows deleted.
     async fn delete_queries_older_than(&self, cutoff_ts: i64) -> Result<u64>;
 
-    // ── Custom whitelist / blacklist ─────────────────────────────────────────
+    /// Make the store able to give space back, so a size cap can be met at all.
+    ///
+    /// Called once when a size cap is first enforced. `Ok(true)` means the
+    /// store had to convert itself and that conversion was expensive, which the
+    /// caller logs. A store that always releases space returns `Ok(false)`.
+    async fn prepare_size_cap(&self) -> Result<bool>;
 
-    /// Persist a whitelist or blacklist entry. `entry_type` is "whitelist" or "blacklist".
-    async fn add_custom_entry(&self, domain: &str, entry_type: &str) -> Result<()>;
-
-    /// Remove a custom entry by domain.
-    async fn remove_custom_entry(&self, domain: &str) -> Result<()>;
-
-    /// Load all custom entries: returns (domain, entry_type) pairs.
-    async fn load_custom_entries(&self) -> Result<Vec<(String, String)>>;
-
-    // ── Custom DNS records ────────────────────────────────────────────────────
-
-    // ── Client aliases ────────────────────────────────────────────────────────
-
-    /// Persist a manual client alias (key + key_type → friendly name).
-    async fn add_client_alias(&self, key: &str, key_type: &str, name: &str) -> Result<()>;
-
-    /// Remove a manual client alias.
-    async fn remove_client_alias(&self, key: &str, key_type: &str) -> Result<()>;
-
-    /// Load all manual client aliases: returns (key, key_type, name) triples.
-    async fn load_client_aliases(&self) -> Result<Vec<(String, String, String)>>;
+    /// Drop the oldest query log entries until the store fits in `max_bytes`,
+    /// then return the space to the filesystem.
+    ///
+    /// Only the query log and its rollups are trimmed: the device inventory is
+    /// tiny and losing it would cost every device its name, which is not what
+    /// someone capping a *log* asked for.
+    async fn enforce_size_cap(&self, max_bytes: u64) -> Result<SizeTrim>;
 
     // ── Learned device identities & IP bindings ───────────────────────────────
 
@@ -171,19 +165,58 @@ pub trait Storage: Send + Sync {
     /// return the deleted IPs so the caller can drop them from its in-memory maps.
     async fn delete_ip_bindings_older_than(&self, cutoff_ts: i64) -> Result<Vec<String>>;
 
-    // ── Custom DNS records ────────────────────────────────────────────────────
+    // ── One-time hand-off of authored state to config.toml ────────────────────
 
-    async fn upsert_custom_record(
-        &self,
-        domain: &str,
-        record_type: &str,
-        value: &str,
-        ttl: u32,
-    ) -> Result<()>;
+    /// Read whatever the pre-v9 configuration tables still hold. Empty once the
+    /// hand-off has run (the tables are gone), so this is cheap on every later
+    /// boot. Missing tables are not an error — a database created after v9 never
+    /// had them.
+    async fn load_legacy_config_rows(&self) -> Result<LegacyConfigRows>;
 
-    async fn delete_custom_record(&self, domain: &str) -> Result<()>;
-
-    async fn load_custom_records(&self) -> Result<Vec<ferrite_core::config::CustomRecordConfig>>;
+    /// Drop the five pre-v9 tables that held authored state. Called only once
+    /// the rows they held are safely in `config.toml`, so a failed config write
+    /// leaves them in place for the next boot to retry.
+    async fn drop_legacy_config_tables(&self) -> Result<()>;
 }
 
+/// What one pass of [`Storage::enforce_size_cap`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SizeTrim {
+    /// Query rows deleted. Zero when the store was already under the cap.
+    pub rows_deleted: u64,
+    /// Size before the pass, as the store accounts for it.
+    pub bytes_before: u64,
+    /// Size after. Still above the cap means the pass hit its own work limit
+    /// and the next one continues — it never deletes unboundedly in one go.
+    pub bytes_after: u64,
+}
+
+impl SizeTrim {
+    /// Nothing needed doing.
+    pub fn is_noop(&self) -> bool {
+        self.rows_deleted == 0
+    }
+}
+
+/// Authored state found in a pre-v9 database, on its way into `config.toml`.
+#[derive(Debug, Default, Clone)]
+pub struct LegacyConfigRows {
+    /// `custom_entries`: (domain, "whitelist" | "blacklist").
+    pub custom_entries: Vec<(String, String)>,
+    /// `custom_dns_records`, in the shape the config file uses.
+    pub custom_records: Vec<ferrite_core::config::CustomRecordConfig>,
+    /// `client_aliases`: (key, "ip" | "mac", name).
+    pub client_aliases: Vec<(String, String, String)>,
+}
+
+impl LegacyConfigRows {
+    /// Nothing to hand over — the common case on every boot after the first.
+    pub fn is_empty(&self) -> bool {
+        self.custom_entries.is_empty()
+            && self.custom_records.is_empty()
+            && self.client_aliases.is_empty()
+    }
+}
+
+pub use memory::MemoryStorage;
 pub use sqlite::SqliteStorage;

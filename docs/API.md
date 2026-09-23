@@ -473,7 +473,9 @@ GET /api/clients/192.168.1.42/stats
 
 ### `POST /api/clients/aliases` — add or update alias
 
-Manual aliases take priority over PTR lookups. Persisted across restarts. Provide exactly one of `ip` or `mac`.
+Manual aliases take priority over PTR lookups. Provide exactly one of `ip` or `mac`.
+
+Written to `[[client_aliases]]` in `config.toml` — they are configuration, not a record, so they survive the privacy switches and clearing the query log. `persisted` says whether the config file was written: the alias is live either way, but `false` means it will not survive a restart (the file is read-only, or there is nowhere to write it).
 
 ```json
 { "ip": "192.168.1.42", "name": "My MacBook" }
@@ -486,7 +488,7 @@ Manual aliases take priority over PTR lookups. Persisted across restarts. Provid
 `201` on success:
 
 ```json
-{ "ip": "192.168.1.42", "name": "My MacBook", "type": "ip" }
+{ "ip": "192.168.1.42", "name": "My MacBook", "type": "ip", "persisted": true }
 ```
 
 ### `DELETE /api/clients/aliases/:key` — remove alias
@@ -499,7 +501,7 @@ DELETE /api/clients/aliases/aa:bb:cc:dd:ee:ff
 ```
 
 ```json
-{ "ip": "192.168.1.42", "status": "removed" }
+{ "ip": "192.168.1.42", "status": "removed", "persisted": true }
 ```
 
 ---
@@ -519,10 +521,12 @@ DELETE /api/clients/aliases/aa:bb:cc:dd:ee:ff
 ```
 
 ```json
-{ "domain": "safe.example.com", "status": "whitelisted" }
+{ "domain": "safe.example.com", "status": "whitelisted", "persisted": true }
 ```
 
-Persisted to SQLite. Takes effect immediately. Wildcard patterns (`*.example.com`) match all direct subdomains but not the apex itself.
+Written to `[allowlist] domains` in `config.toml` (the blacklist goes to `[blocklist] domains`). Takes effect immediately. Wildcard patterns (`*.example.com`) match all direct subdomains but not the apex itself.
+
+`persisted` says whether the config file was written. The entry is live either way; `false` means it will not survive a restart. The same applies to every endpoint below that reports it.
 
 ### `DELETE /api/blocklist/whitelist/:domain`
 
@@ -531,8 +535,10 @@ DELETE /api/blocklist/whitelist/safe.example.com
 ```
 
 ```json
-{ "domain": "safe.example.com", "status": "removed" }
+{ "domain": "safe.example.com", "status": "removed", "persisted": true }
 ```
+
+Deletes the entry wherever it came from, including one written by hand in `config.toml`.
 
 ### `GET /api/blocklist/blacklist`
 
@@ -547,7 +553,7 @@ DELETE /api/blocklist/whitelist/safe.example.com
 ```
 
 ```json
-{ "domain": "evil.com", "status": "blacklisted" }
+{ "domain": "evil.com", "status": "blacklisted", "persisted": true }
 ```
 
 ### `DELETE /api/blocklist/blacklist/:domain`
@@ -557,7 +563,7 @@ DELETE /api/blocklist/blacklist/evil.com
 ```
 
 ```json
-{ "domain": "evil.com", "status": "removed" }
+{ "domain": "evil.com", "status": "removed", "persisted": true }
 ```
 
 ### `GET /api/blocklist/check/:domain` — check if a domain is blocked
@@ -747,7 +753,7 @@ Request/response shapes match the `/api/lists` endpoints exactly.
 
 ## Custom DNS Records
 
-Local A / AAAA / CNAME overrides. Take priority over blocklist and upstream. Wildcards (`*.home.lan`) are supported. Persisted to SQLite.
+Local A / AAAA / CNAME overrides. Take priority over blocklist and upstream. Wildcards (`*.home.lan`) are supported. Written to `[[custom_records]]` in `config.toml`.
 
 Ferrite also has a hidden built-in panel record: `fe.te` resolves to `panel.ipv4` when configured, or to the detected local IPv4 address of the ferrite server. It is not returned by `GET /api/custom-records`; adding a manual `fe.te` custom record overrides the built-in answer. In Docker bridge mode, set `panel.ipv4` or `FERRITE_PANEL_IP` to the host/LAN IP because container interface auto-detection sees the container IP.
 
@@ -785,9 +791,12 @@ Ferrite also has a hidden built-in panel record: `fe.te` resolves to `panel.ipv4
     "type": "A",
     "value": "192.168.1.20",
     "ttl": 300
-  }
+  },
+  "persisted": true
 }
 ```
+
+Written to `[[custom_records]]` in `config.toml`.
 
 ### `DELETE /api/custom-records/:domain`
 
@@ -796,7 +805,7 @@ DELETE /api/custom-records/printer.lan
 ```
 
 ```json
-{ "domain": "printer.lan", "status": "removed" }
+{ "domain": "printer.lan", "status": "removed", "persisted": true }
 ```
 
 ---
@@ -824,7 +833,9 @@ Returns the full parsed config. Non-empty `api_key` and `password_hash` values a
   "zones": [{ "name": "1.168.192.in-addr.arpa", "upstream": "192.168.1.1:53" }],
   "storage": {
     "path": "/path/to/ferrite.db",
+    "backend": "sqlite",
     "log_retention_days": 30,
+    "log_max_mb": 0,
     "log_queries": true,
     "keep_stats": true
   },
@@ -851,9 +862,12 @@ Returns the full parsed config. Non-empty `api_key` and `password_hash` values a
     "domains": [],
     "lists": []
   },
-  "custom_records": []
+  "custom_records": [],
+  "client_aliases": []
 }
 ```
+
+---
 
 ### `PATCH /api/settings` — update settings
 
@@ -871,6 +885,8 @@ All fields are optional. Fields not provided are left unchanged.
 | `dns_log_ignore`     | `string[]`       | Domain patterns to suppress from the query log entirely. Replaces the full list. Supports exact names (`fe.te`) and wildcard suffixes (`*.local`). Queries matching these patterns are still resolved normally. |
 | `web_dir`            | `string \| null` | Override static web UI directory; `null` resets to `~/.local/share/ferrite/web`                                                                                                                                 |
 | `log_retention_days` | int              | Automatically delete query log entries older than N days; `0` disables retention. Applied once ~30 s after startup and every 24 h thereafter.                                                                   |
+| `log_max_mb`         | int              | Cap the query log at N MB, deleting oldest entries first; `0` (default) disables the cap. Checked every 60 s, so it takes effect within the minute. Independent of `log_retention_days` — whichever trims first wins. |
+| `storage_backend`    | `"sqlite"` \| `"memory"` | Which store holds the query log, its rollups and the device inventory. `memory` creates no database file and keeps nothing across a restart; the compiled blocklist cache still lives on disk, since it comes from downloaded lists rather than traffic. **Restart required.** Configuration is unaffected — it lives in `config.toml` either way. |
 | `log_queries`        | bool             | Privacy switch for the per-query log. `false` stops writing rows to `queries`, empties the live ring buffer, and makes `GET /api/queries` return `[]` on every branch — default page, filtered query and delta poll alike. Filtering, routing and the lifetime counters are unaffected. Existing rows stay on disk and become readable again if you switch it back on; clear them for good with `DELETE /api/queries`. |
 | `keep_stats`         | bool             | Privacy switch for the aggregates. `false` stops the 10-minute rollups, the top-N counters, the 24-hour timeseries and the per-egress routed-domain tables, drops what they already hold in memory, and stops every aggregate *read* as well: `/api/stats/top-domains`, `/api/stats/top-blocked`, `/api/stats/top-clients` and `/api/clients` return empty, and `/api/clients/{device}/stats` returns 404, however far back the window reaches. Per-egress byte and connection totals keep counting — they name no host. `/api/stats/summary` keeps serving the process-lifetime counters (`total_queries`, `blocked_queries`, …), which hold no domain or device identity. |
 | `blocklist_enabled`  | bool             | Master switch for DNS blocklist filtering. DNS resolution, custom records, caching, and logging continue to work while filtering is disabled.                                                                    |

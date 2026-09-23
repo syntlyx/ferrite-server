@@ -217,6 +217,12 @@ async fn run() -> anyhow::Result<()> {
     // so log_retention_days can be changed via PATCH /api/settings without restart.
     tokio::spawn(log_retention_loop(state.clone()));
 
+    // ── Query log size cap ───────────────────────────────────────────────────
+    // Age-based retention runs daily, which is the right cadence for a disk.
+    // A byte cap is for somewhere that can't absorb a surprise — a RAM-backed
+    // path, or a nearly-full flash card — so it runs every minute instead.
+    tokio::spawn(log_size_cap_loop(state.clone()));
+
     // ── Neighbour-table mirror ────────────────────────────────────────────────
     // Keeps the IP→MAC map warm from the OS ARP/NDP tables so queries from
     // freshly-rotated addresses are tagged with their device MAC.
@@ -307,17 +313,31 @@ async fn log_retention_loop(state: ferrite_app::AppState) {
     // Say what the policy is before acting on it. The default is 30 days, so an
     // install that never set the key will start pruning here — this line is how
     // its operator finds out, and how they learn to turn it off.
-    let configured = state.live_config.read().storage.log_retention_days;
+    let (configured, max_mb) = {
+        let cfg = state.live_config.read();
+        (cfg.storage.log_retention_days, cfg.storage.log_max_mb)
+    };
     match configured {
+        // A size cap is a retention policy too, so only warn when neither is
+        // set — otherwise the log is bounded, just by bytes rather than days.
+        0 if max_mb > 0 => tracing::info!(
+            "query log retention is by size only: {} MB (storage.log_max_mb)",
+            max_mb
+        ),
         0 => match state.inner.storage.database_bytes().await {
             // Keeping everything is a valid choice; a database that has grown
             // past the size of a small SD card's free space is worth a word.
             Ok(bytes) if bytes > LARGE_DATABASE_BYTES => tracing::warn!(
-                "query log retention is off and the database is {} MB — set storage.log_retention_days to prune it",
+                "query log retention is off and the database is {} MB — set storage.log_retention_days or storage.log_max_mb to prune it",
                 bytes / 1_000_000
             ),
             _ => tracing::info!("query log retention is off — entries are kept forever"),
         },
+        days if max_mb > 0 => tracing::info!(
+            "query log retention: {} days, capped at {} MB (whichever trims first)",
+            days,
+            max_mb
+        ),
         days => tracing::info!(
             "query log retention: {} days (set storage.log_retention_days = 0 to keep everything)",
             days
@@ -347,6 +367,71 @@ async fn log_retention_loop(state: ferrite_app::AppState) {
         // particular). Uses its own fixed age window, independent of log retention.
         state.inner.client_registry.prune_learned_ips().await;
         tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
+    }
+}
+
+/// How often the query log is measured against `storage.log_max_mb`.
+/// A `PRAGMA` read, so checking often costs nothing; the deletes only happen
+/// when the log is actually over.
+const SIZE_CAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Keep the query log under `storage.log_max_mb`, oldest entries first.
+///
+/// Reads the setting from `live_config` each tick, so turning the cap on or
+/// changing it via PATCH /api/settings takes effect within the minute, with no
+/// restart. Off (0) by default, in which case this loop only ticks.
+async fn log_size_cap_loop(state: ferrite_app::AppState) {
+    // Small initial delay so startup I/O settles first.
+    tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+
+    // The one-time conversion a pre-existing database needs before it can give
+    // space back. Deferred until a cap is actually switched on: it rewrites the
+    // whole file, and nobody who never set a cap should pay for that.
+    let mut prepared = false;
+
+    loop {
+        let max_mb = state.live_config.read().storage.log_max_mb;
+        if max_mb > 0 {
+            if !prepared {
+                match state.inner.storage.prepare_size_cap().await {
+                    Ok(converted) => {
+                        if converted {
+                            tracing::info!(
+                                "query log size cap enabled — rebuilt the database once so it can \
+                                 release space; later trims are incremental"
+                            );
+                        }
+                        prepared = true;
+                    }
+                    Err(e) => {
+                        // Trimming without this would delete rows and never see
+                        // the size drop, so skip the pass and retry next tick.
+                        tracing::warn!("could not prepare the database for a size cap: {}", e);
+                        tokio::time::sleep(SIZE_CAP_INTERVAL).await;
+                        continue;
+                    }
+                }
+            }
+
+            let max_bytes = (max_mb as u64) * ferrite_core::config::BYTES_PER_MB;
+            match state.inner.storage.enforce_size_cap(max_bytes).await {
+                Ok(trim) if trim.is_noop() => {}
+                Ok(trim) => tracing::info!(
+                    "query log size cap: deleted {} entries, {} MB -> {} MB (cap {} MB)",
+                    trim.rows_deleted,
+                    trim.bytes_before / ferrite_core::config::BYTES_PER_MB,
+                    trim.bytes_after / ferrite_core::config::BYTES_PER_MB,
+                    max_mb
+                ),
+                Err(e) => tracing::warn!("query log size cap failed: {}", e),
+            }
+        } else {
+            // Cap switched off again: a later re-enable re-checks the database
+            // rather than assuming the earlier preparation still holds.
+            prepared = false;
+        }
+
+        tokio::time::sleep(SIZE_CAP_INTERVAL).await;
     }
 }
 

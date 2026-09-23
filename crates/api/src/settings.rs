@@ -67,10 +67,12 @@ mod nullable {
 /// Hot-patchable (no restart): `api_key`, `password`, `dns_min_ttl`, `dns_max_ttl`,
 ///                             `dns_client_ttl`,
 ///                             `dns_log_ignore`, `web_dir`, `log_retention_days`,
+///                             `log_max_mb`,
 ///                             `log_queries`, `keep_stats`,
 ///                             `blocklist_enabled`, `blocklist_client_bypass`,
 ///                             `debug_logging`.
-/// Restart-required:           `dns_bind_addr`, `dns_cache_size`, `dns_cache_max_mb`,
+/// Restart-required:           `storage_backend`,
+///                             `dns_bind_addr`, `dns_cache_size`, `dns_cache_max_mb`,
 ///                             `dns_strip_ecs`, `dns_dnssec`, `api_bind_addr`,
 ///                             `blocklist_decision_cache_size`, `upstream`, `zones`,
 ///                             `panel_enabled`, `panel_domain`, `panel_ipv4`, `panel_url`.
@@ -88,6 +90,9 @@ pub struct SettingsPatch {
     #[serde(default, deserialize_with = "nullable::deserialize")]
     pub web_dir: Option<Option<PathBuf>>,
     pub log_retention_days: Option<u32>,
+    /// Cap the query log at this many megabytes (0 = no cap). Enforced within
+    /// a minute of being set; see `StorageConfig::log_max_mb`.
+    pub log_max_mb: Option<u32>,
     /// Privacy switch: record one row per query (the query log). Turning it off
     /// only stops new records — use `DELETE /api/queries` to drop what is
     /// already stored.
@@ -100,6 +105,9 @@ pub struct SettingsPatch {
     pub debug_logging: Option<bool>,
 
     // ── Restart-required ─────────────────────────────────────────────────────
+    /// `"sqlite"` or `"memory"` — which store holds the query log. Restart
+    /// required: the store is built once, at startup.
+    pub storage_backend: Option<String>,
     pub dns_bind_addr: Option<String>,
     pub dns_cache_size: Option<usize>,
     pub dns_cache_max_mb: Option<usize>,
@@ -250,6 +258,10 @@ pub async fn update_settings(
             cfg.storage.log_retention_days = days;
             hot_changed.push("log_retention_days");
         }
+        if let Some(mb) = patch.log_max_mb {
+            cfg.storage.log_max_mb = mb;
+            hot_changed.push("log_max_mb");
+        }
 
         if let Some(on) = patch.log_queries {
             cfg.storage.log_queries = on;
@@ -292,6 +304,23 @@ pub async fn update_settings(
                 )))
             })?;
             restart_changed.push("dns_bind_addr");
+        }
+
+        if let Some(backend) = patch.storage_backend.as_deref() {
+            // Parsed here rather than trusted: an unknown name would otherwise
+            // be written to the config and fail the *next* startup, long after
+            // the request that caused it.
+            cfg.storage.backend = match backend.trim().to_ascii_lowercase().as_str() {
+                "sqlite" => ferrite_core::config::StorageBackend::Sqlite,
+                "memory" => ferrite_core::config::StorageBackend::Memory,
+                other => {
+                    return Err(ApiError(FeriteError::Config(format!(
+                        "unknown storage_backend '{}' (expected 'sqlite' or 'memory')",
+                        other
+                    ))));
+                }
+            };
+            restart_changed.push("storage_backend");
         }
 
         if let Some(size) = patch.dns_cache_size {
@@ -473,7 +502,7 @@ pub async fn update_settings(
         })));
     }
 
-    let saved_path = persist_config(&state).await;
+    let saved_path = state.persist_config().await;
     let needs_restart = !restart_changed.is_empty();
 
     tracing::info!(
@@ -483,15 +512,7 @@ pub async fn update_settings(
     );
 
     if needs_restart {
-        tracing::info!("restart-required settings changed, saving snapshot and exiting");
-        let snap_state = state.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            if let Err(e) = snap_state.save_snapshot().await {
-                tracing::error!("snapshot save before restart failed: {}", e);
-            }
-            std::process::exit(0);
-        });
+        schedule_restart(&state);
     }
 
     Ok(Json(json!({
@@ -505,6 +526,35 @@ pub async fn update_settings(
     })))
 }
 
+/// Save the snapshot and exit, leaving the supervisor to start us again.
+///
+/// Delayed so this request's response gets out first — the caller is told a
+/// restart is coming, then it happens.
+#[cfg(not(test))]
+fn schedule_restart(state: &AppState) {
+    tracing::info!("restart-required settings changed, saving snapshot and exiting");
+    let snap_state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        if let Err(e) = snap_state.save_snapshot().await {
+            tracing::error!("snapshot save before restart failed: {}", e);
+        }
+        std::process::exit(0);
+    });
+}
+
+/// Under test this does nothing, because the real one ends in
+/// `std::process::exit(0)`.
+///
+/// Today a test survives it by accident: each `#[tokio::test]` drops its
+/// runtime when the test returns, which cancels the pending task before the
+/// 300 ms elapses. A test that took longer would exit the whole binary with
+/// status 0 — the suite would report success having silently skipped whatever
+/// had not run yet. A false green is the one test failure worth engineering
+/// against, so the exit is not reachable from a test at all.
+#[cfg(test)]
+fn schedule_restart(_state: &AppState) {}
+
 fn normalize_client_bypass(entries: &[String]) -> Result<Vec<String>, ApiError> {
     let mut normalized = BTreeSet::new();
     for entry in entries {
@@ -517,32 +567,6 @@ fn normalize_client_bypass(entries: &[String]) -> Result<Vec<String>, ApiError> 
         normalized.insert(key);
     }
     Ok(normalized.into_iter().collect())
-}
-
-async fn persist_config(state: &AppState) -> Option<String> {
-    let cfg = state.live_config.read().clone();
-
-    let path = state.config_path.as_ref().clone().or_else(|| {
-        ferrite_core::config::Config::config_candidates()
-            .into_iter()
-            .next()
-    })?;
-
-    let path_clone = path.clone();
-    match tokio::task::spawn_blocking(move || cfg.save(&path_clone)).await {
-        Ok(Ok(())) => {
-            tracing::info!("config saved to {}", path.display());
-            Some(path.display().to_string())
-        }
-        Ok(Err(e)) => {
-            tracing::error!("failed to save config to {}: {}", path.display(), e);
-            None
-        }
-        Err(e) => {
-            tracing::error!("config save task panicked: {}", e);
-            None
-        }
-    }
 }
 
 #[cfg(test)]
@@ -609,6 +633,7 @@ mod tests {
                 dns_log_ignore: Some(log_ignore.clone()),
                 web_dir: Some(Some(web_dir.clone())),
                 log_retention_days: Some(14),
+                log_max_mb: Some(64),
                 blocklist_enabled: Some(false),
                 blocklist_client_bypass: Some(vec![
                     "::ffff:192.0.2.10".to_string(),
@@ -630,6 +655,7 @@ mod tests {
         assert_eq!(cfg.dns.min_ttl, 120);
         assert_eq!(cfg.dns.max_ttl, 240);
         assert_eq!(cfg.storage.log_retention_days, 14);
+        assert_eq!(cfg.storage.log_max_mb, 64);
         assert_eq!(cfg.web_dir.as_ref(), Some(&web_dir));
         assert!(!cfg.blocklist.enabled);
         assert_eq!(
@@ -653,6 +679,7 @@ mod tests {
         let saved: Config = toml::from_str(&std::fs::read_to_string(&config_path).unwrap())
             .expect("persisted config should parse");
         assert_eq!(saved.api.api_key.as_deref(), Some("new-key"));
+        assert_eq!(saved.storage.log_max_mb, 64);
         assert_eq!(saved.dns.log_ignore, log_ignore);
         assert_eq!(saved.web_dir.as_ref(), Some(&web_dir));
         assert!(!saved.blocklist.enabled);

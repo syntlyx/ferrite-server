@@ -41,6 +41,11 @@ pub struct Config {
     pub zones: Vec<ZoneConfig>,
     #[serde(default)]
     pub custom_records: Vec<CustomRecordConfig>,
+    /// Manual client name aliases (IP or MAC → friendly name). Configuration,
+    /// not a record: what the operator decided to call a device, as opposed to
+    /// the hostnames ferrite learns from PTR/mDNS, which stay in the database.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client_aliases: Vec<ClientAliasConfig>,
     /// Selective per-domain routing through tunnels/proxies (egresses).
     #[serde(default)]
     pub proxy: ProxyConfig,
@@ -89,6 +94,18 @@ pub struct CustomRecordConfig {
 
 fn default_custom_ttl() -> u32 {
     300
+}
+
+/// A manual client name alias: exactly one of `ip`/`mac`, plus the display name.
+/// Mirrors the `POST /api/clients/aliases` payload so the file and the API
+/// describe an alias the same way.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ClientAliasConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
+    pub name: String,
 }
 
 /// One minute — the same window the proxy's synthetic routing answers use, so
@@ -201,7 +218,10 @@ pub enum UpstreamConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct StorageConfig {
-    /// SQLite database path.
+    /// Which store holds the query log, its rollups and the device inventory.
+    #[serde(default)]
+    pub backend: StorageBackend,
+    /// SQLite database path. Unused by the `memory` backend.
     pub path: PathBuf,
     /// Automatically delete query log entries older than this many days.
     /// 0 keeps them forever. Applied once at startup and then every 24 hours.
@@ -212,6 +232,19 @@ pub struct StorageConfig {
     /// is longer than anyone looks back for, and set it to 0 to keep the lot.
     #[serde(skip_serializing_if = "is_retention_disabled")]
     pub log_retention_days: u32,
+    /// Cap the query log at this many megabytes, oldest entries first.
+    /// 0 (the default) means no size limit — `log_retention_days` alone decides.
+    ///
+    /// Age is the right knob on a disk, where a month of history costs nothing
+    /// you notice. Size is the right knob when the database is somewhere that
+    /// can't absorb a surprise: a RAM-backed path, or a flash card with little
+    /// free space. Checked every minute, not daily, because the point is to
+    /// stop growth before it matters.
+    ///
+    /// Enforced on the durable part of the database. The write-ahead log sits
+    /// beside it and is checkpointed back, so allow it a few MB of headroom.
+    #[serde(skip_serializing_if = "is_retention_disabled")]
+    pub log_max_mb: u32,
     /// Record one row per DNS query — the query log behind the Queries page.
     /// `false` answers queries without keeping any per-query history: nothing
     /// reaches the `queries` table and the recent-queries view stays empty.
@@ -225,6 +258,23 @@ pub struct StorageConfig {
     pub keep_stats: bool,
 }
 
+/// Where the query log lives.
+///
+/// Configuration is never affected by this — it is in `config.toml` either way.
+/// This only decides what happens to what ferrite *observed*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageBackend {
+    /// SQLite on disk. Survives restarts; costs writes on whatever the
+    /// database sits on.
+    #[default]
+    Sqlite,
+    /// In RAM only. No database file, no write-ahead log, nothing written to
+    /// disk — and nothing kept across a restart. For boxes whose flash you
+    /// don't want to spend, or a read-only root.
+    Memory,
+}
+
 /// How long the query log is kept when the config does not say. See
 /// [`StorageConfig::log_retention_days`] for why it is not "forever".
 pub const DEFAULT_LOG_RETENTION_DAYS: u32 = 30;
@@ -232,6 +282,10 @@ pub const DEFAULT_LOG_RETENTION_DAYS: u32 = 30;
 fn is_retention_disabled(d: &u32) -> bool {
     *d == 0
 }
+
+/// Bytes in a configured megabyte. Decimal, matching how the setting reads in
+/// the UI and how `database_bytes` is reported elsewhere.
+pub const BYTES_PER_MB: u64 = 1_000_000;
 
 impl StorageConfig {
     /// The recording surfaces these settings leave enabled.
@@ -608,7 +662,9 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             path: data_dir().join("ferrite.db"),
+            backend: StorageBackend::Sqlite,
             log_retention_days: DEFAULT_LOG_RETENTION_DAYS,
+            log_max_mb: 0,
             log_queries: true,
             keep_stats: true,
         }
@@ -678,6 +734,7 @@ impl Default for Config {
             allowlist: AllowlistConfig::default(),
             zones: vec![],
             custom_records: vec![],
+            client_aliases: vec![],
             proxy: ProxyConfig::default(),
             debug_logging: false,
             web_dir: None,

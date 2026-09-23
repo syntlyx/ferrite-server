@@ -109,9 +109,45 @@ port    = 53
 
 
 # ── Storage ───────────────────────────────────────────────────────────────────
+#
+# The database holds only what ferrite *observed*: the query log, its rollups,
+# and the device inventory learned from PTR/mDNS and the neighbour tables.
+# Everything you author — settings, subscriptions, manual block/allow entries,
+# custom records, client aliases, tunnels — lives in this file and only here.
+# So back up this file and you have backed up the configuration; delete the
+# database and you lose history, never setup.
+#
+# Changes you make in the web UI are written straight back here. The file is
+# regenerated on each save, so hand-written comments in the sections the UI
+# manages will not survive; the values will.
 
 [storage]
-# Default: ~/.local/share/ferrite/ferrite.db
+# Where the query log, its rollups and the learned device inventory live.
+#
+#   "sqlite" (default) — a database file; history survives a restart.
+#   "memory"           — RAM only. No database file, no write-ahead log, and no
+#                        disk write per query; history is lost on restart.
+#                        (The compiled blocklist cache still lives in the data
+#                        directory — it is built from downloaded lists, not from
+#                        your traffic, and is written on a refresh, not per
+#                        query.)
+#
+# Pick "memory" when the box boots off something you'd rather not spend writes
+# on (an SD card), or when the root filesystem is read-only, or simply when you
+# don't want what was resolved to land on a disk at all. The Queries page, the
+# dashboard and the per-device stats all keep working either way — the
+# in-memory store keeps the same rollups, it just forgets them on restart.
+#
+# Bounded by construction: the in-memory log is a ring that drops the oldest
+# entry rather than growing. `log_max_mb` below sizes it; left at 0 it holds
+# about 128k entries (~32 MB).
+#
+# Changing this needs a restart. Your configuration is in this file either way
+# and is never affected.
+# backend = "sqlite"
+
+# Where the database file lives. Default: ~/.local/share/ferrite/ferrite.db
+# (unused by the "memory" backend).
 # path = "/var/lib/ferrite/ferrite.db"
 
 # Automatically delete query log entries older than this many days.
@@ -120,6 +156,24 @@ port    = 53
 # anyone looks back for. Set it to 0 to keep every entry forever — ferrite then
 # warns once at startup if the database has grown large.
 # log_retention_days = 30
+
+# Cap the query log at this many megabytes, oldest entries first.
+# Default: 0 (no size limit — the day count above decides on its own).
+#
+# Days are the right knob on a disk. Bytes are the right knob when the database
+# sits somewhere that cannot absorb a surprise: a RAM-backed path, or a flash
+# card with little room left. Set both and whichever trims first wins.
+#
+# Checked every 60 seconds rather than daily — a size cap exists to stop growth
+# before it matters. Only the query log and its rollups are trimmed; the learned
+# device inventory is tiny and is left alone.
+#
+# The first time a cap is switched on, an existing database is rebuilt once so
+# it can release space back to the filesystem (SQLite otherwise keeps freed
+# pages). That takes a moment and is logged; databases created from here on are
+# already set up for it. Allow a few MB of headroom for the write-ahead log,
+# which sits beside the database and is not counted in this figure.
+# log_max_mb = 0
 
 # Privacy switches — both default to true, both apply without a restart.
 #
@@ -256,3 +310,22 @@ domains = [
 # type   = "A"
 # value  = "192.168.1.100"
 # ttl    = 300
+
+
+# ── Client aliases ────────────────────────────────────────────────────────────
+# What you decided to call a device, overriding the hostname ferrite learns for
+# it. Give exactly one of `mac` or `ip`: a MAC follows the device across DHCP
+# leases and address rotation, so prefer it when you know it.
+#
+# These are configuration, not a record — they are kept even with both privacy
+# switches off, and they are unaffected by clearing the query log. The names
+# ferrite *learns* (PTR/mDNS) are the record, and those live in the database.
+# Also manageable at runtime via POST /api/clients/aliases.
+
+# [[client_aliases]]
+# mac  = "aa:bb:cc:dd:ee:ff"
+# name = "Kitchen TV"
+
+# [[client_aliases]]
+# ip   = "192.168.1.5"
+# name = "NAS"

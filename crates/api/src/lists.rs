@@ -142,19 +142,7 @@ async fn sync_lists_to_config(state: &AppState) {
         cfg.allowlist.lists = state.inner.blocklist.get_allow_lists();
     }
 
-    let cfg = state.live_config.read().clone();
-    let path = state.config_path.as_ref().clone().or_else(|| {
-        ferrite_core::config::Config::config_candidates()
-            .into_iter()
-            .next()
-    });
-
-    if let Some(path) = path {
-        match cfg.save(&path) {
-            Ok(()) => tracing::info!("blocklist config saved to {}", path.display()),
-            Err(e) => tracing::error!("failed to save blocklist config: {}", e),
-        }
-    }
+    state.persist_config().await;
 }
 
 /// PATCH /api/lists/:name — enable or disable a list without removing it

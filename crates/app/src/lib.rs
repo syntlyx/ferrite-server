@@ -18,7 +18,7 @@ use tokio::sync::{Notify, Semaphore, mpsc};
 
 use ferrite_blocklist::Blocklist;
 use ferrite_clients::ClientRegistry;
-use ferrite_core::config::{Config, CustomRecordConfig};
+use ferrite_core::config::{ClientAliasConfig, Config, CustomRecordConfig, StorageBackend};
 use ferrite_core::error::Result;
 use ferrite_core::recording::RecordSwitches;
 use ferrite_core::types::QueryEntry;
@@ -26,7 +26,7 @@ use ferrite_dns::cache::DnsCache;
 use ferrite_dns::custom::CustomRecords;
 use ferrite_stats::CpuSampler;
 use ferrite_stats::live::LiveStats;
-use ferrite_storage::{SqliteStorage, Storage};
+use ferrite_storage::{LegacyConfigRows, MemoryStorage, SqliteStorage, Storage};
 use ferrite_upstream::{UpstreamPool, ZoneRouter};
 
 /// Capacity of the query channel (DNS handler → stats writer).
@@ -82,6 +82,9 @@ pub struct AppState {
     /// Serializes every writer of [`Self::snapshot_path`]. See
     /// [`AppState::save_snapshot`].
     snapshot_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes every writer of [`Self::config_path`]. See
+    /// [`AppState::persist_config`].
+    config_lock: Arc<tokio::sync::Mutex<()>>,
     /// Active sessions: token → expiry Instant.
     pub sessions: Arc<DashMap<String, Instant>>,
     /// Signals the stats writer to flush its current batch immediately (used on shutdown).
@@ -121,6 +124,47 @@ impl AppState {
             .map_err(|e| {
                 ferrite_core::error::FeriteError::Internal(format!("snapshot task failed: {e}"))
             })?
+    }
+
+    /// Write `live_config` to the config file, serialized against every other
+    /// writer of it.
+    ///
+    /// The config file is now the only copy of everything an operator authored
+    /// — settings, subscriptions, manual block/allow entries, custom records,
+    /// client aliases, tunnels — so every API handler that changes any of it
+    /// ends here. The lock is what makes concurrent edits safe: `Config::save`
+    /// writes `config.toml.tmp` and renames it over the target, and two of
+    /// those interleaving would race on the same temp path.
+    ///
+    /// Returns the path written, or `None` if there was nowhere to write or the
+    /// write failed — callers report that as "applied, but not persisted"
+    /// rather than failing the request, because the change is already live.
+    pub async fn persist_config(&self) -> Option<String> {
+        let _guard = self.config_lock.lock().await;
+        let cfg = self.live_config.read().clone();
+        let path = self.config_path.as_ref().clone().or_else(|| {
+            ferrite_core::config::Config::config_candidates()
+                .into_iter()
+                .next()
+        })?;
+
+        let path_clone = path.clone();
+        // spawn_blocking: save() ends in std::fs::write + rename, blocking
+        // syscalls that would stall a runtime worker on slow storage.
+        match tokio::task::spawn_blocking(move || cfg.save(&path_clone)).await {
+            Ok(Ok(())) => {
+                tracing::info!("config saved to {}", path.display());
+                Some(path.display().to_string())
+            }
+            Ok(Err(e)) => {
+                tracing::error!("failed to save config to {}: {}", path.display(), e);
+                None
+            }
+            Err(e) => {
+                tracing::error!("config save task panicked: {}", e);
+                None
+            }
+        }
     }
 
     /// The slice of state the stats writer consumes (everything but the
@@ -182,8 +226,44 @@ impl AppState {
 
     /// Construct the full application state from configuration.
     pub async fn init(config: &Config, persistent_config: Config) -> Result<Self> {
-        // Storage
-        let storage: Arc<dyn Storage> = SqliteStorage::open(&config.storage.path).await?;
+        let max_bytes = config.storage.log_max_mb as u64 * ferrite_core::config::BYTES_PER_MB;
+
+        // Storage. `memory` writes nothing to disk, so it does not create the
+        // database file — but if one is already there it may still hold
+        // authored state from before that moved to `config.toml`, and losing
+        // that silently because of a backend switch would be its own bug. So
+        // the hand-off below runs against whichever store can answer for it.
+        let storage: Arc<dyn Storage> = match config.storage.backend {
+            StorageBackend::Sqlite => SqliteStorage::open(&config.storage.path).await?,
+            StorageBackend::Memory => MemoryStorage::open(max_bytes),
+        };
+        let legacy_source: Arc<dyn Storage> = match config.storage.backend {
+            StorageBackend::Sqlite => Arc::clone(&storage),
+            StorageBackend::Memory if config.storage.path.exists() => {
+                tracing::info!(
+                    "memory backend, but {} exists — checking it for configuration to migrate",
+                    config.storage.path.display()
+                );
+                SqliteStorage::open(&config.storage.path).await?
+            }
+            StorageBackend::Memory => Arc::clone(&storage),
+        };
+
+        // Determine where config changes are saved.
+        let config_path = Config::config_candidates().into_iter().find(|p| p.exists());
+
+        // Authored state used to live in the database next to the query log.
+        // Fold anything a pre-v9 database still holds into the config and hand
+        // the file back, so everything below seeds from one source.
+        let (config, persistent_config) = migrate_legacy_config(
+            &legacy_source,
+            config.clone(),
+            persistent_config,
+            config_path.as_deref(),
+        )
+        .await;
+        let config = &config;
+        drop(legacy_source);
 
         let data_dir = ferrite_core::config::data_dir();
 
@@ -206,31 +286,6 @@ impl AppState {
         // profile's default-deny, like *.arpa and the built-in local suffixes.
         let zone_names: Vec<String> = config.zones.iter().map(|z| z.name.clone()).collect();
         blocklist.set_local_zones(&zone_names);
-
-        // Load persisted whitelist/blacklist from storage.
-        match storage.load_custom_entries().await {
-            Ok(entries) => {
-                for (domain, entry_type) in entries {
-                    match entry_type.as_str() {
-                        "whitelist" => {
-                            if let Err(e) = blocklist.add_whitelist(&domain) {
-                                tracing::warn!("invalid whitelist entry '{}': {}", domain, e);
-                            }
-                        }
-                        "blacklist" => {
-                            if let Err(e) = blocklist.add_blacklist(&domain) {
-                                tracing::warn!("invalid blacklist entry '{}': {}", domain, e);
-                            }
-                        }
-                        other => {
-                            tracing::warn!("unknown custom entry type '{}' for '{}'", other, domain)
-                        }
-                    }
-                }
-                tracing::info!("custom whitelist/blacklist loaded from storage");
-            }
-            Err(e) => tracing::warn!("failed to load custom entries: {}", e),
-        }
 
         // Live stats
         let live_stats = LiveStats::new();
@@ -357,20 +412,9 @@ impl AppState {
         let default_pool = UpstreamPool::from_config(&config.upstream, Arc::clone(&proxy_handle))?;
         let upstream_pool = ZoneRouter::new(&config.zones, default_pool)?;
 
-        // Custom DNS records — load from config, then append from DB.
+        // Custom DNS records — the config file is the only source.
         let custom_records = CustomRecords::new();
         custom_records.load_from_config(&config.custom_records);
-        match storage.load_custom_records().await {
-            Ok(db_records) => {
-                for cfg in &db_records {
-                    if let Err(e) = custom_records.add(cfg) {
-                        tracing::warn!("invalid custom record in DB '{}': {}", cfg.domain, e);
-                    }
-                }
-                tracing::info!("loaded {} custom DNS records from DB", db_records.len());
-            }
-            Err(e) => tracing::warn!("failed to load custom DNS records: {}", e),
-        }
         let builtin_records = builtin_panel_records(config);
         if let Some(record) = builtin_records.first() {
             custom_records.load_builtin(&builtin_records);
@@ -409,6 +453,7 @@ impl AppState {
             Arc::clone(&upstream_pool),
             Arc::clone(&storage),
             Arc::clone(&record_switches),
+            &config.client_aliases,
         )
         .await;
 
@@ -448,9 +493,6 @@ impl AppState {
             query_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
         });
 
-        // Determine where to save config changes.
-        let config_path = Config::config_candidates().into_iter().find(|p| p.exists());
-
         Ok(Self {
             inner,
             query_tx,
@@ -459,6 +501,7 @@ impl AppState {
             config_path: Arc::new(config_path),
             snapshot_path: Arc::new(snapshot_path),
             snapshot_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions: Arc::new(DashMap::new()),
             flush_notify: Arc::new(Notify::new()),
             flush_done: Arc::new(Notify::new()),
@@ -468,6 +511,136 @@ impl AppState {
                 ferrite_updater::UpdateCheckCache::new(),
             )),
         })
+    }
+}
+
+/// Fold authored state out of a pre-v9 database into the config file, once.
+///
+/// Manual block/allow entries, custom DNS records and client aliases used to be
+/// written to SQLite while the rest of the configuration went to `config.toml`.
+/// That split meant the database held state no backup of the config file
+/// carried, and an entry written in the file could not be deleted through the
+/// UI (the delete cleared a database row that was never there, and the file
+/// re-seeded it on the next boot). The file is now the only copy.
+///
+/// The tables are dropped only after the config has been written, so a failed
+/// write leaves them for the next boot to retry. Returns the two configs with
+/// the recovered entries merged in either way, so this run behaves correctly
+/// even if the file could not be updated.
+async fn migrate_legacy_config(
+    storage: &Arc<dyn Storage>,
+    mut config: Config,
+    mut persistent_config: Config,
+    config_path: Option<&std::path::Path>,
+) -> (Config, Config) {
+    let rows = match storage.load_legacy_config_rows().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("could not read legacy configuration rows: {}", e);
+            return (config, persistent_config);
+        }
+    };
+
+    if rows.is_empty() {
+        // Nothing to carry over: either this has already run, or the database
+        // was created after the tables were removed. Dropping is idempotent and
+        // clears the two tables that never had a reader at all.
+        if let Err(e) = storage.drop_legacy_config_tables().await {
+            tracing::warn!("could not drop legacy configuration tables: {}", e);
+        }
+        return (config, persistent_config);
+    }
+
+    tracing::info!(
+        "migrating {} block/allow entr{}, {} custom record(s) and {} client alias(es) \
+         from the database into the config file",
+        rows.custom_entries.len(),
+        if rows.custom_entries.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        rows.custom_records.len(),
+        rows.client_aliases.len(),
+    );
+
+    fold_legacy_rows(&mut config, &rows);
+    fold_legacy_rows(&mut persistent_config, &rows);
+
+    let Some(path) = config_path
+        .map(|p| p.to_path_buf())
+        .or_else(|| Config::config_candidates().into_iter().next())
+    else {
+        tracing::warn!("nowhere to write the config file — keeping the legacy tables for now");
+        return (config, persistent_config);
+    };
+
+    let to_save = persistent_config.clone();
+    let save_path = path.clone();
+    let saved = tokio::task::spawn_blocking(move || to_save.save(&save_path)).await;
+    match saved {
+        Ok(Ok(())) => {
+            tracing::info!("legacy configuration written to {}", path.display());
+            if let Err(e) = storage.drop_legacy_config_tables().await {
+                tracing::warn!("could not drop legacy configuration tables: {}", e);
+            }
+        }
+        Ok(Err(e)) => tracing::error!(
+            "failed to write recovered configuration to {} ({}) — keeping the legacy tables, \
+             will retry on the next start",
+            path.display(),
+            e
+        ),
+        Err(e) => tracing::error!("config save task panicked during legacy migration: {}", e),
+    }
+
+    (config, persistent_config)
+}
+
+/// Merge recovered rows into `cfg`, skipping anything the file already says.
+/// The file wins on a conflict: it is what the operator can see and edit.
+fn fold_legacy_rows(cfg: &mut Config, rows: &LegacyConfigRows) {
+    for (domain, entry_type) in &rows.custom_entries {
+        let target = match entry_type.as_str() {
+            "blacklist" => &mut cfg.blocklist.domains,
+            "whitelist" => &mut cfg.allowlist.domains,
+            other => {
+                tracing::warn!("unknown custom entry type '{}' for '{}'", other, domain);
+                continue;
+            }
+        };
+        if !target.iter().any(|d| d == domain) {
+            target.push(domain.clone());
+        }
+    }
+
+    for record in &rows.custom_records {
+        let dup = cfg
+            .custom_records
+            .iter()
+            .any(|r| r.domain == record.domain && r.record_type == record.record_type);
+        if !dup {
+            cfg.custom_records.push(record.clone());
+        }
+    }
+
+    for (key, key_type, name) in &rows.client_aliases {
+        let (ip, mac) = if key_type == "mac" {
+            (None, Some(key.clone()))
+        } else {
+            (Some(key.clone()), None)
+        };
+        let dup = cfg
+            .client_aliases
+            .iter()
+            .any(|a| a.ip == ip && a.mac == mac);
+        if !dup {
+            cfg.client_aliases.push(ClientAliasConfig {
+                ip,
+                mac,
+                name: name.clone(),
+            });
+        }
     }
 }
 
@@ -704,6 +877,103 @@ mod tests {
 
         drop(state);
         crate::test_support::cleanup_sqlite(&db_path);
+    }
+
+    /// The whole point of the move: a box upgrading from a build that kept
+    /// authored state in SQLite must end up with that state in `config.toml`,
+    /// and the tables must be gone so it can never be read from two places.
+    #[tokio::test]
+    async fn legacy_database_configuration_lands_in_the_config_file() {
+        let db_path = crate::test_support::temp_path("app-legacy-config", "db");
+        let cfg_path = crate::test_support::temp_path("app-legacy-config", "toml");
+
+        let storage = SqliteStorage::open(&db_path).await.unwrap();
+        storage
+            .seed_legacy_config_tables(&LegacyConfigRows {
+                custom_entries: vec![
+                    ("ads.test".to_string(), "blacklist".to_string()),
+                    ("safe.test".to_string(), "whitelist".to_string()),
+                ],
+                custom_records: vec![CustomRecordConfig {
+                    domain: "router.lan".to_string(),
+                    record_type: "A".to_string(),
+                    value: "192.168.1.1".to_string(),
+                    ttl: 60,
+                }],
+                client_aliases: vec![(
+                    "aa:bb:cc:dd:ee:ff".to_string(),
+                    "mac".to_string(),
+                    "Phone".to_string(),
+                )],
+            })
+            .await
+            .unwrap();
+
+        let storage: Arc<dyn Storage> = storage;
+        let base = Config::default();
+        let (runtime, persistent) =
+            migrate_legacy_config(&storage, base.clone(), base, Some(cfg_path.as_path())).await;
+
+        // Both configs carry the recovered entries: the runtime one so this
+        // boot behaves, the persistent one because it is what was written.
+        for cfg in [&runtime, &persistent] {
+            assert_eq!(cfg.blocklist.domains, vec!["ads.test".to_string()]);
+            assert_eq!(cfg.allowlist.domains, vec!["safe.test".to_string()]);
+            assert_eq!(cfg.custom_records.len(), 1);
+            assert_eq!(cfg.custom_records[0].domain, "router.lan");
+            assert_eq!(cfg.client_aliases.len(), 1);
+            assert_eq!(
+                cfg.client_aliases[0].mac.as_deref(),
+                Some("aa:bb:cc:dd:ee:ff")
+            );
+            assert_eq!(cfg.client_aliases[0].name, "Phone");
+        }
+
+        // It really reached disk, in a shape that loads back.
+        let written = std::fs::read_to_string(&cfg_path).unwrap();
+        let reloaded: Config = toml::from_str(&written).unwrap();
+        assert_eq!(reloaded.blocklist.domains, vec!["ads.test".to_string()]);
+        assert_eq!(reloaded.client_aliases[0].name, "Phone");
+
+        // And the tables are gone, so a second boot finds nothing to migrate
+        // and cannot resurrect a deleted entry from a stale row.
+        assert!(storage.load_legacy_config_rows().await.unwrap().is_empty());
+
+        drop(storage);
+        crate::test_support::cleanup_sqlite(&db_path);
+        let _ = std::fs::remove_file(&cfg_path);
+    }
+
+    /// The file wins on a conflict, and nothing is duplicated.
+    #[test]
+    fn folding_legacy_rows_skips_what_the_file_already_says() {
+        let mut cfg = Config::default();
+        cfg.blocklist.domains = vec!["ads.test".to_string()];
+        cfg.client_aliases = vec![ClientAliasConfig {
+            ip: None,
+            mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
+            name: "Renamed in the file".to_string(),
+        }];
+
+        fold_legacy_rows(
+            &mut cfg,
+            &LegacyConfigRows {
+                custom_entries: vec![
+                    ("ads.test".to_string(), "blacklist".to_string()),
+                    ("new.test".to_string(), "blacklist".to_string()),
+                ],
+                custom_records: vec![],
+                client_aliases: vec![(
+                    "aa:bb:cc:dd:ee:ff".to_string(),
+                    "mac".to_string(),
+                    "Phone".to_string(),
+                )],
+            },
+        );
+
+        assert_eq!(cfg.blocklist.domains, vec!["ads.test", "new.test"]);
+        assert_eq!(cfg.client_aliases.len(), 1);
+        assert_eq!(cfg.client_aliases[0].name, "Renamed in the file");
     }
 
     fn query_entry(ts: i64, domain: &str, client_ip: &str, status: QueryStatus) -> QueryEntry {

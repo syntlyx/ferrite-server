@@ -373,11 +373,18 @@ GET    /api/update/check   POST /api/update/server|web
 
 ## Data files
 
+Configuration lives in `config.toml` and only there — settings, subscriptions,
+manual block/allow entries, custom records, client aliases, tunnels. Everything
+the UI changes is written straight back to it, so backing up that one file backs
+up the whole setup. The database holds only what ferrite observed (the query log
+and the device inventory): delete it and you lose history, never configuration.
+
 All under `~/.local/share/ferrite/`:
 
 | File                  | Contents                                                       |
 | --------------------- | -------------------------------------------------------------- |
-| `ferrite.db`          | SQLite — query log, stats, whitelist/blacklist, custom records |
+| `ferrite.db`          | SQLite — query log, rollups, learned device inventory          |
+|                       | (absent entirely with `storage.backend = "memory"`)            |
 | `blocklist.fst`       | Compiled blocklist (rebuilt on list changes)                   |
 | `allowlist.fst`       | Compiled subscribed allowlists                                 |
 | `lists/<name>.*`      | Per-blocklist parsed-domain cache                              |

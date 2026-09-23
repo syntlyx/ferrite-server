@@ -1,8 +1,27 @@
 /// SQL schema applied on first startup (or after a migration).
+///
+/// Everything here is data ferrite *observed*: the query log, its rollups, and
+/// the device inventory learned from PTR/mDNS and the neighbour tables. What an
+/// operator *authored* — settings, subscriptions, manual block/allow entries,
+/// custom DNS records, client aliases — lives in `config.toml` and only there,
+/// so backing up one file backs up the configuration and the database stays
+/// disposable. Five tables here used to hold authored state; they are handed
+/// over to the config file once and then dropped — see
+/// `Storage::load_legacy_config_rows` / `drop_legacy_config_tables`.
 pub const SCHEMA: &str = r#"
+-- Must come before the first table: on an existing database this is a no-op,
+-- and switching it on later costs a full VACUUM (which `prepare_size_cap`
+-- does, once, only for a database that opts into `storage.log_max_mb`).
+-- Without it a delete only moves pages to the freelist and the file never
+-- shrinks, so a size cap could not be met.
+PRAGMA auto_vacuum=INCREMENTAL;
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 PRAGMA foreign_keys=ON;
+-- Truncate the write-ahead log back down after each checkpoint instead of
+-- leaving it at its high-water mark. It sits next to the database and is not
+-- counted in its size, which matters most when the pair lives in RAM.
+PRAGMA journal_size_limit=8388608;
 
 -- ---------------------------------------------------------------
 -- DNS query log
@@ -64,86 +83,9 @@ CREATE TABLE IF NOT EXISTS domain_buckets_10m (
     PRIMARY KEY (bucket, domain)
 );
 
-CREATE TABLE IF NOT EXISTS client_buckets_10m (
-    bucket     INTEGER NOT NULL,
-    client_ip  TEXT    NOT NULL,
-    total      INTEGER NOT NULL DEFAULT 0,
-    blocked    INTEGER NOT NULL DEFAULT 0,
-    last_seen  INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (bucket, client_ip)
-);
-CREATE INDEX IF NOT EXISTS idx_client_buckets_client_bucket
-    ON client_buckets_10m (client_ip, bucket);
-
--- ---------------------------------------------------------------
--- Per-client aggregated statistics (refreshed periodically)
--- ---------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS client_stats (
-    client_ip   TEXT    PRIMARY KEY,
-    total       INTEGER NOT NULL DEFAULT 0,
-    blocked     INTEGER NOT NULL DEFAULT 0,
-    last_seen   INTEGER NOT NULL DEFAULT 0
-);
-
--- ---------------------------------------------------------------
--- Blocklist metadata (which lists are configured)
--- ---------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS blocklists (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT    NOT NULL UNIQUE,
-    url         TEXT    NOT NULL,
-    enabled     INTEGER NOT NULL DEFAULT 1,
-    last_update INTEGER,            -- Unix epoch of last successful fetch
-    domain_count INTEGER NOT NULL DEFAULT 0
-);
-
--- ---------------------------------------------------------------
--- Custom per-user whitelist / blacklist entries
--- ---------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS custom_entries (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    domain      TEXT    NOT NULL UNIQUE,
-    entry_type  TEXT    NOT NULL,   -- 'whitelist' | 'blacklist'
-    comment     TEXT,
-    created_at  INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_custom_domain ON custom_entries (domain);
-CREATE INDEX IF NOT EXISTS idx_custom_type   ON custom_entries (entry_type);
-
--- ---------------------------------------------------------------
--- Custom DNS records (managed at runtime via API)
--- ---------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS custom_dns_records (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    domain      TEXT    NOT NULL,
-    record_type TEXT    NOT NULL,   -- 'A' | 'AAAA' | 'CNAME'
-    value       TEXT    NOT NULL,
-    ttl         INTEGER NOT NULL DEFAULT 300,
-    created_at  INTEGER NOT NULL
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_custom_dns_domain_type
-    ON custom_dns_records (domain, record_type);
-
--- ---------------------------------------------------------------
--- Key-value settings store
--- ---------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS settings (
-    key     TEXT    PRIMARY KEY,
-    value   TEXT    NOT NULL,
-    updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-);
-
--- ---------------------------------------------------------------
--- Manual client name aliases  (key + key_type → friendly name)
--- ---------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS client_aliases (
-    key         TEXT    NOT NULL,
-    key_type    TEXT    NOT NULL DEFAULT 'ip',  -- 'ip' | 'mac'
-    name        TEXT    NOT NULL,
-    created_at  INTEGER NOT NULL,
-    PRIMARY KEY (key, key_type)
-);
+-- Per-device rollups (`device_buckets_10m`) are created by migration v4 rather
+-- than here — they replaced an IP-keyed table, and the migration is what moves
+-- an existing database across.
 
 -- ---------------------------------------------------------------
 -- Learned device identities (one row per physical device, keyed by MAC).

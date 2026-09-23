@@ -78,7 +78,7 @@ pub async fn put_profiles(
             })?;
     }
     state.live_config.write().blocklist.profiles = profiles;
-    let saved_to = persist(&state).await;
+    let saved_to = state.persist_config().await;
 
     Ok(Json(json!({
         "status": "ok",
@@ -145,30 +145,6 @@ fn slugify(s: &str) -> String {
         }
     }
     out.trim_matches('-').to_string()
-}
-
-async fn persist(state: &AppState) -> Option<String> {
-    let cfg = state.live_config.read().clone();
-    let path = state.config_path.as_ref().clone().or_else(|| {
-        ferrite_core::config::Config::config_candidates()
-            .into_iter()
-            .next()
-    })?;
-    let path_clone = path.clone();
-    match tokio::task::spawn_blocking(move || cfg.save(&path_clone)).await {
-        Ok(Ok(())) => {
-            tracing::info!("blocklist profiles saved to {}", path.display());
-            Some(path.display().to_string())
-        }
-        Ok(Err(e)) => {
-            tracing::error!("failed to save blocklist profiles: {}", e);
-            None
-        }
-        Err(e) => {
-            tracing::error!("config save task panicked: {}", e);
-            None
-        }
-    }
 }
 
 fn bad(msg: &str) -> ApiError {
