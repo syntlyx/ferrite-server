@@ -178,10 +178,17 @@ decision_cache_size = 50000
 # [allowlist] section below. Old configs still load — entries are migrated
 # automatically and rewritten in the new shape on the next config save.
 
-# Extra wildcard patterns to always block.
-# Also manageable at runtime via POST /api/blocklist/blacklist.
-wildcard_block = [
+# Manual block entries — exact domains and wildcards alike. An exact domain
+# also blocks its subdomains; wildcards like "*.doubleclick.net" match all
+# subdomains (not the apex itself). Mirrors [allowlist] domains below.
+# This is where the UI writes; also manageable via POST /api/blocklist/blacklist.
+#
+# NOTE: `wildcard_block` was the old name and held wildcards only. Old configs
+# still load — entries are migrated into `domains` automatically and rewritten
+# in the new shape on the next config save.
+domains = [
     # "*.doubleclick.net",
+    # "ads.example.com",
 ]
 
 # Remote blocklist subscriptions (hosts or Adblock format, auto-detected).

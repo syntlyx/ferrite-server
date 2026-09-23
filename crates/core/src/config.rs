@@ -277,6 +277,15 @@ pub struct BlocklistConfig {
     #[serde(default = "default_blocklist_decision_cache_size")]
     pub decision_cache_size: usize,
     pub lists: Vec<ListConfig>,
+    /// Manual block entries — exact domains and `*.wildcard` patterns alike,
+    /// mirroring `[allowlist] domains`. This is where the UI and
+    /// `POST /api/blocklist/blacklist` write; the file is the only copy.
+    #[serde(default)]
+    pub domains: Vec<String>,
+    /// DEPRECATED: superseded by `domains`, which holds exact entries too.
+    /// Still accepted on load — `Config::normalize` migrates entries into
+    /// `domains` — and no longer serialized, so the next save uses the new shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wildcard_block: Vec<String>,
     /// DEPRECATED: superseded by `[allowlist] domains`. Still accepted on load —
     /// `Config::normalize` migrates entries into `allowlist.domains` — and no
@@ -637,6 +646,7 @@ impl Default for BlocklistConfig {
                 name: "StevenBlack".to_string(),
                 enabled: true,
             }],
+            domains: vec![],
             wildcard_block: vec![],
             whitelist: vec![],
             client_bypass: vec![],
@@ -710,7 +720,32 @@ impl Config {
         self.panel.normalize();
         self.blocklist.normalize();
         self.migrate_whitelist();
+        self.migrate_wildcard_block();
         self.proxy.normalize();
+    }
+
+    /// Move deprecated `blocklist.wildcard_block` entries into
+    /// `blocklist.domains`. Same contract as [`Self::migrate_whitelist`]: an old
+    /// config keeps working and is rewritten in the new shape on its next save.
+    fn migrate_wildcard_block(&mut self) {
+        if self.blocklist.wildcard_block.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            "blocklist.wildcard_block is deprecated — moving {} entr{} to [blocklist] domains",
+            self.blocklist.wildcard_block.len(),
+            if self.blocklist.wildcard_block.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            }
+        );
+        let existing: HashSet<String> = self.blocklist.domains.iter().cloned().collect();
+        for entry in std::mem::take(&mut self.blocklist.wildcard_block) {
+            if !existing.contains(&entry) {
+                self.blocklist.domains.push(entry);
+            }
+        }
     }
 
     /// Move deprecated `blocklist.whitelist` entries into `allowlist.domains`.

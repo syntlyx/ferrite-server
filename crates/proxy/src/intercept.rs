@@ -521,6 +521,7 @@ mod blocking_tests {
                 enabled: true,
                 decision_cache_size: 128,
                 lists: vec![],
+                domains: vec![],
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass,

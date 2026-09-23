@@ -231,7 +231,7 @@ rules are the allow entries. Manage everything live in the UI.
 ```toml
 [blocklist]
 enabled = true
-wildcard_block  = ["*.doubleclick.net"]
+domains = ["*.doubleclick.net", "ads.example.com"]   # always blocked (manual entries)
 client_bypass   = ["192.168.1.50", "aa:bb:cc:dd:ee:ff"]   # these clients skip filtering
 
 [[blocklist.lists]]

@@ -843,7 +843,7 @@ Returns the full parsed config. Non-empty `api_key` and `password_hash` values a
     "enabled": true,
     "decision_cache_size": 50000,
     "lists": [],
-    "wildcard_block": [],
+    "domains": [],
     "client_bypass": ["192.168.1.50", "aa:bb:cc:dd:ee:ff"],
     "profiles": []
   },

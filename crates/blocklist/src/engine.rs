@@ -103,10 +103,15 @@ fn matched_key(domain: &str, contains: impl Fn(&str) -> bool) -> Option<String> 
     None
 }
 
-/// The hot-swappable core data (FST + wildcards).
+/// The hot-swappable core data: the merged subscription FST.
+///
+/// Manual block patterns are *not* here — they live in `blacklist` /
+/// `blacklist_wildcards`, which the API can also remove from. Config-sourced
+/// entries used to be compiled into a second, parallel wildcard set here, which
+/// meant an entry written in the file could be matched but never listed or
+/// deleted through the UI. One set, one lifecycle.
 struct BlocklistData {
     fst: FstMap,
-    wildcards: Vec<Regex>,
 }
 
 /// Decision-cache size for a per-device profile. Smaller than the global cache
@@ -287,7 +292,26 @@ impl Blocklist {
             })
             .collect();
 
-        let wildcards = compile_wildcards(&config.wildcard_block);
+        // Manual block entries. `config.wildcard_block` is the deprecated
+        // location — `Config::normalize` migrates it into `domains`, but seed
+        // from both so a directly-constructed BlocklistConfig keeps working.
+        let manual_block = || config.domains.iter().chain(config.wildcard_block.iter());
+
+        let blacklist: HashSet<String> = manual_block()
+            .filter(|s| !s.contains('*'))
+            .map(|s| normalise(s))
+            .collect();
+
+        let blacklist_wildcards: Vec<(String, Regex)> = manual_block()
+            .filter(|s| s.contains('*'))
+            .filter_map(|s| {
+                let norm = normalise(s);
+                wildcard_to_regex(&norm)
+                    .map_err(|e| tracing::warn!("skipping invalid wildcard '{}': {}", s, e))
+                    .ok()
+                    .map(|re| (norm, re))
+            })
+            .collect();
 
         let list_cache_dir = fst_path
             .parent()
@@ -306,17 +330,14 @@ impl Blocklist {
             enabled: AtomicBool::new(config.enabled),
             has_client_bypass: AtomicBool::new(!client_bypass.is_empty()),
             has_profiles: AtomicBool::new(!config.profiles.is_empty()),
-            data: ArcSwap::from_pointee(BlocklistData {
-                fst: empty,
-                wildcards,
-            }),
+            data: ArcSwap::from_pointee(BlocklistData { fst: empty }),
             profiles: ArcSwap::from_pointee(Vec::new()),
             profiles_config: RwLock::new(config.profiles),
             client_bypass: ArcSwap::from_pointee(client_bypass),
             whitelist: RwLock::new(whitelist),
             whitelist_wildcards: RwLock::new(whitelist_wildcards),
-            blacklist: RwLock::new(HashSet::new()),
-            blacklist_wildcards: RwLock::new(Vec::new()),
+            blacklist: RwLock::new(blacklist),
+            blacklist_wildcards: RwLock::new(blacklist_wildcards),
             cache: BlocklistCache::new(config.decision_cache_size),
             lists: RwLock::new(config.lists),
             domain_counts: RwLock::new(HashMap::new()),
@@ -348,14 +369,7 @@ impl Blocklist {
         match loader::mmap_fst(&self.fst_path) {
             Ok(fst) => {
                 let count = fst.len();
-                let wildcards: Vec<Regex> = self
-                    .data
-                    .load()
-                    .wildcards
-                    .iter()
-                    .map(|re| Regex::new(re.as_str()).expect("previously compiled"))
-                    .collect();
-                self.data.store(Arc::new(BlocklistData { fst, wildcards }));
+                self.data.store(Arc::new(BlocklistData { fst }));
                 self.merged_on_disk.store(true, Ordering::Relaxed);
                 self.cache.clear();
                 self.restore_list_stats_from_cache();
@@ -526,7 +540,7 @@ impl Blocklist {
             return cached;
         }
         let data = self.data.load();
-        let result = self.check_blocked_in(domain, &data.fst, &data.wildcards);
+        let result = self.check_blocked_in(domain, &data.fst);
         self.cache.insert(domain, result);
         result
     }
@@ -534,7 +548,7 @@ impl Blocklist {
     /// Profile-aware block check for the DNS hot path. With `profile == None`
     /// this is exactly [`Self::is_blocked_normalized`] (the default, all-lists
     /// FST). With a profile it uses that profile's subset FST + private cache;
-    /// the manual blacklist and `wildcard_block` still apply (they're global).
+    /// the manual blacklist still applies (it is global).
     pub fn is_blocked_for_normalized(
         &self,
         domain: &str,
@@ -546,10 +560,9 @@ impl Blocklist {
         if let Some(cached) = profile.cache.get(domain) {
             return cached;
         }
-        // Profiles share the global compiled wildcards (config.wildcard_block);
-        // only the subscription FST differs.
-        let wildcards = self.data.load().wildcards.clone();
-        let result = self.check_blocked_in(domain, &profile.fst, &wildcards);
+        // Only the subscription FST differs; the manual sets are global and
+        // `check_blocked_in` reads them itself.
+        let result = self.check_blocked_in(domain, &profile.fst);
         profile.cache.insert(domain, result);
         result
     }
@@ -578,8 +591,8 @@ impl Blocklist {
     ///      profile names none),
     ///   4. profile `default_deny` → blocked, except local-infrastructure names
     ///      ([`Self::is_local_infra`]) which fall through,
-    ///   5. global blacklist + the profile's (or global) subscription FST +
-    ///      wildcards → blocked,
+    ///   5. global blacklist (exact + wildcard) + the profile's (or global)
+    ///      subscription FST → blocked,
     ///   6. otherwise allowed.
     ///
     /// The FST layer (step 5) is the cached part ([`Self::is_blocked_for_normalized`]);
@@ -644,12 +657,12 @@ impl Blocklist {
         *self.local_zones.write() = zones.iter().map(|z| normalise(z)).collect();
     }
 
-    /// The core block decision against a specific FST + wildcard set. The manual
+    /// The core block decision against a specific subscription FST. The manual
     /// blacklist (exact + wildcard) is always consulted first — it is global and
-    /// overrides every profile — then the given FST/wildcards with the hierarchy
-    /// walk. Shared by the default path and every profile so their semantics
-    /// can't drift.
-    fn check_blocked_in(&self, domain: &str, fst: &FstMap, wildcards: &[Regex]) -> bool {
+    /// overrides every profile — then the given FST with the hierarchy walk.
+    /// Shared by the default path and every profile so their semantics can't
+    /// drift.
+    fn check_blocked_in(&self, domain: &str, fst: &FstMap) -> bool {
         {
             // Manual blacklist: exact match, then walk up the hierarchy so a
             // blacklist entry for `evil.com` also blocks `www.evil.com` —
@@ -677,11 +690,6 @@ impl Blocklist {
 
         if fst.contains_key(domain.as_bytes()) {
             return true;
-        }
-        for re in wildcards {
-            if re.is_match(domain) {
-                return true;
-            }
         }
 
         // Walk up the domain hierarchy: `www.evil.com` → check `evil.com`.
@@ -907,17 +915,6 @@ impl Blocklist {
                 sources.push(BlockSource {
                     kind: "wildcard".into(),
                     name: pat.clone(),
-                    matched: domain.clone(),
-                });
-            }
-        }
-        // Config `wildcard_block` (compiled into the hot-path data; only the
-        // anchored regex survives there, so report that as the pattern).
-        for re in &self.data.load().wildcards {
-            if re.is_match(&domain) {
-                sources.push(BlockSource {
-                    kind: "wildcard".into(),
-                    name: re.as_str().to_string(),
                     matched: domain.clone(),
                 });
             }
@@ -1231,13 +1228,9 @@ impl Blocklist {
         .await?;
         let unique_count = set.unique_count;
 
-        let wildcards = self.data.load().wildcards.clone();
         // Install the new FST and its domain counts together so a reader never
         // sees counts from one refresh paired with the FST of another.
-        self.data.store(Arc::new(BlocklistData {
-            fst: set.fst,
-            wildcards,
-        }));
+        self.data.store(Arc::new(BlocklistData { fst: set.fst }));
         *self.domain_counts.write() = set.counts;
         *self.adblock_stats.write() = set.stats;
         self.merged_on_disk.store(set.persisted, Ordering::Relaxed);
@@ -1808,18 +1801,6 @@ fn empty_fst() -> FstMap {
     loader::ram_fst(bytes).expect("empty FST map")
 }
 
-fn compile_wildcards(patterns: &[String]) -> Vec<Regex> {
-    patterns
-        .iter()
-        .filter_map(|p| {
-            let pattern = normalise(p);
-            wildcard_to_regex(&pattern)
-                .map_err(|e| tracing::warn!("skipping invalid wildcard '{}': {}", p, e))
-                .ok()
-        })
-        .collect()
-}
-
 /// Compile a domain wildcard pattern (`*.example.com`) into an anchored regex.
 /// Exposed to the crate so the proxy routing engine can reuse the exact same
 /// wildcard semantics as the blocklist (`\*` → `.*`, anchored `^…$`).
@@ -1858,6 +1839,7 @@ mod tests {
                 enabled: true,
                 decision_cache_size: 50_000,
                 lists: vec![],
+                domains: vec![],
                 wildcard_block: vec!["*.ads.test".to_string()],
                 whitelist: vec![],
                 client_bypass: vec![],
@@ -1913,6 +1895,7 @@ mod tests {
                     url: "https://example.test/list.txt".to_string(),
                     enabled: true,
                 }],
+                domains: vec![],
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
@@ -1976,6 +1959,7 @@ mod tests {
                         enabled: true,
                     },
                 ],
+                domains: vec![],
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
@@ -2058,6 +2042,7 @@ mod tests {
                 }],
                 // Globally whitelist news.example (allowed for everyone by default).
                 whitelist: vec!["news.example".into()],
+                domains: vec![],
                 wildcard_block: vec![],
                 client_bypass: vec![],
                 profiles: vec![
@@ -2129,6 +2114,7 @@ mod tests {
                     url: "file:///this/path/does/not/exist".to_string(),
                     enabled: true,
                 }],
+                domains: vec![],
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
@@ -2161,6 +2147,7 @@ mod tests {
                 enabled: true,
                 decision_cache_size: 128,
                 lists: vec![],
+                domains: vec![],
                 wildcard_block: vec!["*.Ads.Test.".to_string()],
                 whitelist: vec!["Safe.Test.".to_string(), "*.Trusted.Test.".to_string()],
                 client_bypass: vec![],
@@ -2183,6 +2170,7 @@ mod tests {
                 enabled: true,
                 decision_cache_size: 128,
                 lists: vec![],
+                domains: vec![],
                 wildcard_block: vec!["*.ads.test".to_string()],
                 whitelist: vec!["safe.test".to_string()],
                 client_bypass: vec![],
@@ -2229,6 +2217,7 @@ mod tests {
                 enabled: true,
                 decision_cache_size: 128,
                 lists: vec![],
+                domains: vec![],
                 wildcard_block: vec![],
                 whitelist: vec!["google.com".to_string()],
                 client_bypass: vec![],
@@ -2254,6 +2243,7 @@ mod tests {
                 enabled: true,
                 decision_cache_size: 128,
                 lists: vec![],
+                domains: vec![],
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
@@ -2283,6 +2273,7 @@ mod tests {
                 enabled: true,
                 decision_cache_size: 128,
                 lists: vec![],
+                domains: vec![],
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
@@ -2308,6 +2299,7 @@ mod tests {
                 enabled: true,
                 decision_cache_size: 128,
                 lists: vec![],
+                domains: vec![],
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
@@ -2345,6 +2337,7 @@ mod tests {
                     url: format!("file://{}", block_src.display()),
                     enabled: true,
                 }],
+                domains: vec![],
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
@@ -2402,6 +2395,7 @@ mod tests {
                 enabled: true,
                 decision_cache_size: 1000,
                 lists: vec![],
+                domains: vec![],
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
@@ -2456,6 +2450,7 @@ mod tests {
                 enabled: true,
                 decision_cache_size: 1000,
                 lists: vec![],
+                domains: vec![],
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
@@ -2494,6 +2489,7 @@ mod tests {
                 enabled: true,
                 decision_cache_size: 1000,
                 lists: vec![],
+                domains: vec![],
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
@@ -2522,6 +2518,7 @@ mod tests {
                 enabled: true,
                 decision_cache_size: 128,
                 lists: vec![],
+                domains: vec![],
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
@@ -2564,6 +2561,7 @@ mod tests {
                 enabled: true,
                 decision_cache_size: 1000,
                 lists: vec![],
+                domains: vec![],
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
@@ -2618,6 +2616,7 @@ mod tests {
                 enabled: true,
                 decision_cache_size: 1000,
                 lists: vec![],
+                domains: vec![],
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
@@ -2687,6 +2686,7 @@ mod tests {
                 enabled: true,
                 decision_cache_size: 1000,
                 lists: vec![],
+                domains: vec![],
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
@@ -2769,6 +2769,7 @@ mod tests {
                         enabled: true,
                     },
                 ],
+                domains: vec![],
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
@@ -2843,6 +2844,7 @@ mod tests {
                     list("Track", &track),
                     list("Noisy", &noisy),
                 ],
+                domains: vec![],
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
@@ -2933,6 +2935,7 @@ mod tests {
                 enabled: true,
                 decision_cache_size: 1000,
                 lists,
+                domains: vec![],
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
@@ -2993,6 +2996,7 @@ mod tests {
                 enabled: true,
                 decision_cache_size: 1000,
                 lists: lists.clone(),
+                domains: vec![],
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
@@ -3059,6 +3063,7 @@ mod tests {
                 enabled: true,
                 decision_cache_size: 128,
                 lists: vec![],
+                domains: vec![],
                 wildcard_block: vec![],
                 whitelist: vec![],
                 client_bypass: vec![],
