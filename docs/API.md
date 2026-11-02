@@ -796,15 +796,29 @@ While `enabled` is off, `/api/mcp` answers `404`.
 
 ## Notifications
 
-One webhook, POSTed a JSON event for each kind that is switched on. Plain JSON,
-so ntfy, Home Assistant, a Slack/Telegram shim or anything that takes a POST
-works. Every event has `event`, `message` (one readable line) and `timestamp`.
+One webhook, sent an event for each kind that is switched on. `format` decides
+the body:
+
+| `format`          | Body                                                                       |
+| ----------------- | -------------------------------------------------------------------------- |
+| `json` (default)  | The event's fields, below — for Home Assistant, n8n, a script              |
+| `ntfy`            | ntfy JSON publish: `topic` (the URL's last segment), `title`, `message`, `tags`, `priority` — posted to the server root |
+| `discord`         | One embed: title, description, colour by severity                          |
+| `slack`           | `{ "text": "*title*\nmessage" }` — Mattermost and Rocket.Chat too          |
+| `telegram`        | `sendMessage` with `chat_id`, HTML text; `webhook` is `https://api.telegram.org/bot<token>/sendMessage` |
+| `gotify`          | `title`, `message`, `priority` to the `/message?token=…` URL               |
+
+Every JSON event has `event`, `message` (one readable line) and `timestamp`.
 
 ### `GET /api/notifications` · `PUT /api/notifications`
 
 ```json
-{ "webhook": "https://ntfy.sh/my-ferrite", "tunnel_alerts": true, "new_device": true }
+{ "webhook": "https://ntfy.sh/my-ferrite", "format": "ntfy",
+  "tunnel_alerts": true, "new_device": true }
 ```
+
+`chat_id` is required with `format: "telegram"`; `format` is omitted when it is
+`json`.
 
 - `tunnel_alerts`: a tunnel stays down past a minute (`egress_down`, with
   `egress`, `name`, `down_secs`), and its recovery (`egress_up`).
@@ -822,14 +836,15 @@ works. Every event has `event`, `message` (one readable line) and `timestamp`.
   name; `name` is `null` if it hasn't given one. Phones that rotate their Wi-Fi
   MAC count as new each time they rotate.
 
-A non-http(s) `webhook` → `400`. Before 0.2 the webhook was `[proxy]
+A non-http(s) `webhook`, an ntfy URL without a topic, or Telegram without a
+`chat_id` → `400`. Before 0.2 the webhook was `[proxy]
 alert_webhook`; an old config is moved over on load.
 
 ### `POST /api/notifications/test`
 
-Sends `{ "event": "test", "message": "Test notification from ferrite", … }`.
-The body may carry `{ "webhook": "…" }` to try a URL before saving it; without
-one the saved webhook is used. `200` when the receiver accepted it, `400` with
+Sends a `test` event. The body may carry `{ "webhook": "…", "format": "…",
+"chat_id": "…" }` to try a target before saving it; without a `webhook` the
+saved one is used. `200` when the receiver accepted it, `400` with
 the reason when it answered an error status or couldn't be reached.
 
 ---

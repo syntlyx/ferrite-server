@@ -1,4 +1,5 @@
-//! `/api/notifications` — the webhook and which events go to it — plus
+//! `/api/notifications` — the webhook, the shape its receiver expects, and
+//! which events go to it — plus
 //! `POST /api/notifications/test`, which sends a test event so a setup can be
 //! checked from the panel.
 
@@ -8,9 +9,9 @@ use serde_json::{Value, json};
 
 use crate::ApiError;
 use ferrite_app::AppState;
-use ferrite_core::config::NotificationsConfig;
+use ferrite_core::config::{NotificationsConfig, WebhookFormat};
 use ferrite_core::error::FeriteError;
-use ferrite_core::notify;
+use ferrite_core::notify::{self, Level, Notice, Target};
 
 /// GET /api/notifications
 pub async fn get_notifications(State(state): State<AppState>) -> Json<NotificationsConfig> {
@@ -23,12 +24,8 @@ pub async fn put_notifications(
     Json(mut body): Json<NotificationsConfig>,
 ) -> Result<Json<Value>, ApiError> {
     body.normalize();
-    if let Some(url) = body.webhook.as_deref()
-        && !notify::valid_webhook(url)
-    {
-        return Err(ApiError(FeriteError::Config(
-            "the webhook must be an http(s) URL".into(),
-        )));
+    if let Some(problem) = Target::from_config(&body).and_then(|t| t.problem()) {
+        return Err(ApiError(FeriteError::Config(problem.into())));
     }
     state.live_config.write().notifications = body;
     let saved_to = state.persist_config().await;
@@ -42,9 +39,13 @@ pub async fn put_notifications(
 #[derive(Debug, Default, Deserialize)]
 pub struct TestBody {
     /// Test this URL instead of the saved one — so a webhook can be checked
-    /// before it is saved.
+    /// before it is saved. `format` and `chat_id` go with it.
     #[serde(default)]
     pub webhook: Option<String>,
+    #[serde(default)]
+    pub format: Option<WebhookFormat>,
+    #[serde(default)]
+    pub chat_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -61,25 +62,36 @@ pub async fn test_notification(
     State(state): State<AppState>,
     body: Option<Json<TestBody>>,
 ) -> Result<Json<Value>, ApiError> {
-    let url = body
-        .and_then(|Json(b)| b.webhook)
-        .map(|u| u.trim().to_string())
-        .filter(|u| !u.is_empty())
-        .or_else(|| state.live_config.read().notifications.webhook.clone());
-    let Some(url) = url else {
+    let unsaved = body.map(|Json(b)| b).and_then(|b| {
+        let mut cfg = NotificationsConfig {
+            webhook: b.webhook,
+            format: b.format.unwrap_or_default(),
+            chat_id: b.chat_id,
+            ..NotificationsConfig::default()
+        };
+        cfg.normalize();
+        Target::from_config(&cfg)
+    });
+    let target = unsaved.or_else(|| Target::from_config(&state.live_config.read().notifications));
+    let Some(target) = target else {
         return Err(ApiError(FeriteError::Config("no webhook is set".into())));
     };
-    if !notify::valid_webhook(&url) {
-        return Err(ApiError(FeriteError::Config(
-            "the webhook must be an http(s) URL".into(),
-        )));
+    if let Some(problem) = target.problem() {
+        return Err(ApiError(FeriteError::Config(problem.into())));
     }
-    let event = TestEvent {
-        event: "test",
-        message: "Test notification from ferrite",
-        timestamp: chrono::Utc::now().to_rfc3339(),
+    let message = "Test notification from ferrite — notifications reach you here.";
+    let notice = Notice {
+        title: "ferrite".into(),
+        message: message.into(),
+        level: Level::Info,
+        tags: &["bell"],
+        event: TestEvent {
+            event: "test",
+            message,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        },
     };
-    notify::post(&notify::client(), &url, &event)
+    notify::send(&notify::client(), &target, &notice)
         .await
         .map_err(|e| ApiError(FeriteError::Config(e)))?;
     Ok(Json(json!({ "status": "ok" })))
@@ -102,6 +114,7 @@ mod tests {
                 webhook: Some("ntfy.sh/x".into()),
                 tunnel_alerts: true,
                 new_device: true,
+                ..NotificationsConfig::default()
             }),
         )
         .await;
@@ -111,8 +124,10 @@ mod tests {
             State(state.clone()),
             Json(NotificationsConfig {
                 webhook: Some(" https://ntfy.sh/ferrite ".into()),
+                format: WebhookFormat::Ntfy,
                 tunnel_alerts: false,
                 new_device: true,
+                ..NotificationsConfig::default()
             }),
         )
         .await
@@ -120,6 +135,20 @@ mod tests {
         let saved = state.live_config.read().notifications.clone();
         assert_eq!(saved.webhook.as_deref(), Some("https://ntfy.sh/ferrite"));
         assert!(!saved.tunnel_alerts && saved.new_device);
+        assert_eq!(saved.format, WebhookFormat::Ntfy);
+
+        // Telegram without a chat id can't post anywhere.
+        let no_chat = put_notifications(
+            State(state.clone()),
+            Json(NotificationsConfig {
+                webhook: Some("https://api.telegram.org/bot1:x/sendMessage".into()),
+                format: WebhookFormat::Telegram,
+                chat_id: Some("  ".into()),
+                ..NotificationsConfig::default()
+            }),
+        )
+        .await;
+        assert!(no_chat.is_err());
 
         drop(state);
         test_support::cleanup_sqlite(&db);

@@ -3,7 +3,7 @@
 //! A single sequential watcher task samples every enabled egress's health on an
 //! interval and turns the *transitions* into alerts: an egress that stays down
 //! past [`ALERT_GRACE`] logs a WARN (visible on the Logs page) and, when
-//! `[notifications] tunnel_alerts` is on, POSTs a JSON event to the webhook;
+//! `[notifications] tunnel_alerts` is on, sends an event to the webhook;
 //! recovery logs an INFO and POSTs the matching `egress_up` event. The grace period absorbs routine blips
 //! (a WireGuard rekey, a breaker cooldown) so alerts mean a real outage.
 //!
@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use ferrite_core::notify::{self, Level, Notice, Target};
+
 use super::{AlertEvent, ProxyCtx};
 
 /// How long an egress must stay unhealthy before a down alert fires. Recovery
@@ -25,7 +27,7 @@ pub(super) const ALERT_GRACE: Duration = Duration::from_secs(60);
 /// Health sampling cadence. Cheap: a handful of atomic loads per egress.
 const WATCH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// The JSON body POSTed to the webhook.
+/// The event's fields, POSTed as-is to a `format = "json"` webhook.
 #[derive(Serialize)]
 struct WebhookPayload<'a> {
     /// `egress_down` | `egress_up`.
@@ -54,7 +56,7 @@ pub async fn watch(ctx: ProxyCtx) {
 
         // Snapshot the bits of config we need, never holding the lock across
         // an await. Proxy disabled → tunnels are intentionally idle: no alerts.
-        let (enabled, webhook, egresses): (bool, Option<String>, Vec<(String, String)>) = {
+        let (enabled, target, egresses): (bool, Option<Target>, Vec<(String, String)>) = {
             let live = ctx.live_config.read();
             let cfg = &live.proxy;
             let notify = &live.notifications;
@@ -62,7 +64,7 @@ pub async fn watch(ctx: ProxyCtx) {
                 cfg.enabled,
                 notify
                     .tunnel_alerts
-                    .then(|| notify.webhook.clone())
+                    .then(|| Target::from_config(notify))
                     .flatten(),
                 cfg.egresses
                     .iter()
@@ -100,9 +102,9 @@ pub async fn watch(ctx: ProxyCtx) {
                     ("egress_up", down_for)
                 }
             };
-            if let Some(url) = webhook.as_deref() {
-                let client = client.get_or_insert_with(ferrite_core::notify::client);
-                deliver(client, url, kind, id, name, down_for).await;
+            if let Some(target) = &target {
+                let client = client.get_or_insert_with(notify::client);
+                deliver(client, target, kind, id, name, down_for).await;
             }
         }
     }
@@ -110,27 +112,45 @@ pub async fn watch(ctx: ProxyCtx) {
 
 async fn deliver(
     client: &reqwest::Client,
-    url: &str,
+    target: &Target,
     event: &str,
     egress: &str,
     name: &str,
     down_for: Duration,
 ) {
     let secs = down_for.as_secs();
-    let message = if event == "egress_down" {
-        format!("Tunnel {name} has been down for {secs}s")
+    let took = notify::human_duration(secs);
+    let down = event == "egress_down";
+    let (title, message) = if down {
+        (
+            format!("Tunnel down: {name}"),
+            format!("Tunnel {name} has been down for {took}"),
+        )
     } else {
-        format!("Tunnel {name} is back up after {secs}s down")
+        (
+            format!("Tunnel back up: {name}"),
+            format!("Tunnel {name} is back up after {took} down"),
+        )
     };
-    let payload = WebhookPayload {
-        event,
-        egress,
-        name,
-        down_secs: secs,
-        message,
-        timestamp: chrono::Utc::now().to_rfc3339(),
+    let notice = Notice {
+        title,
+        message: message.clone(),
+        level: if down { Level::Warning } else { Level::Info },
+        tags: if down {
+            &["warning"]
+        } else {
+            &["white_check_mark"]
+        },
+        event: WebhookPayload {
+            event,
+            egress,
+            name,
+            down_secs: secs,
+            message,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        },
     };
-    match ferrite_core::notify::post(client, url, &payload).await {
+    match notify::send(client, target, &notice).await {
         Ok(()) => tracing::debug!("proxy: alert webhook delivered {event} '{egress}'"),
         Err(e) => tracing::warn!("proxy: alert webhook for {event} '{egress}': {e}"),
     }

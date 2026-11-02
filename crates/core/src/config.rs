@@ -867,24 +867,60 @@ pub struct McpConfig {
     pub allow_changes: bool,
 }
 
-/// Webhook notifications: one URL, POSTed a JSON event for each kind that is
-/// switched on. Plain JSON — works with ntfy, a Slack/Telegram shim, Home
-/// Assistant, or anything that accepts a POST.
+/// Webhook notifications: one URL, POSTed an event for each kind that is
+/// switched on. `format` shapes the body for the receiver — raw JSON for Home
+/// Assistant or a script, or a readable message for ntfy, Discord, Slack,
+/// Telegram or Gotify.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct NotificationsConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub webhook: Option<String>,
+    /// What the receiver at `webhook` expects.
+    #[serde(skip_serializing_if = "WebhookFormat::is_json")]
+    pub format: WebhookFormat,
+    /// The chat a Telegram bot posts to; only read when `format = "telegram"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_id: Option<String>,
     /// A tunnel stays down past the alert grace period, and its recovery.
     pub tunnel_alerts: bool,
     /// A device the box has never seen joins the network.
     pub new_device: bool,
 }
 
+/// The receiver a webhook talks to, which decides the shape of the body.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WebhookFormat {
+    /// The event as JSON fields (`event`, `message`, …) — for Home Assistant,
+    /// n8n, a script.
+    #[default]
+    Json,
+    /// An ntfy topic URL (`https://ntfy.sh/<topic>`); sent as a titled,
+    /// tagged message.
+    Ntfy,
+    /// A Discord channel webhook.
+    Discord,
+    /// A Slack incoming webhook — also Mattermost and Rocket.Chat.
+    Slack,
+    /// `https://api.telegram.org/bot<token>/sendMessage`, with `chat_id`.
+    Telegram,
+    /// A Gotify message URL, `https://<host>/message?token=<app token>`.
+    Gotify,
+}
+
+impl WebhookFormat {
+    pub fn is_json(&self) -> bool {
+        *self == WebhookFormat::Json
+    }
+}
+
 impl Default for NotificationsConfig {
     fn default() -> Self {
         Self {
             webhook: None,
+            format: WebhookFormat::Json,
+            chat_id: None,
             // Tunnel alerts went to the webhook before there were switches;
             // existing setups keep getting them.
             tunnel_alerts: true,
@@ -900,6 +936,11 @@ impl NotificationsConfig {
             .take()
             .map(|u| u.trim().to_string())
             .filter(|u| !u.is_empty());
+        self.chat_id = self
+            .chat_id
+            .take()
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty());
     }
 }
 

@@ -374,14 +374,22 @@ domains = [
 
 
 # ── Notifications ─────────────────────────────────────────────────────────────
-# One webhook, POSTed a JSON event for each kind switched on — ntfy, Home
-# Assistant, a Slack/Telegram shim, anything that accepts a POST. Configurable
-# from Settings → Notifications, which can also send a test event.
+# One webhook, sent an event for each kind switched on. `format` shapes the
+# body for the receiver: "json" (the default — the event's fields, for Home
+# Assistant or a script), "ntfy", "discord", "slack" (also Mattermost and
+# Rocket.Chat), "telegram" or "gotify". Configurable from Settings →
+# Notifications, which can also send a test event.
 #
 # [notifications]
 # webhook       = "https://ntfy.sh/my-ferrite"
+# format        = "ntfy"
 # tunnel_alerts = true    # a tunnel down for over a minute, and its recovery
 # new_device    = true    # a device the box has never seen joins the network
+#
+# Telegram: the bot's sendMessage URL and the chat to post to.
+# webhook = "https://api.telegram.org/bot<token>/sendMessage"
+# format  = "telegram"
+# chat_id = "123456789"
 
 # ── MCP (AI assistants) ───────────────────────────────────────────────────────
 # /api/mcp lets an assistant such as Claude Code read what ferrite is doing,

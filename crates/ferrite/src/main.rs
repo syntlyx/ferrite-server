@@ -494,7 +494,8 @@ async fn pause_expiry_loop(state: ferrite_app::AppState) {
 /// the notification can say "pixel-8" rather than only a MAC.
 const NEW_DEVICE_NAME_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The JSON body POSTed for a `new_device` event.
+/// The event's fields for a `new_device`, POSTed as-is to a
+/// `format = "json"` webhook.
 #[derive(serde::Serialize)]
 struct NewDevicePayload {
     event: &'static str,
@@ -523,11 +524,13 @@ async fn new_device_loop(state: ferrite_app::AppState) {
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         };
-        let webhook = {
+        let target = {
             let cfg = &state.live_config.read().notifications;
-            cfg.new_device.then(|| cfg.webhook.clone()).flatten()
+            cfg.new_device
+                .then(|| ferrite_core::notify::Target::from_config(cfg))
+                .flatten()
         };
-        let Some(url) = webhook else {
+        let Some(target) = target else {
             continue;
         };
         let registry = std::sync::Arc::clone(&state.inner.client_registry);
@@ -543,15 +546,25 @@ async fn new_device_loop(state: ferrite_app::AppState) {
                 ),
                 None => format!("New device on the network: {} ({})", device.ip, device.mac),
             };
-            let payload = NewDevicePayload {
-                event: "new_device",
-                mac: device.mac.clone(),
-                ip: device.ip.to_string(),
-                name,
-                message,
-                timestamp: chrono::Utc::now().to_rfc3339(),
+            let title = format!(
+                "New device: {}",
+                name.as_deref().unwrap_or(device.mac.as_str())
+            );
+            let notice = ferrite_core::notify::Notice {
+                title,
+                message: message.clone(),
+                level: ferrite_core::notify::Level::Info,
+                tags: &["new"],
+                event: NewDevicePayload {
+                    event: "new_device",
+                    mac: device.mac.clone(),
+                    ip: device.ip.to_string(),
+                    name,
+                    message,
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                },
             };
-            if let Err(e) = ferrite_core::notify::post(&client, &url, &payload).await {
+            if let Err(e) = ferrite_core::notify::send(&client, &target, &notice).await {
                 tracing::warn!("new-device webhook for {}: {}", device.mac, e);
             }
         });
