@@ -26,13 +26,20 @@ Authorization: Bearer your-api-key
 
 ### Session Token (password-based)
 
-If a password is set (via `PATCH /api/settings` → `password` field, or `ferrite passwd` CLI), log in to get a session token valid for 24 h:
+If a password is set (via `PATCH /api/settings` → `password` field, or `ferrite passwd` CLI), log in to get a session token:
 
 ```
 POST /api/auth
 { "password": "..." }
-→ { "token": "...", "expires_in": 86400 }
+→ { "token": "...", "expires_in": 604800 }
 ```
+
+A session lasts 7 days since it was last used (each day of use pushes it
+forward) and survives restarts: it is kept in the database as the token's
+SHA-256, never the token. It is tied to the password it was issued under, so a
+new password — from Settings, `ferrite passwd` or a restored config — ends
+every older session. Changing it through `PATCH /api/settings` keeps the
+session that made the change.
 
 Send the token on subsequent requests:
 
