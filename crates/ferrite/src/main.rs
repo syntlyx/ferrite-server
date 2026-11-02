@@ -241,6 +241,9 @@ async fn run() -> anyhow::Result<()> {
     // Schedules read a stored minute of the week; this keeps it current.
     tokio::spawn(schedule_clock_loop(state.clone()));
 
+    // ── New-device notifications ─────────────────────────────────────────────
+    tokio::spawn(new_device_loop(state.clone()));
+
     // ── Selective routing / proxy ─────────────────────────────────────────────
     // Detached (not in the try_join! below) so a listener bind failure — :80/:443
     // already in use, or no privilege to bind them — degrades gracefully instead
@@ -484,6 +487,74 @@ async fn pause_expiry_loop(state: ferrite_app::AppState) {
         if pauses.expire(ferrite_blocklist::pause::unix_now()) {
             tracing::info!("blocking pause ended");
         }
+    }
+}
+
+/// How long a new device gets to answer PTR/mDNS before it is announced, so
+/// the notification can say "pixel-8" rather than only a MAC.
+const NEW_DEVICE_NAME_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The JSON body POSTed for a `new_device` event.
+#[derive(serde::Serialize)]
+struct NewDevicePayload {
+    event: &'static str,
+    mac: String,
+    ip: String,
+    /// The device's name once resolved (alias, PTR or mDNS); `None` when it
+    /// hasn't announced one.
+    name: Option<String>,
+    /// One line for receivers that show text, not fields.
+    message: String,
+    timestamp: String,
+}
+
+/// Announce devices the box has never seen to the webhook, when
+/// `[notifications] new_device` is on. Each delivery waits briefly for the
+/// device's name on its own task, so a burst of arrivals isn't serialised.
+async fn new_device_loop(state: ferrite_app::AppState) {
+    let mut events = state.inner.client_registry.subscribe_new_devices();
+    let client = ferrite_core::notify::client();
+    loop {
+        let device = match events.recv().await {
+            Ok(device) => device,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("new-device notifications: {} event(s) dropped", n);
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        };
+        let webhook = {
+            let cfg = &state.live_config.read().notifications;
+            cfg.new_device.then(|| cfg.webhook.clone()).flatten()
+        };
+        let Some(url) = webhook else {
+            continue;
+        };
+        let registry = std::sync::Arc::clone(&state.inner.client_registry);
+        let client = client.clone();
+        tokio::spawn(async move {
+            ferrite_clients::ClientRegistry::trigger_resolve(&registry, device.ip);
+            tokio::time::sleep(NEW_DEVICE_NAME_WAIT).await;
+            let name = registry.get_name(device.ip);
+            let message = match &name {
+                Some(name) => format!(
+                    "New device on the network: {name} ({}, {})",
+                    device.ip, device.mac
+                ),
+                None => format!("New device on the network: {} ({})", device.ip, device.mac),
+            };
+            let payload = NewDevicePayload {
+                event: "new_device",
+                mac: device.mac.clone(),
+                ip: device.ip.to_string(),
+                name,
+                message,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            };
+            if let Err(e) = ferrite_core::notify::post(&client, &url, &payload).await {
+                tracing::warn!("new-device webhook for {}: {}", device.mac, e);
+            }
+        });
     }
 }
 

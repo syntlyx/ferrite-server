@@ -371,3 +371,14 @@ domains = [
 # [[client_aliases]]
 # ip   = "192.168.1.5"
 # name = "NAS"
+
+
+# ── Notifications ─────────────────────────────────────────────────────────────
+# One webhook, POSTed a JSON event for each kind switched on — ntfy, Home
+# Assistant, a Slack/Telegram shim, anything that accepts a POST. Configurable
+# from Settings → Notifications, which can also send a test event.
+#
+# [notifications]
+# webhook       = "https://ntfy.sh/my-ferrite"
+# tunnel_alerts = true    # a tunnel down for over a minute, and its recovery
+# new_device    = true    # a device the box has never seen joins the network

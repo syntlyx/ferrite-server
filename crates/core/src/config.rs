@@ -50,6 +50,10 @@ pub struct Config {
     /// Selective per-domain routing through tunnels/proxies (egresses).
     #[serde(default)]
     pub proxy: ProxyConfig,
+    /// Where ferrite tells you about things — tunnels going down, devices
+    /// joining — and which of those it tells.
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
     /// Verbose debug-level logging for the `ferrite` target. **Off by default**:
     /// every DNS query and proxied connection emits a record, and each one costs
     /// two allocations, a process-wide ring-buffer lock and a stdout write — real
@@ -521,9 +525,8 @@ pub struct ProxyConfig {
     pub advertise_ipv6: Option<Ipv6Addr>,
     /// Hard cap on simultaneous proxied connections (bounds memory).
     pub max_connections: usize,
-    /// Optional URL POSTed a JSON event when an egress stays down past the
-    /// alert grace period (and again on recovery). Plain webhook — works with
-    /// ntfy, a Slack/Telegram shim, or anything that accepts a JSON POST.
+    /// DEPRECATED: superseded by `[notifications] webhook`. Still accepted on
+    /// load — `Config::normalize` moves it there — and never written back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alert_webhook: Option<String>,
     /// `host:port` the active probe TCP-connects to *through* each egress to
@@ -839,9 +842,46 @@ impl Default for Config {
             custom_records: vec![],
             client_aliases: vec![],
             proxy: ProxyConfig::default(),
+            notifications: NotificationsConfig::default(),
             debug_logging: false,
             web_dir: None,
         }
+    }
+}
+
+/// Webhook notifications: one URL, POSTed a JSON event for each kind that is
+/// switched on. Plain JSON — works with ntfy, a Slack/Telegram shim, Home
+/// Assistant, or anything that accepts a POST.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct NotificationsConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webhook: Option<String>,
+    /// A tunnel stays down past the alert grace period, and its recovery.
+    pub tunnel_alerts: bool,
+    /// A device the box has never seen joins the network.
+    pub new_device: bool,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            webhook: None,
+            // Tunnel alerts went to the webhook before there were switches;
+            // existing setups keep getting them.
+            tunnel_alerts: true,
+            new_device: false,
+        }
+    }
+}
+
+impl NotificationsConfig {
+    pub fn normalize(&mut self) {
+        self.webhook = self
+            .webhook
+            .take()
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty());
     }
 }
 
@@ -892,6 +932,23 @@ impl Config {
         self.migrate_whitelist();
         self.migrate_wildcard_block();
         self.proxy.normalize();
+        self.migrate_alert_webhook();
+        self.notifications.normalize();
+    }
+
+    /// Move the deprecated `proxy.alert_webhook` to `notifications.webhook`
+    /// (unless that is already set). Tunnel alerts were the only notifications
+    /// when the webhook lived under `[proxy]`; it is shared now.
+    fn migrate_alert_webhook(&mut self) {
+        let Some(url) = self.proxy.alert_webhook.take() else {
+            return;
+        };
+        if self.notifications.webhook.is_none() {
+            tracing::warn!(
+                "proxy.alert_webhook is deprecated — moving it to [notifications] webhook"
+            );
+            self.notifications.webhook = Some(url);
+        }
     }
 
     /// Move deprecated `blocklist.wildcard_block` entries into
@@ -1305,6 +1362,42 @@ mod tests {
 
         let reloaded = Config::from_toml(&cfg.to_toml().unwrap()).unwrap();
         assert_eq!(&reloaded.blocklist.profiles[0].schedule, schedule);
+    }
+
+    #[test]
+    fn the_old_proxy_webhook_moves_to_notifications() {
+        let cfg = Config::from_toml(
+            r#"
+            [proxy]
+            alert_webhook = " https://ntfy.sh/old "
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.notifications.webhook.as_deref(),
+            Some("https://ntfy.sh/old")
+        );
+        assert!(cfg.notifications.tunnel_alerts);
+        assert!(!cfg.notifications.new_device);
+        assert!(cfg.proxy.alert_webhook.is_none());
+        let saved = cfg.to_toml().unwrap();
+        assert!(!saved.contains("alert_webhook"), "{saved}");
+        assert!(saved.contains("[notifications]"), "{saved}");
+
+        // An explicit [notifications] webhook wins over the old key.
+        let cfg = Config::from_toml(
+            r#"
+            [proxy]
+            alert_webhook = "https://old.example/hook"
+            [notifications]
+            webhook = "https://new.example/hook"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.notifications.webhook.as_deref(),
+            Some("https://new.example/hook")
+        );
     }
 
     #[test]

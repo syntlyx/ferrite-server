@@ -2,9 +2,9 @@
 //!
 //! A single sequential watcher task samples every enabled egress's health on an
 //! interval and turns the *transitions* into alerts: an egress that stays down
-//! past [`ALERT_GRACE`] logs a WARN (visible on the Logs page) and optionally
-//! POSTs a JSON event to the configured webhook; recovery logs an INFO and
-//! POSTs the matching `egress_up` event. The grace period absorbs routine blips
+//! past [`ALERT_GRACE`] logs a WARN (visible on the Logs page) and, when
+//! `[notifications] tunnel_alerts` is on, POSTs a JSON event to the webhook;
+//! recovery logs an INFO and POSTs the matching `egress_up` event. The grace period absorbs routine blips
 //! (a WireGuard rekey, a breaker cooldown) so alerts mean a real outage.
 //!
 //! The transition state machine lives in [`ProxyState::note_health`] (pure map
@@ -25,10 +25,6 @@ pub(super) const ALERT_GRACE: Duration = Duration::from_secs(60);
 /// Health sampling cadence. Cheap: a handful of atomic loads per egress.
 const WATCH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Timeout for a single webhook delivery. Best-effort: a failure is logged and
-/// the event is dropped (the log line itself is the fallback alert channel).
-const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// The JSON body POSTed to the webhook.
 #[derive(Serialize)]
 struct WebhookPayload<'a> {
@@ -40,6 +36,8 @@ struct WebhookPayload<'a> {
     name: &'a str,
     /// How long the egress has been (or was, for `egress_up`) down, seconds.
     down_secs: u64,
+    /// One line for receivers that show text, not fields.
+    message: String,
     /// RFC 3339 UTC timestamp of the event.
     timestamp: String,
 }
@@ -57,10 +55,15 @@ pub async fn watch(ctx: ProxyCtx) {
         // Snapshot the bits of config we need, never holding the lock across
         // an await. Proxy disabled → tunnels are intentionally idle: no alerts.
         let (enabled, webhook, egresses): (bool, Option<String>, Vec<(String, String)>) = {
-            let cfg = &ctx.live_config.read().proxy;
+            let live = ctx.live_config.read();
+            let cfg = &live.proxy;
+            let notify = &live.notifications;
             (
                 cfg.enabled,
-                cfg.alert_webhook.clone(),
+                notify
+                    .tunnel_alerts
+                    .then(|| notify.webhook.clone())
+                    .flatten(),
                 cfg.egresses
                     .iter()
                     .filter(|e| e.enabled)
@@ -98,19 +101,11 @@ pub async fn watch(ctx: ProxyCtx) {
                 }
             };
             if let Some(url) = webhook.as_deref() {
-                let client = client.get_or_insert_with(build_client);
+                let client = client.get_or_insert_with(ferrite_core::notify::client);
                 deliver(client, url, kind, id, name, down_for).await;
             }
         }
     }
-}
-
-fn build_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(WEBHOOK_TIMEOUT)
-        .build()
-        // Falls back to default settings; only fails on broken TLS backends.
-        .unwrap_or_default()
 }
 
 async fn deliver(
@@ -121,21 +116,22 @@ async fn deliver(
     name: &str,
     down_for: Duration,
 ) {
+    let secs = down_for.as_secs();
+    let message = if event == "egress_down" {
+        format!("Tunnel {name} has been down for {secs}s")
+    } else {
+        format!("Tunnel {name} is back up after {secs}s down")
+    };
     let payload = WebhookPayload {
         event,
         egress,
         name,
-        down_secs: down_for.as_secs(),
+        down_secs: secs,
+        message,
         timestamp: chrono::Utc::now().to_rfc3339(),
     };
-    match client.post(url).json(&payload).send().await {
-        Ok(resp) if !resp.status().is_success() => {
-            tracing::warn!(
-                "proxy: alert webhook returned {} for {event} '{egress}'",
-                resp.status()
-            );
-        }
-        Ok(_) => tracing::debug!("proxy: alert webhook delivered {event} '{egress}'"),
-        Err(e) => tracing::warn!("proxy: alert webhook failed for {event} '{egress}': {e}"),
+    match ferrite_core::notify::post(client, url, &payload).await {
+        Ok(()) => tracing::debug!("proxy: alert webhook delivered {event} '{egress}'"),
+        Err(e) => tracing::warn!("proxy: alert webhook for {event} '{egress}': {e}"),
     }
 }

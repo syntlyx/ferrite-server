@@ -9,6 +9,7 @@ pub mod lists;
 pub mod logs;
 pub mod metrics;
 pub mod middleware;
+pub mod notifications;
 pub mod pause;
 pub mod profiles;
 pub mod proxy;
@@ -95,6 +96,12 @@ pub fn build_router(state: AppState) -> Router {
             delete(custom_records::delete_record),
         )
         // Temporary pauses of filtering (box-wide or per device; not persisted)
+        .route("/notifications", get(notifications::get_notifications))
+        .route("/notifications", put(notifications::put_notifications))
+        .route(
+            "/notifications/test",
+            post(notifications::test_notification),
+        )
         .route("/blocking/pause", get(pause::get_pause))
         .route("/blocking/pause", post(pause::pause))
         .route("/blocking/resume", post(pause::resume))

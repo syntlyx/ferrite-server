@@ -10,6 +10,7 @@ pub mod fsinfo;
 pub mod logbuf;
 pub mod memstats;
 pub mod net;
+pub mod notify;
 pub mod recording;
 pub mod schedule;
 pub mod services;

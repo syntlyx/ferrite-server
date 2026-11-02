@@ -174,11 +174,20 @@ pub async fn put_proxy(
 
     validate(&new)?;
     new.normalize();
+    // A panel from before `[notifications]` still sends the webhook here: it
+    // belongs there now.
+    let moved_webhook = new.alert_webhook.take();
 
     // Apply live — routing snapshot swaps and the listeners rebind if their
     // settings changed (no restart) — then persist.
     state.inner.proxy.reload(&new);
-    state.live_config.write().proxy = new;
+    {
+        let mut live = state.live_config.write();
+        live.proxy = new;
+        if let Some(url) = moved_webhook {
+            live.notifications.webhook = Some(url);
+        }
+    }
     let saved_to = state.persist_config().await;
 
     Ok(Json(json!({
