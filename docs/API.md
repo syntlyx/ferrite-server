@@ -604,6 +604,8 @@ GET → {
       "clients": ["aa:bb:cc:dd:ee:ff"],
       "block": [], "allow": ["ntp.example.com"],
       "services": ["tiktok"],                 // catalog services blocked for these devices
+      "safe_search": true,                    // see "SafeSearch" below
+      "youtube_restricted": "strict",         // "off" | "moderate" | "strict"
       "default_deny": true,                   // block everything not explicitly allowed
       "schedule": [                           // when it applies; [] = always
         { "days": ["sun", "mon", "tue", "wed", "thu"], "from": "21:00", "to": "07:00" }
@@ -688,6 +690,31 @@ allowlist entry still exempts one, and a profile's `allow` wins. Unknown ids →
 ```json
 { "kind": "service", "name": "TikTok", "matched": "tiktok.com" }
 ```
+
+### `GET /api/blocklist/safe-search` · `PUT /api/blocklist/safe-search` — SafeSearch
+
+```json
+{ "safe_search": true, "youtube_restricted": "moderate" }
+```
+
+Enforced in DNS, the way the engines publish it: the search host resolves as a
+CNAME to the engine's safe host, followed by that host's records.
+
+| Setting | Names | Safe host |
+|---|---|---|
+| `safe_search` | `google.<any country suffix>`, `www.google.<…>` | `forcesafesearch.google.com` |
+| | `bing.com`, `www.bing.com` | `strict.bing.com` |
+| | `duckduckgo.com`, `www.`, `start.` | `safe.duckduckgo.com` |
+| `youtube_restricted` | `www.youtube.com`, `m.youtube.com`, `youtubei.googleapis.com`, `youtube.googleapis.com`, `www.youtube-nocookie.com` | `restrictmoderate.youtube.com` / `restrict.youtube.com` |
+
+The network-wide setting applies to every device; a profile's `safe_search`
+and `youtube_restricted` apply to its devices, and the stricter of the two
+wins, so a profile can tighten the setting but not loosen it. The rewrite runs
+after the blocklist (a blocked YouTube stays blocked) and before tunnel
+routing (the safe host's addresses are what make the results safe). A pause or
+a client with filtering off is not rewritten. If the safe host can't be
+resolved the client gets SERVFAIL, never the unfiltered answer. The query log
+shows these with upstream `safesearch:<safe host>`.
 
 ### Routing a service through a tunnel
 
