@@ -1303,3 +1303,29 @@ fn whitelisted_parent_overrides_blocked_subdomain() {
     // www.google.com resolve again.
     assert!(blocklist.is_whitelisted_normalized("www.google.com"));
 }
+
+#[test]
+fn a_pause_lifts_filtering_box_wide_or_for_one_device() {
+    let bl = Blocklist::new(
+        BlocklistConfig::default(),
+        AllowlistConfig::default(),
+        temp_fst_path("pause"),
+    );
+    assert!(bl.blocking_enabled());
+    assert!(!bl.has_client_exceptions());
+
+    bl.pauses().pause_global(i64::MAX);
+    assert!(!bl.blocking_enabled());
+    bl.pauses().resume_global();
+    assert!(bl.blocking_enabled());
+
+    // A device pause is a client exception like a configured bypass, and is
+    // matched by IP or MAC; the configured bypass itself is untouched.
+    bl.pauses()
+        .pause_clients(&["aa:bb:cc:dd:ee:ff".into()], i64::MAX);
+    assert!(bl.has_client_exceptions());
+    assert!(!bl.has_client_bypass());
+    assert!(bl.client_filtering_off_normalized("10.0.0.2", Some("aa:bb:cc:dd:ee:ff")));
+    assert!(!bl.client_filtering_off_normalized("10.0.0.2", None));
+    assert!(!bl.client_bypasses_blocking("10.0.0.2", Some("aa:bb:cc:dd:ee:ff")));
+}

@@ -5,6 +5,7 @@ pub mod loader;
 mod manual;
 mod names;
 pub mod parser;
+pub mod pause;
 mod profiles;
 mod refresh;
 mod subscriptions;

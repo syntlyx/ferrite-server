@@ -228,6 +228,10 @@ async fn run() -> anyhow::Result<()> {
     // freshly-rotated addresses are tagged with their device MAC.
     tokio::spawn(neighbor_mirror_loop(state.clone()));
 
+    // ── Blocking pauses ──────────────────────────────────────────────────────
+    // A pause from the panel ("let me through for five minutes") lapses here.
+    tokio::spawn(pause_expiry_loop(state.clone()));
+
     // ── Selective routing / proxy ─────────────────────────────────────────────
     // Detached (not in the try_join! below) so a listener bind failure — :80/:443
     // already in use, or no privilege to bind them — degrades gracefully instead
@@ -432,6 +436,21 @@ async fn log_size_cap_loop(state: ferrite_app::AppState) {
         }
 
         tokio::time::sleep(SIZE_CAP_INTERVAL).await;
+    }
+}
+
+/// Lift temporary blocking pauses as they run out. A one-second tick is precise
+/// enough for minute-long pauses, and with none running each tick is a pair of
+/// atomic loads.
+async fn pause_expiry_loop(state: ferrite_app::AppState) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let pauses = state.inner.blocklist.pauses();
+        if pauses.expire(ferrite_blocklist::pause::unix_now()) {
+            tracing::info!("blocking pause ended");
+        }
     }
 }
 

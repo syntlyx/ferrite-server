@@ -118,7 +118,7 @@ pub fn decide(raw: &[u8], src: SocketAddr, ctx: &DnsCtx) -> Decision {
     // client all short-circuit on the same flags, so neither the MAC lookup nor
     // the address-as-text below has to happen.
     let client_scoped = (blocking_enabled
-        && (ctx.blocklist.has_client_bypass() || ctx.blocklist.has_profiles()))
+        && (ctx.blocklist.has_client_exceptions() || ctx.blocklist.has_profiles()))
         || ctx.interceptor.has_client_rules();
     let client_mac = if client_scoped {
         ctx.client_registry.get_mac(client_addr)
@@ -132,7 +132,7 @@ pub fn decide(raw: &[u8], src: SocketAddr, ctx: &DnsCtx) -> Decision {
     let filtering_enabled = blocking_enabled
         && !ctx
             .blocklist
-            .client_bypasses_blocking_normalized(client_ip, client_mac.as_deref());
+            .client_filtering_off_normalized(client_ip, client_mac.as_deref());
     // The per-device profile (subset of lists) for this client, if any. When
     // present it replaces the default all-lists FST for every block check below.
     let profile = if filtering_enabled {

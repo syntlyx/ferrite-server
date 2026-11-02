@@ -238,7 +238,7 @@ fn host_blocked_for_client(
     client_mac: Option<&str>,
 ) -> bool {
     if !blocklist.blocking_enabled()
-        || blocklist.client_bypasses_blocking_normalized(client_ip, client_mac)
+        || blocklist.client_filtering_off_normalized(client_ip, client_mac)
     {
         return false;
     }
@@ -266,7 +266,7 @@ async fn splice_through(
     let client_ip = client_addr.map(|ip| ip.to_string()).unwrap_or_default();
     let need_mac = ctx.proxy.has_client_rules()
         || (ctx.blocklist.blocking_enabled()
-            && (ctx.blocklist.has_client_bypass() || ctx.blocklist.has_profiles()));
+            && (ctx.blocklist.has_client_exceptions() || ctx.blocklist.has_profiles()));
     let client_mac = if need_mac {
         client_addr.and_then(|ip| ctx.client_registry.get_mac(ip))
     } else {

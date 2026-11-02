@@ -11,6 +11,7 @@ use crate::cache::BlocklistCache;
 use crate::loader::FstMap;
 use crate::manual::ManualList;
 use crate::names::{has_suffix, is_registrable_or_deeper, matched_key, normalise};
+use crate::pause::Pauses;
 use crate::profiles::{CompiledProfile, compile_profiles};
 use crate::subscriptions::Subscriptions;
 use ferrite_core::config::{AllowlistConfig, BlocklistConfig};
@@ -65,6 +66,8 @@ pub struct BlockSource {
 /// - Lists: the set of remote subscriptions, mutable at runtime.
 pub struct Blocklist {
     enabled: AtomicBool,
+    /// Temporary, unpersisted pauses of filtering — box-wide or per device.
+    pauses: Pauses,
     has_client_bypass: AtomicBool,
     has_profiles: AtomicBool,
     /// Subscribed blocklists and their merged FST — the subscription tier of
@@ -133,6 +136,7 @@ impl Blocklist {
 
         Self {
             enabled: AtomicBool::new(config.enabled),
+            pauses: Pauses::default(),
             has_client_bypass: AtomicBool::new(!client_bypass.is_empty()),
             has_profiles: AtomicBool::new(!config.profiles.is_empty()),
             block,
@@ -204,16 +208,37 @@ impl Blocklist {
 
     // ── Blocking checks ──────────────────────────────────────────────────────
 
+    /// Is filtering on right now — switched on in the config and not paused?
     pub fn blocking_enabled(&self) -> bool {
-        self.enabled.load(Ordering::Relaxed)
+        self.enabled.load(Ordering::Relaxed) && !self.pauses.global_active()
     }
 
     pub fn set_blocking_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::Relaxed);
     }
 
+    /// The temporary pauses, for the API to set, lift and report.
+    pub fn pauses(&self) -> &Pauses {
+        &self.pauses
+    }
+
+    /// Configured per-device bypasses (`client_bypass`) exist.
     pub fn has_client_bypass(&self) -> bool {
         self.has_client_bypass.load(Ordering::Relaxed)
+    }
+
+    /// Anything that can switch filtering off for a single device — a
+    /// configured bypass or a running pause. The hot path uses it to decide
+    /// whether the client's identity is worth resolving at all.
+    pub fn has_client_exceptions(&self) -> bool {
+        self.has_client_bypass() || self.pauses.any_clients()
+    }
+
+    /// Is filtering off for this client — bypassed in the config or paused?
+    /// Assumes normalised keys (the hot path).
+    pub fn client_filtering_off_normalized(&self, client_ip: &str, mac: Option<&str>) -> bool {
+        self.client_bypasses_blocking_normalized(client_ip, mac)
+            || self.pauses.client_paused(client_ip, mac)
     }
 
     pub fn set_client_bypass(&self, entries: &[String]) {
