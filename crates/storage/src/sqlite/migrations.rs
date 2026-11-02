@@ -4,7 +4,7 @@ use super::table_exists;
 use crate::ROLLUP_BUCKET_SECS;
 
 /// Latest schema version. Bump when adding a migration step below.
-pub(super) const SCHEMA_VERSION: i64 = 11;
+pub(super) const SCHEMA_VERSION: i64 = 12;
 
 /// Apply versioned migrations on top of the baseline `SCHEMA`.
 ///
@@ -31,6 +31,7 @@ pub(super) fn run_migrations(c: &mut rusqlite::Connection) -> rusqlite::Result<(
             9 => migrate_v9_drop_unread_client_rollups(&tx)?,
             10 => migrate_v10_device_first_seen(&tx)?,
             11 => migrate_v11_sessions(&tx)?,
+            12 => migrate_v12_session_details(&tx)?,
             _ => unreachable!("no migration step for v{next}"),
         }
         // PRAGMA can't be parameter-bound; the value is our own constant.
@@ -226,6 +227,27 @@ fn migrate_v11_sessions(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
              expires     INTEGER NOT NULL
          )",
     )
+}
+
+/// v12: a session remembers when and where it signed in and when it was last
+/// used, so the panel can list them. Sessions from v11 get zeros and blanks.
+fn migrate_v12_session_details(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
+    for (column, decl) in [
+        ("created", "INTEGER NOT NULL DEFAULT 0"),
+        ("last_seen", "INTEGER NOT NULL DEFAULT 0"),
+        ("agent", "TEXT NOT NULL DEFAULT ''"),
+        ("ip", "TEXT NOT NULL DEFAULT ''"),
+    ] {
+        let present: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = ?1",
+            [column],
+            |row| row.get(0),
+        )?;
+        if present == 0 {
+            tx.execute_batch(&format!("ALTER TABLE sessions ADD COLUMN {column} {decl}"))?;
+        }
+    }
+    Ok(())
 }
 
 fn migrate_v4_device_buckets(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {

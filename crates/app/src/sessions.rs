@@ -10,12 +10,21 @@ use dashmap::DashMap;
 use ferrite_storage::{Storage, StoredSession};
 
 /// One live session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Session {
     /// Fingerprint of the password hash it was issued under.
     pub password_fp: String,
     /// Unix seconds it lapses at.
     pub expires: i64,
+    /// Unix seconds it signed in at.
+    pub created: i64,
+    /// Unix seconds it was last used at. Kept current in memory; written to
+    /// storage with each renewal, so after a restart it can be up to a day old.
+    pub last_seen: i64,
+    /// The browser's User-Agent at sign-in.
+    pub agent: String,
+    /// The address it signed in from.
+    pub ip: String,
 }
 
 pub struct Sessions {
@@ -42,6 +51,10 @@ impl Sessions {
                         Session {
                             password_fp: row.password_fp,
                             expires: row.expires,
+                            created: row.created,
+                            last_seen: row.last_seen,
+                            agent: row.agent,
+                            ip: row.ip,
                         },
                     );
                 }
@@ -65,6 +78,25 @@ impl Sessions {
     /// the call (a later `remove` on the same shard would deadlock on it).
     pub fn get(&self, key: &str) -> Option<Session> {
         self.map.get(key).map(|e| e.clone())
+    }
+
+    /// Every live session with its key, oldest sign-in first.
+    pub fn list(&self) -> Vec<(String, Session)> {
+        let mut all: Vec<(String, Session)> = self
+            .map
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        all.sort_by_key(|(_, s)| s.created);
+        all
+    }
+
+    /// Note that a session was just used. Memory only — the request path
+    /// shouldn't write to the database; the next renewal carries it.
+    pub fn touch(&self, key: &str, now: i64) {
+        if let Some(mut s) = self.map.get_mut(key) {
+            s.last_seen = now;
+        }
     }
 
     /// Add a session and wait for it to be stored.
@@ -112,6 +144,10 @@ async fn persist(storage: &dyn Storage, key: String, session: Session) {
         token_hash: key,
         password_fp: session.password_fp,
         expires: session.expires,
+        created: session.created,
+        last_seen: session.last_seen,
+        agent: session.agent,
+        ip: session.ip,
     };
     if let Err(e) = storage.save_session(&row).await {
         tracing::warn!("could not save a login session: {}", e);

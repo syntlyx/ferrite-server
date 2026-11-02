@@ -12,12 +12,16 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::Router;
+use axum::extract::ConnectInfo;
+use hyper::Request;
+use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
+use tower::ServiceExt;
 
 use ferrite_app::AppState;
 use ferrite_proxy::http_host::{HostResult, parse_http_host};
@@ -61,6 +65,15 @@ pub(super) async fn dispatch(mut stream: TcpStream, state: AppState, router: Rou
 /// Serve the buffered connection as the panel: replay the peeked bytes ahead of
 /// the socket and let hyper drive the axum router (HTTP/1, keep-alive).
 async fn serve_panel(stream: TcpStream, prefix: Vec<u8>, router: Router) {
+    // Handlers that want the client's address (a login, to list where a
+    // session signed in from) read it as `ConnectInfo`.
+    let peer = stream.peer_addr().ok();
+    let router = router.map_request(move |mut req: Request<Incoming>| {
+        if let Some(peer) = peer {
+            req.extensions_mut().insert(ConnectInfo(peer));
+        }
+        req
+    });
     let io = TokioIo::new(Prefixed::new(prefix, stream));
     let service = TowerToHyperService::new(router);
     if let Err(e) = http1::Builder::new().serve_connection(io, service).await {

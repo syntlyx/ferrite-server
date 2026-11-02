@@ -103,6 +103,10 @@ pub fn build_router(state: AppState) -> Router {
             "/settings/mcp",
             get(mcp::get_settings).put(mcp::put_settings),
         )
+        // Signed-in panel sessions (the login itself is public, above)
+        .route("/auth/sessions", get(auth::list_sessions))
+        .route("/auth/sessions", delete(auth::revoke_other_sessions))
+        .route("/auth/sessions/{id}", delete(auth::revoke_session))
         .route("/notifications", get(notifications::get_notifications))
         .route("/notifications", put(notifications::put_notifications))
         .route(
@@ -288,6 +292,8 @@ mod tests {
         state.live_config.write().api.password_hash = Some(hash_password("secret").unwrap());
         let axum::Json(login) = crate::auth::login(
             axum::extract::State(state.clone()),
+            axum::http::HeaderMap::new(),
+            None,
             axum::Json(crate::auth::LoginRequest {
                 password: "secret".to_string(),
             }),

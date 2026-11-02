@@ -119,6 +119,10 @@ CREATE INDEX IF NOT EXISTS idx_ip_bindings_mac ON ip_bindings (mac);
 CREATE TABLE IF NOT EXISTS sessions (
     token_hash  TEXT    PRIMARY KEY,
     password_fp TEXT    NOT NULL,
-    expires     INTEGER NOT NULL
+    expires     INTEGER NOT NULL,
+    created     INTEGER NOT NULL DEFAULT 0,
+    last_seen   INTEGER NOT NULL DEFAULT 0,
+    agent       TEXT    NOT NULL DEFAULT '',
+    ip          TEXT    NOT NULL DEFAULT ''
 );
 "#;

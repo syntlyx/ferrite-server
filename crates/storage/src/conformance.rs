@@ -537,6 +537,10 @@ async fn sessions_save_update_lapse_and_delete_the_same() {
             token_hash: hash.into(),
             password_fp: "fp1".into(),
             expires,
+            created: 100,
+            last_seen: expires - 1_000,
+            agent: "Mozilla/5.0 (Macintosh)".into(),
+            ip: "192.168.1.20".into(),
         };
         storage.save_session(&s("live", 2_000)).await.unwrap();
         storage.save_session(&s("lapsed", 500)).await.unwrap();

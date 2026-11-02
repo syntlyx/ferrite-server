@@ -1031,3 +1031,36 @@ fn v10_backfills_bound_macs_as_known_devices_of_unknown_age() {
         ]
     );
 }
+
+#[test]
+fn v12_gives_v11_sessions_blank_details_and_keeps_them() {
+    let mut c = rusqlite::Connection::open_in_memory().unwrap();
+    c.execute_batch(
+        "CREATE TABLE sessions (token_hash TEXT PRIMARY KEY, password_fp TEXT NOT NULL, expires INTEGER NOT NULL);
+         INSERT INTO sessions VALUES ('abc', 'fp', 5000);
+         PRAGMA user_version = 11;",
+    )
+    .unwrap();
+    super::migrations::run_migrations(&mut c).unwrap();
+
+    let row: (String, i64, i64, i64, String, String) = c
+        .query_row(
+            "SELECT token_hash, expires, created, last_seen, agent, ip FROM sessions",
+            [],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        row,
+        ("abc".into(), 5000, 0, 0, String::new(), String::new())
+    );
+}

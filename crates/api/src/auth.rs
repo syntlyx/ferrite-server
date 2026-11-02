@@ -1,3 +1,4 @@
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use argon2::{
@@ -5,13 +6,13 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
 use axum::{
-    Json,
-    extract::State,
-    http::{HeaderMap, StatusCode},
+    Extension, Json,
+    extract::{ConnectInfo, Path, State},
+    http::{HeaderMap, StatusCode, header::USER_AGENT},
     response::IntoResponse,
 };
 use ring::rand::{SecureRandom, SystemRandom};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::ApiError;
@@ -177,11 +178,19 @@ pub fn is_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
             Session {
                 password_fp,
                 expires: now + ttl,
+                last_seen: now,
+                ..session
             },
         );
+    } else if now - session.last_seen >= TOUCH_EVERY {
+        state.sessions.touch(&key, now);
     }
     true
 }
+
+/// "Last used" is noted at most this often per session — it is shown to the
+/// minute, and a busy panel makes several requests a second.
+const TOUCH_EVERY: i64 = 30;
 
 /// After the password changed, keep the session of the request that changed
 /// it: re-issue it under the new password. Every other session lapses.
@@ -190,12 +199,15 @@ pub fn rebind_session(state: &AppState, headers: &HeaderMap, new_password_hash: 
         return;
     };
     let key = session_key(&token);
-    if state.sessions.get(&key).is_some() {
+    if let Some(session) = state.sessions.get(&key) {
+        let now = unix_now();
         state.sessions.update(
             &key,
             Session {
                 password_fp: password_fingerprint(new_password_hash),
-                expires: unix_now() + SESSION_TTL.as_secs() as i64,
+                expires: now + SESSION_TTL.as_secs() as i64,
+                last_seen: now,
+                ..session
             },
         );
     }
@@ -208,9 +220,23 @@ pub struct LoginRequest {
     pub password: String,
 }
 
+/// The longest User-Agent kept with a session — enough to tell browsers and
+/// systems apart, short enough that a hostile header can't bloat the table.
+const AGENT_MAX: usize = 256;
+
+/// The address a request came from, when the listener recorded it.
+type Peer = Option<Extension<ConnectInfo<SocketAddr>>>;
+
+fn peer_ip(peer: &Peer) -> Option<IpAddr> {
+    peer.as_ref()
+        .map(|Extension(ConnectInfo(addr))| addr.ip().to_canonical())
+}
+
 /// POST /api/auth — verify password, issue session token.
 pub async fn login(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    peer: Peer,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<Value>, ApiError> {
     // Throttle before touching config or running Argon2 so a flood is cheap to reject.
@@ -234,13 +260,25 @@ pub async fn login(
     }
 
     let token = generate_session_token()?;
+    let now = unix_now();
+    let agent: String = headers
+        .get(USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .chars()
+        .take(AGENT_MAX)
+        .collect();
     state
         .sessions
         .insert(
             session_key(&token),
             Session {
                 password_fp: password_fingerprint(&hash),
-                expires: unix_now() + SESSION_TTL.as_secs() as i64,
+                expires: now + SESSION_TTL.as_secs() as i64,
+                created: now,
+                last_seen: now,
+                agent,
+                ip: peer_ip(&peer).map(|ip| ip.to_string()).unwrap_or_default(),
             },
         )
         .await;
@@ -269,6 +307,110 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Json<V
         state.sessions.remove(&session_key(&token)).await;
     }
     Json(json!({ "status": "ok" }))
+}
+
+/// A session as the panel lists it. `id` is a prefix of the stored key —
+/// enough to name it, useless for signing in.
+#[derive(Debug, Serialize)]
+pub struct SessionView {
+    pub id: String,
+    pub created: i64,
+    pub last_seen: i64,
+    pub expires: i64,
+    pub agent: String,
+    pub ip: String,
+    /// The name of the device at `ip`, as the client list knows it.
+    pub device: Option<String>,
+    /// The session making this request.
+    pub current: bool,
+}
+
+const SESSION_ID_LEN: usize = 16;
+
+/// GET /api/auth/sessions — every session that can still sign in, oldest first.
+pub async fn list_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Json<Vec<SessionView>> {
+    let current = extract_session_token(&headers).map(|t| session_key(&t));
+    let password_fp = state
+        .live_config
+        .read()
+        .api
+        .password_hash()
+        .map(password_fingerprint);
+    let now = unix_now();
+    let registry = &state.inner.client_registry;
+    let mut views = Vec::new();
+    for (key, s) in state.sessions.list() {
+        // One that can no longer sign in (an old password) is cleared out
+        // rather than shown.
+        if s.expires <= now || Some(&s.password_fp) != password_fp.as_ref() {
+            state.sessions.forget(&key);
+            continue;
+        }
+        views.push(SessionView {
+            id: key[..SESSION_ID_LEN].to_string(),
+            current: current.as_deref() == Some(key.as_str()),
+            device: s.ip.parse().ok().and_then(|ip| registry.get_name(ip)),
+            created: s.created,
+            last_seen: s.last_seen,
+            expires: s.expires,
+            agent: s.agent,
+            ip: s.ip,
+        });
+    }
+    Json(views)
+}
+
+/// DELETE /api/auth/sessions/{id} — sign one session out. It may be the
+/// caller's own.
+pub async fn revoke_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let key = (id.len() == SESSION_ID_LEN)
+        .then(|| {
+            state
+                .sessions
+                .list()
+                .into_iter()
+                .map(|(key, _)| key)
+                .find(|key| key.starts_with(&id))
+        })
+        .flatten()
+        .ok_or_else(|| ApiError(FeriteError::NotFound(format!("session {id}"))))?;
+    state.sessions.remove(&key).await;
+    Ok(Json(json!({ "status": "ok" })))
+}
+
+/// DELETE /api/auth/sessions — sign out every session but the caller's own.
+/// `removed` counts the ones that could still sign in — what the list showed.
+pub async fn revoke_other_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Json<Value> {
+    let current = extract_session_token(&headers).map(|t| session_key(&t));
+    let password_fp = state
+        .live_config
+        .read()
+        .api
+        .password_hash()
+        .map(password_fingerprint);
+    let now = unix_now();
+    let mut removed = 0;
+    for (key, s) in state.sessions.list() {
+        if current.as_deref() != Some(key.as_str()) {
+            state.sessions.remove(&key).await;
+            if s.expires > now && Some(&s.password_fp) == password_fp.as_ref() {
+                removed += 1;
+            }
+        }
+    }
+    if removed > 0 {
+        tracing::info!("signed out {removed} other panel session(s)");
+    }
+    Json(json!({ "status": "ok", "removed": removed }))
 }
 
 /// GET /api/auth — check if the caller has a valid session.
@@ -353,6 +495,8 @@ mod tests {
 
         let Json(body) = login(
             State(state.clone()),
+            axum::http::HeaderMap::new(),
+            None,
             Json(LoginRequest {
                 password: "secret".to_string(),
             }),
@@ -384,6 +528,8 @@ mod tests {
 
         let err = login(
             State(state.clone()),
+            axum::http::HeaderMap::new(),
+            None,
             Json(LoginRequest {
                 password: "secret".to_string(),
             }),
@@ -412,6 +558,7 @@ mod tests {
                 Session {
                     password_fp: password_fingerprint(&hash),
                     expires: unix_now() - 1,
+                    ..Session::default()
                 },
             )
             .await;
@@ -429,6 +576,8 @@ mod tests {
     async fn login_token(state: &AppState) -> String {
         let Json(body) = login(
             State(state.clone()),
+            axum::http::HeaderMap::new(),
+            None,
             Json(LoginRequest {
                 password: "secret".to_string(),
             }),
@@ -468,6 +617,63 @@ mod tests {
         // A new password — however it got there — ends the session.
         state.live_config.write().api.password_hash = Some(hash_password("other").unwrap());
         assert!(!is_authenticated(&state, &token_headers(&token)));
+
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
+    }
+
+    #[tokio::test]
+    async fn sessions_are_listed_and_signed_out_one_by_one_or_all_but_mine() {
+        let (state, db_path) = test_support::app_state("auth-sessions").await;
+        state.live_config.write().api.password_hash = Some(hash_password("secret").unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(USER_AGENT, HeaderValue::from_static("Mozilla/5.0 (iPhone)"));
+        let peer: Peer = Some(Extension(ConnectInfo(
+            "[::ffff:192.168.1.7]:5555".parse().unwrap(),
+        )));
+        let Json(body) = login(
+            State(state.clone()),
+            headers,
+            peer,
+            Json(LoginRequest {
+                password: "secret".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let phone = body["token"].as_str().unwrap().to_string();
+        let mine = login_token(&state).await;
+        let third = login_token(&state).await;
+
+        let Json(list) = list_sessions(State(state.clone()), token_headers(&mine)).await;
+        assert_eq!(list.len(), 3);
+        let me: Vec<_> = list.iter().filter(|s| s.current).collect();
+        assert_eq!(me.len(), 1);
+        let iphone = list.iter().find(|s| s.agent.contains("iPhone")).unwrap();
+        assert_eq!(iphone.ip, "192.168.1.7");
+        assert_eq!(iphone.id.len(), SESSION_ID_LEN);
+
+        // One by one, by its id…
+        let Json(_) = revoke_session(State(state.clone()), Path(iphone.id.clone()))
+            .await
+            .unwrap();
+        assert!(!is_authenticated(&state, &token_headers(&phone)));
+        assert!(
+            revoke_session(State(state.clone()), Path(iphone.id.clone()))
+                .await
+                .is_err()
+        );
+        assert!(
+            revoke_session(State(state.clone()), Path("short".into()))
+                .await
+                .is_err()
+        );
+
+        // …or every one but the caller's.
+        let Json(out) = revoke_other_sessions(State(state.clone()), token_headers(&mine)).await;
+        assert_eq!(out["removed"], 1);
+        assert!(is_authenticated(&state, &token_headers(&mine)));
+        assert!(!is_authenticated(&state, &token_headers(&third)));
 
         drop(state);
         test_support::cleanup_sqlite(&db_path);

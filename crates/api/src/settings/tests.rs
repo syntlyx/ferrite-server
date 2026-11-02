@@ -572,6 +572,8 @@ async fn changing_the_password_keeps_the_caller_signed_in_and_no_one_else() {
     let login = |state: AppState| async move {
         let Json(v) = crate::auth::login(
             State(state),
+            axum::http::HeaderMap::new(),
+            None,
             Json(crate::auth::LoginRequest {
                 password: "old secret".into(),
             }),

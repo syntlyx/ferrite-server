@@ -666,11 +666,22 @@ impl Storage for SqliteStorage {
         self.conn
             .call(move |c| {
                 c.execute(
-                    "INSERT INTO sessions (token_hash, password_fp, expires) VALUES (?1, ?2, ?3)
+                    "INSERT INTO sessions
+                         (token_hash, password_fp, expires, created, last_seen, agent, ip)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                      ON CONFLICT(token_hash) DO UPDATE SET
                          password_fp = excluded.password_fp,
-                         expires     = excluded.expires",
-                    rusqlite::params![s.token_hash, s.password_fp, s.expires],
+                         expires     = excluded.expires,
+                         last_seen   = excluded.last_seen",
+                    rusqlite::params![
+                        s.token_hash,
+                        s.password_fp,
+                        s.expires,
+                        s.created,
+                        s.last_seen,
+                        s.agent,
+                        s.ip
+                    ],
                 )?;
                 Ok(())
             })
@@ -693,14 +704,20 @@ impl Storage for SqliteStorage {
         self.conn
             .call(move |c| {
                 c.execute("DELETE FROM sessions WHERE expires <= ?1", [now])?;
-                let mut stmt =
-                    c.prepare("SELECT token_hash, password_fp, expires FROM sessions")?;
+                let mut stmt = c.prepare(
+                    "SELECT token_hash, password_fp, expires, created, last_seen, agent, ip
+                     FROM sessions",
+                )?;
                 let rows = stmt
                     .query_map([], |row| {
                         Ok(StoredSession {
                             token_hash: row.get(0)?,
                             password_fp: row.get(1)?,
                             expires: row.get(2)?,
+                            created: row.get(3)?,
+                            last_seen: row.get(4)?,
+                            agent: row.get(5)?,
+                            ip: row.get(6)?,
                         })
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;

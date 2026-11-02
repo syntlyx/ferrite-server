@@ -89,6 +89,29 @@ Invalidates the current session token. Token read from `X-Session-Token` or `Aut
 { "status": "ok" }
 ```
 
+### `GET /api/auth/sessions` — signed-in sessions
+
+Behind authentication, unlike the rest of `/api/auth`. Every session that can
+still sign in, oldest first. `id` is a prefix of the
+stored key — it names a session, it can't be used to sign in. `device` is the
+client list's name for `ip`. Sessions from before 0.2's session details have
+`created`, `last_seen` = `0` and blank `agent`/`ip`. `last_seen` is kept to
+the half-minute while ferrite runs and written with each daily renewal.
+
+```json
+[
+  { "id": "3f9a0c1b7e2d4a58", "created": 1793650000, "last_seen": 1793736400,
+    "expires": 1794341200, "agent": "Mozilla/5.0 (iPhone; …) Safari/604.1",
+    "ip": "192.168.1.23", "device": "pixel-8", "current": false }
+]
+```
+
+### `DELETE /api/auth/sessions/{id}` · `DELETE /api/auth/sessions`
+
+Sign out one session (it may be the caller's own; unknown id → `404`), or every
+session except the caller's — `{ "status": "ok", "removed": 2 }`. Changing the
+password also ends every session but the one that changed it.
+
 ---
 
 ## Stats

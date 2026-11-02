@@ -59,6 +59,19 @@ pub struct StoredSession {
     pub password_fp: String,
     /// Unix seconds the session lapses at.
     pub expires: i64,
+    /// Unix seconds it was signed in at.
+    #[serde(default)]
+    pub created: i64,
+    /// Unix seconds it was last used at, as of the last write — the live
+    /// value is kept in memory and written with each renewal.
+    #[serde(default)]
+    pub last_seen: i64,
+    /// The browser's User-Agent at sign-in, trimmed.
+    #[serde(default)]
+    pub agent: String,
+    /// The address it signed in from.
+    #[serde(default)]
+    pub ip: String,
 }
 
 /// Aggregated statistics per device (keyed by the device identity token: a MAC
