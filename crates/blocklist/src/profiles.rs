@@ -94,29 +94,38 @@ fn split_patterns(patterns: &[String]) -> (HashSet<String>, Vec<Regex>) {
 /// so merges stream from the page cache and the compiled profile FSTs are
 /// themselves mmap'd from `profile_<id>.fst` files (kept off anonymous RSS,
 /// like the global FST).
+///
+/// With `stale_ok` (startup) a profile whose map can't be confirmed current is
+/// served from the map the previous run left — see [`profile_map`]. The second
+/// value says whether any profile got such a stand-in.
 pub(crate) fn compile_profiles(
     configs: &[ferrite_core::config::BlocklistProfileConfig],
     list_cache_dir: &Path,
     allow_cache_dir: &Path,
     merged: Option<&MergedSet>,
     allow_merged: Option<&MergedSet>,
-) -> Vec<Arc<CompiledProfile>> {
+    stale_ok: bool,
+) -> (Vec<Arc<CompiledProfile>>, bool) {
     let mut compiled: Vec<Arc<CompiledProfile>> = Vec::with_capacity(configs.len());
+    let mut any_stale = false;
     for cfg in configs {
-        let fst = reuse_merged(merged, &cfg.id, &cfg.lists, list_cache_dir)
-            .or_else(|| build_profile_fst(&cfg.id, &cfg.lists, list_cache_dir))
-            .unwrap_or_else(empty_fst);
+        let (fst, stale) = profile_map(merged, &cfg.id, &cfg.lists, list_cache_dir, stale_ok);
+        any_stale |= stale;
         // Allowlist subset: named lists compile to the profile's own allow
         // FST; an empty selection means "inherit the global allow set"
         // (`None`), so existing profiles keep their exemptions.
         let allow_fst = if cfg.allowlists.is_empty() {
             None
         } else {
-            Some(
-                reuse_merged(allow_merged, &cfg.id, &cfg.allowlists, allow_cache_dir)
-                    .or_else(|| build_profile_fst(&cfg.id, &cfg.allowlists, allow_cache_dir))
-                    .unwrap_or_else(empty_fst),
-            )
+            let (fst, stale) = profile_map(
+                allow_merged,
+                &cfg.id,
+                &cfg.allowlists,
+                allow_cache_dir,
+                stale_ok,
+            );
+            any_stale |= stale;
+            Some(fst)
         };
         let clients: HashSet<String> = normalize_client_keys(&cfg.clients).into_iter().collect();
         let (allow_exact, allow_wild) = split_patterns(&cfg.allow);
@@ -133,7 +142,49 @@ pub(crate) fn compile_profiles(
             default_deny: cfg.default_deny,
         }));
     }
-    compiled
+    (compiled, any_stale)
+}
+
+/// The map a profile serves for `names`, and whether it is a stand-in.
+///
+/// At startup (`stale_ok`) a map the previous run left on disk is served as it
+/// stands when its recorded inputs can't be confirmed — and after an upgrade
+/// none can be, because list caches from another version are not trusted. The
+/// alternative is the full merge, and startup runs it before DNS listens: on a
+/// router with a million-domain profile that was fifteen seconds without DNS on
+/// every restart. The stand-in is flagged; the next refresh compiles the real
+/// map off the hot path.
+fn profile_map(
+    merged: Option<&MergedSet>,
+    id: &str,
+    names: &[String],
+    cache_dir: &Path,
+    stale_ok: bool,
+) -> (FstMap, bool) {
+    if let Some(map) = reuse_merged(merged, id, names, cache_dir) {
+        return (map, false);
+    }
+    if stale_ok
+        && !profile_cache_current(id, names, cache_dir)
+        && let Ok(map) = loader::mmap_fst(&profile_fst_path(cache_dir, id))
+    {
+        tracing::info!(
+            "profile '{}': serving the map from the last run until a refresh confirms it",
+            id
+        );
+        return (map, true);
+    }
+    (
+        build_profile_fst(id, names, cache_dir).unwrap_or_else(empty_fst),
+        false,
+    )
+}
+
+/// Does the profile's map on disk record exactly the inputs `names` have now?
+fn profile_cache_current(id: &str, names: &[String], cache_dir: &Path) -> bool {
+    let path = profile_fst_path(cache_dir, id);
+    profile_fingerprint(cache_dir, names)
+        .is_some_and(|inputs| load_fst_inputs(&path).is_some_and(|r| r.inputs == inputs))
 }
 
 /// A profile that selects exactly the merged set gets the merged FST itself:

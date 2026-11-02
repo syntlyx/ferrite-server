@@ -228,6 +228,11 @@ async fn run() -> anyhow::Result<()> {
     // freshly-rotated addresses are tagged with their device MAC.
     tokio::spawn(neighbor_mirror_loop(state.clone()));
 
+    // ── Scheduled list refresh ───────────────────────────────────────────────
+    // Lists were only ever fetched on a cold start or when someone touched the
+    // Lists page; this keeps them current on its own.
+    tokio::spawn(list_refresh_loop(state.clone()));
+
     // ── Blocking pauses ──────────────────────────────────────────────────────
     // A pause from the panel ("let me through for five minutes") lapses here.
     tokio::spawn(pause_expiry_loop(state.clone()));
@@ -436,6 +441,30 @@ async fn log_size_cap_loop(state: ferrite_app::AppState) {
         }
 
         tokio::time::sleep(SIZE_CAP_INTERVAL).await;
+    }
+}
+
+/// Keep subscription lists current. Each list's cache is good for 12 hours; this
+/// looks hourly and refreshes when any enabled list has outlived it, or was
+/// built by another ferrite version — after an upgrade those stay distrusted,
+/// and device profiles keep serving last run's maps, until a refresh rebuilds
+/// them. A refresh only fetches what is stale, conditionally, and builds nothing
+/// when nothing moved. The first look comes a minute after startup, once the
+/// box has settled and DNS is up.
+async fn list_refresh_loop(state: ferrite_app::AppState) {
+    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        let blocklist = &state.inner.blocklist;
+        if !blocklist.needs_refresh() {
+            continue;
+        }
+        match blocklist.refresh(false).await {
+            Ok(n) => tracing::info!("scheduled list refresh: {} unique domains", n),
+            Err(e) => tracing::warn!("scheduled list refresh failed, next try in an hour: {}", e),
+        }
     }
 }
 

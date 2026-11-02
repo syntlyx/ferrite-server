@@ -101,6 +101,10 @@ pub struct Blocklist {
     /// Serialises [`Self::refresh`] so concurrent API-triggered refreshes don't
     /// race on the swapped FSTs and counts or pile up duplicate network fetches.
     refresh_lock: tokio::sync::Mutex<()>,
+    /// Some profile is serving the map a previous run left, because startup
+    /// would not hold DNS back for a merge. The next refresh recompiles them
+    /// even if no list moved.
+    profiles_stale: AtomicBool,
 }
 
 impl Blocklist {
@@ -149,6 +153,7 @@ impl Blocklist {
             cache: BlocklistCache::new(config.decision_cache_size),
             local_zones: RwLock::new(Vec::new()),
             refresh_lock: tokio::sync::Mutex::new(()),
+            profiles_stale: AtomicBool::new(false),
         }
     }
 
@@ -167,8 +172,10 @@ impl Blocklist {
                 let allow_ok = self.load_allow_from_disk();
                 // Per-list FSTs are on disk too, so profiles can compile now
                 // (before any network refresh) — a restart keeps device profiles
-                // working immediately, like the global list.
-                self.rebuild_profiles();
+                // working immediately, like the global list. Without merging:
+                // this runs before DNS listens, so a profile whose map can't be
+                // confirmed current serves last run's until a refresh.
+                self.store_profiles(true);
                 tracing::info!("blocklist loaded from disk: {} domains", count);
                 allow_ok
             }
@@ -474,18 +481,35 @@ impl Blocklist {
     /// contexts use [`Self::rebuild_profiles_off_thread`] instead; this sync
     /// form is for startup ([`Self::load_from_disk`]) and tests.
     pub fn rebuild_profiles(&self) {
+        self.store_profiles(false);
+    }
+
+    /// Compile and install the profiles on the calling thread; `stale_ok` lets
+    /// a profile keep last run's map rather than merge (startup only).
+    fn store_profiles(&self, stale_ok: bool) {
         let configs = self.profiles_config.read().clone();
-        let compiled = compile_profiles(
+        let (compiled, stale) = compile_profiles(
             &configs,
             self.block.cache_dir(),
             self.allow.cache_dir(),
             self.block.merged_set().as_ref(),
             self.allow.merged_set().as_ref(),
+            stale_ok,
         );
         self.profiles.store(Arc::new(compiled));
+        self.profiles_stale.store(stale, Ordering::Relaxed);
         if !configs.is_empty() {
             tracing::info!("blocklist: rebuilt {} profile(s)", configs.len());
         }
+    }
+
+    /// Does a refresh have work to do — a list past its cache lifetime or built
+    /// by another ferrite version, or a profile still on last run's map? The
+    /// scheduled refresh asks before fetching anything.
+    pub fn needs_refresh(&self) -> bool {
+        self.profiles_stale.load(Ordering::Relaxed)
+            || self.block.caches_stale()
+            || self.allow.caches_stale()
     }
 
     /// Like [`Self::rebuild_profiles`], but the FST merging runs on the
@@ -505,13 +529,16 @@ impl Blocklist {
                 &allow_dir,
                 merged.as_ref(),
                 allow_merged.as_ref(),
+                false,
             )
+            .0
         })
         .await;
         match compiled {
             Ok(compiled) => {
                 let count = compiled.len();
                 self.profiles.store(Arc::new(compiled));
+                self.profiles_stale.store(false, Ordering::Relaxed);
                 if count > 0 {
                     tracing::info!("blocklist: rebuilt {} profile(s)", count);
                 }
@@ -747,7 +774,7 @@ impl Blocklist {
         // and the compiled profiles off the same per-list FSTs. Clearing and
         // recompiling them here would cost seconds of CPU and a cold cache to
         // arrive at exactly what is already in place.
-        if block.changed || allow_changed {
+        if block.changed || allow_changed || self.profiles_stale.load(Ordering::Relaxed) {
             self.cache.clear();
             // The per-list FSTs just refreshed — recompile profiles off the fresh
             // subset caches so device profiles track list updates.

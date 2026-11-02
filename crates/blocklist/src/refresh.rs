@@ -483,6 +483,19 @@ pub(super) fn list_digest(dir: &Path, list_name: &str) -> Option<String> {
     (meta.version == CACHE_VERSION).then_some(meta.digest)
 }
 
+/// Is this list's cache usable as it stands: an FST younger than
+/// [`LIST_CACHE_TTL`] with a sidecar this version wrote? Synchronous, for the
+/// scheduler's hourly look — one stat and one small read.
+pub(super) fn cache_is_current(dir: &Path, list_name: &str) -> bool {
+    let cache = ListCache::new(dir, list_name);
+    let young = std::fs::metadata(&cache.fst)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .is_some_and(|age| age < LIST_CACHE_TTL);
+    young && list_digest(dir, list_name).is_some()
+}
+
 /// Turn a user-supplied list name into a safe filesystem component.
 pub(super) fn sanitize_name(name: &str) -> String {
     name.chars()

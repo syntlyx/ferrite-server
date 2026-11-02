@@ -1329,3 +1329,104 @@ fn a_pause_lifts_filtering_box_wide_or_for_one_device() {
     assert!(!bl.client_filtering_off_normalized("10.0.0.2", None));
     assert!(!bl.client_bypasses_blocking("10.0.0.2", Some("aa:bb:cc:dd:ee:ff")));
 }
+
+/// After an upgrade no list cache is trusted, so a profile's map can't be
+/// confirmed current. Startup must still not merge — it runs before DNS
+/// listens — but serve last run's map, and say a refresh is due. The refresh
+/// then rebuilds the profile even though no list moved.
+#[tokio::test]
+async fn startup_after_an_upgrade_serves_last_runs_profile_map_until_a_refresh() {
+    use ferrite_core::config::BlocklistProfileConfig;
+    use std::os::unix::fs::MetadataExt;
+
+    let fst_path = temp_fst_path("ferrite-profile-upgrade");
+    let dir = fst_path.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = |name: &str, body: &str| {
+        let path = dir.join(format!("{name}.txt"));
+        std::fs::write(&path, body).unwrap();
+        path
+    };
+    let ads = source("ads", "ads.example\n");
+    let track = source("track", "track.example\n");
+    let noisy = source("noisy", "noisy.example\n");
+    let list = |name: &str, path: &PathBuf| ListConfig {
+        name: name.into(),
+        url: format!("file://{}", path.display()),
+        enabled: true,
+    };
+    let config = || BlocklistConfig {
+        enabled: true,
+        decision_cache_size: 1000,
+        lists: vec![
+            list("Ads", &ads),
+            list("Track", &track),
+            list("Noisy", &noisy),
+        ],
+        domains: vec![],
+        wildcard_block: vec![],
+        whitelist: vec![],
+        client_bypass: vec![],
+        profiles: vec![BlocklistProfileConfig {
+            id: "kid".into(),
+            name: "Kid".into(),
+            lists: vec!["Ads".into(), "Track".into()],
+            clients: vec!["10.0.0.2".into()],
+            block: vec![],
+            allow: vec![],
+            allowlists: vec![],
+            default_deny: false,
+        }],
+    };
+
+    let first = Blocklist::new(config(), AllowlistConfig::default(), fst_path.clone());
+    first.refresh(false).await.unwrap();
+    assert!(!first.needs_refresh(), "everything was just built");
+    drop(first);
+
+    // Every per-list sidecar now claims another version, as after an upgrade.
+    let lists_dir = dir.join("lists");
+    for entry in std::fs::read_dir(&lists_dir).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if name.ends_with(".meta.json") && !name.starts_with("profile_") {
+            let text = std::fs::read_to_string(&path).unwrap();
+            let mut meta: serde_json::Value = serde_json::from_str(&text).unwrap();
+            meta["version"] = "0.0.0-older".into();
+            std::fs::write(&path, meta.to_string()).unwrap();
+        }
+    }
+    let profile_fst = lists_dir.join("profile_kid.fst");
+    let built = std::fs::metadata(&profile_fst).unwrap().ino();
+
+    let restarted = Blocklist::new(config(), AllowlistConfig::default(), fst_path);
+    assert!(restarted.load_from_disk());
+    assert_eq!(
+        std::fs::metadata(&profile_fst).unwrap().ino(),
+        built,
+        "startup must serve last run's map, not merge a new one"
+    );
+    let kid = restarted.profile_for("10.0.0.2", None);
+    assert!(restarted.should_block_for("ads.example", kid.as_deref()));
+    assert!(!restarted.should_block_for("noisy.example", kid.as_deref()));
+    assert!(
+        restarted.needs_refresh(),
+        "stale caches and a stand-in profile"
+    );
+
+    restarted.refresh(false).await.unwrap();
+    assert!(
+        !restarted.needs_refresh(),
+        "the refresh brought everything current"
+    );
+    // The lists' content didn't change, so last run's map is confirmed as it
+    // stands — no merge, only a fresh record of what went into it.
+    assert!(
+        lists_dir.join("profile_kid.meta.json").exists(),
+        "the profile's map is vouched for again"
+    );
+    let kid = restarted.profile_for("10.0.0.2", None);
+    assert!(restarted.should_block_for("track.example", kid.as_deref()));
+
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -218,6 +218,16 @@ impl Subscriptions {
         })
     }
 
+    /// Is any enabled list's cache past its lifetime, missing, or written by
+    /// another ferrite version? Cheap — a stat and a small read per list.
+    pub(crate) fn caches_stale(&self) -> bool {
+        self.lists
+            .read()
+            .iter()
+            .filter(|l| l.enabled)
+            .any(|l| !refresh::cache_is_current(&self.cache_dir, &l.name))
+    }
+
     /// The merged FST as an input for profile compilation — `None` unless the
     /// file on disk is the map currently being served.
     pub(crate) fn merged_set(&self) -> Option<MergedSet> {

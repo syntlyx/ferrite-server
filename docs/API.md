@@ -678,6 +678,8 @@ so every section applies.
 
 Remote blocklists that ferrite downloads and compiles into an FST. Per-list downloads are cached on disk for 12 hours; only expired or new lists hit the network on refresh.
 
+ferrite refreshes on its own: it looks hourly (first a minute after startup) and refreshes when any enabled list — blocklist or allowlist — is past those 12 hours, or its cache was built by another ferrite version, as after an upgrade. A refresh fetches conditionally and rebuilds nothing when nothing changed. The endpoints below force one now.
+
 ### `GET /api/lists`
 
 ```json
