@@ -988,6 +988,41 @@ profile. AdGuard rules with modifiers (`$client`, `$dnstype`, `$dnsrewrite`…),
 ClientIDs, DNSCrypt upstreams, per-client upstreams and the blocked-services
 pause schedule have no counterpart and are listed in `notes`.
 
+
+### Following a primary — `GET · PUT /api/sync`, `POST /api/sync/now`
+
+Two resolvers that answer alike, configured in one place. A **secondary**
+reads the primary's configuration (`GET /api/config/export`, with the
+primary's API key) every `interval` seconds and takes the chosen `sections`:
+
+| Section     | What comes over                                                                  |
+| ----------- | -------------------------------------------------------------------------------- |
+| `filtering` | Lists, allowlists, manual entries, services, SafeSearch, profiles, block answer   |
+| `records`   | Custom DNS records                                                                |
+| `devices`   | Device names                                                                      |
+| `dns`       | TTLs, log-ignore, ECS/DNSSEC, optimistic cache, rate limit, client access, upstreams, zones |
+| `tunnels`   | Egresses and rules — off by default: one WireGuard key on two boxes makes both tunnels flap |
+
+When that changes anything, the secondary writes its config and restarts —
+about a second, with the DNS cache carried across. Listeners, storage, the
+panel, passwords and keys, notifications, MCP and its own `[sync]` stay local.
+Nothing needs turning on on the primary but an API key.
+
+```json
+GET /api/sync
+{ "primary": "http://192.168.1.10", "api_key_set": true, "interval": 300,
+  "sections": ["filtering", "records", "devices", "dns"],
+  "status": { "last_attempt": 1793663347, "last_ok": 1793663347,
+              "last_change": 1793663329, "changed": ["filtering"], "error": null } }
+```
+
+`PUT /api/sync` takes `{ "primary": "…", "api_key": "…" | null, "interval": 300,
+"sections": [...] }` (`primary: ""` stops following; `api_key` absent keeps
+it). `POST /api/sync/now` syncs at once and answers with the view plus
+`restarting`; an unreachable primary or a refused key is `400` with the reason
+— and the same reason in `status.error` for the background syncs. A sync that
+would apply the same thing twice says so instead of restarting in a loop.
+
 ---
 
 ## Subscription Lists

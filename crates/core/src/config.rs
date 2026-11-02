@@ -58,6 +58,10 @@ pub struct Config {
     /// change — what ferrite does.
     #[serde(default)]
     pub mcp: McpConfig,
+    /// Follow another ferrite: this box takes the chosen parts of that one's
+    /// configuration, so two resolvers on one network answer alike.
+    #[serde(default, skip_serializing_if = "SyncConfig::is_off")]
+    pub sync: SyncConfig,
     /// Verbose debug-level logging for the `ferrite` target. **Off by default**:
     /// every DNS query and proxied connection emits a record, and each one costs
     /// two allocations, a process-wide ring-buffer lock and a stdout write — real
@@ -970,6 +974,7 @@ impl Default for Config {
             proxy: ProxyConfig::default(),
             notifications: NotificationsConfig::default(),
             mcp: McpConfig::default(),
+            sync: SyncConfig::default(),
             debug_logging: false,
             web_dir: None,
         }
@@ -987,6 +992,62 @@ pub struct McpConfig {
     /// Offer the tools that change things — block or allow a domain, pause
     /// filtering, block a service. Off: an assistant can look, not touch.
     pub allow_changes: bool,
+}
+
+/// `[sync]`: make this box a secondary that follows a primary ferrite. Every
+/// `interval` seconds it reads the primary's configuration (the export, with
+/// the primary's API key) and takes the chosen sections; when that changes
+/// anything here, it restarts to apply it — about a second, cache kept.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SyncConfig {
+    /// The primary's panel URL, e.g. `http://192.168.1.10`. Empty = this box
+    /// follows nobody.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub primary: String,
+    /// The primary's API key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// Seconds between syncs.
+    pub interval: u64,
+    /// What to take: `filtering` (lists, rules, services, SafeSearch,
+    /// profiles, block answer), `records`, `devices` (names), `dns` (TTLs,
+    /// upstreams, zones, access, cache), `tunnels`.
+    pub sections: Vec<SyncSection>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncSection {
+    Filtering,
+    Records,
+    Devices,
+    Dns,
+    /// Egresses and rules. Off by default: a WireGuard key in use on two
+    /// boxes at once makes both tunnels flap.
+    Tunnels,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            primary: String::new(),
+            api_key: None,
+            interval: 300,
+            sections: vec![
+                SyncSection::Filtering,
+                SyncSection::Records,
+                SyncSection::Devices,
+                SyncSection::Dns,
+            ],
+        }
+    }
+}
+
+impl SyncConfig {
+    pub fn is_off(&self) -> bool {
+        self.primary.is_empty()
+    }
 }
 
 /// Webhook notifications: one URL, POSTed an event for each kind that is

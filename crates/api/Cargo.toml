@@ -27,6 +27,7 @@ hyper.workspace = true
 hyper-util.workspace = true
 parking_lot.workspace = true
 hex.workspace = true
+reqwest.workspace = true
 ring.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

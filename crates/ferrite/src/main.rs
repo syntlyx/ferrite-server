@@ -243,6 +243,8 @@ async fn run() -> anyhow::Result<()> {
 
     // ── New-device notifications ─────────────────────────────────────────────
     tokio::spawn(new_device_loop(state.clone()));
+    // Following a primary ferrite, when `[sync]` names one.
+    tokio::spawn(ferrite_api::sync::run(state.clone()));
 
     // ── Selective routing / proxy ─────────────────────────────────────────────
     // Detached (not in the try_join! below) so a listener bind failure — :80/:443

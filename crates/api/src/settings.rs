@@ -45,6 +45,10 @@ pub async fn get_settings(State(state): State<AppState>) -> Result<Json<Value>, 
             json!(null)
         };
     }
+    // The primary's key, when this box follows one: shown as set, never read.
+    if let Some(key) = val.get_mut("sync").and_then(|s| s.get_mut("api_key")) {
+        *key = json!("***");
+    }
 
     Ok(Json(val))
 }
@@ -54,7 +58,7 @@ pub async fn get_settings(State(state): State<AppState>) -> Result<Json<Value>, 
 //   field = null → Some(None)    (clear the setting)
 //   field = T   → Some(Some(T)) (set to a new value)
 // Use together with #[serde(default)] so absent fields produce None.
-mod nullable {
+pub(crate) mod nullable {
     use serde::{Deserialize, Deserializer};
 
     pub fn deserialize<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>

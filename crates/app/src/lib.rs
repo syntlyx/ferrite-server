@@ -4,6 +4,7 @@
 
 pub mod sessions;
 pub mod snapshot;
+pub mod sync_status;
 
 #[cfg(any(test, feature = "testutil"))]
 pub mod test_support;
@@ -63,6 +64,10 @@ pub struct AppStateInner {
     pub query_semaphore: Arc<Semaphore>,
     /// Client access lists and the per-client rate limit. Hot-patchable.
     pub client_gate: Arc<ferrite_dns::gate::ClientGate>,
+    /// What following a primary ferrite has done lately (`[sync]`).
+    pub sync_status: Arc<parking_lot::Mutex<sync_status::SyncStatus>>,
+    /// Wakes the sync loop early — after its settings change, or "sync now".
+    pub sync_wake: Arc<Notify>,
 }
 
 /// Cheaply-cloneable application state handle, backed by `Arc<AppStateInner>`.
@@ -494,6 +499,8 @@ impl AppState {
             log_ignore: Arc::new(RwLock::new(config.dns.log_ignore.clone())),
             client_ttl: Arc::new(AtomicU32::new(config.dns.client_ttl)),
             client_gate: Arc::new(ferrite_dns::gate::ClientGate::new(&config.dns)),
+            sync_status: Arc::new(parking_lot::Mutex::new(sync_status::SyncStatus::load())),
+            sync_wake: Arc::new(Notify::new()),
             record_switches,
             query_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
         });

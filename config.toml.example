@@ -420,6 +420,20 @@ domains = [
 # format  = "telegram"
 # chat_id = "123456789"
 
+# ── Following a primary (two resolvers that answer alike) ────────────────────
+# This box takes the chosen parts of another ferrite's configuration every
+# `interval` seconds, with that box's API key, and restarts for about a second
+# when something changed. Sections: filtering, records, devices, dns, tunnels
+# (tunnels only if this box routes too — one WireGuard key on two boxes makes
+# both tunnels flap). Edit on the primary; changes made here to those sections
+# are replaced on the next sync.
+#
+# [sync]
+# primary  = "http://192.168.1.10"
+# api_key  = "<the primary's API key>"
+# interval = 300
+# sections = ["filtering", "records", "devices", "dns"]
+
 # ── MCP (AI assistants) ───────────────────────────────────────────────────────
 # /api/mcp lets an assistant such as Claude Code read what ferrite is doing,
 # using the API key. Off by default; allow_changes also lets it block, allow

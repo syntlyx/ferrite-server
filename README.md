@@ -52,6 +52,11 @@ upstream's queries can themselves ride a tunnel. EDNS Client Subnet is stripped,
 DNSSEC is requested, local zones can be forwarded to your router, and custom
 `A` / `AAAA` / `CNAME` records (exact or wildcard) answer first.
 
+**Two resolvers, one setup.** A second ferrite can follow the first: it takes
+the chosen parts of its configuration — filtering, records, names, DNS
+settings — every few minutes, so devices given both resolvers get the same
+answers from either, and you edit in one place.
+
 **Coming from Pi-hole or AdGuard Home?** Settings → System reads a Pi-hole v6
 Teleporter export or an `AdGuardHome.yaml` and shows what comes over — lists,
 rules, local records, groups and per-device settings, blocked services — and

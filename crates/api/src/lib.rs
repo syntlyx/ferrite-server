@@ -21,6 +21,7 @@ pub mod services;
 pub mod settings;
 pub mod stats;
 pub mod storage;
+pub mod sync;
 pub mod system;
 pub mod tools;
 pub mod update;
@@ -122,6 +123,9 @@ pub fn build_router(state: AppState) -> Router {
         // Whole-config backup and restore
         .route("/config/export", get(backup::export_config))
         .route("/config/import", post(backup::import_config))
+        // Follow a primary ferrite
+        .route("/sync", get(sync::get_sync).put(sync::put_sync))
+        .route("/sync/now", post(sync::sync_now))
         // Bring a Pi-hole or AdGuard Home setup over (a Teleporter archive
         // can run to a few MiB, past the default body limit)
         .route(
