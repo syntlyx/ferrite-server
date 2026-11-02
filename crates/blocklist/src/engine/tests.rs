@@ -1,4 +1,7 @@
 use super::*;
+use crate::{AdblockStats, loader, refresh};
+use ferrite_core::config::ListConfig;
+use fst::Map;
 
 fn temp_fst_path(name: &str) -> PathBuf {
     let unique = format!(
@@ -88,8 +91,16 @@ fn load_from_disk_restores_per_list_counts_and_stats_from_cache() {
 
     assert!(blocklist.load_from_disk());
     // Per-list count + Adblock stats restored from cache — no network refresh.
-    assert_eq!(blocklist.domain_count("My List"), Some(2));
-    let restored = blocklist.parse_stats("My List").expect("stats restored");
+    assert_eq!(
+        blocklist
+            .subscriptions(ListPolarity::Block)
+            .domain_count("My List"),
+        Some(2)
+    );
+    let restored = blocklist
+        .subscriptions(ListPolarity::Block)
+        .parse_stats("My List")
+        .expect("stats restored");
     assert_eq!(restored.kept, 2);
     assert_eq!(restored.exceptions, 1);
 }
@@ -543,7 +554,12 @@ async fn subscribed_allowlist_exempts_blocked_domains() {
     assert!(!blocklist.should_block_for("cdn.example", None));
     assert!(!blocklist.should_block_for("static.cdn.example", None));
     assert!(blocklist.is_whitelisted_normalized("cdn.example"));
-    assert_eq!(blocklist.allow_domain_count("Allow"), Some(1));
+    assert_eq!(
+        blocklist
+            .subscriptions(ListPolarity::Allow)
+            .domain_count("Allow"),
+        Some(1)
+    );
 
     // Explain attributes the exemption to its source allowlist by name and
     // still reports the (overridden) block source.
@@ -556,7 +572,7 @@ async fn subscribed_allowlist_exempts_blocked_domains() {
     assert!(!e.sources.is_empty());
 
     // Removing the allowlist takes effect on the next refresh.
-    assert!(blocklist.remove_allow_list("Allow"));
+    assert!(blocklist.subscriptions(ListPolarity::Allow).remove("Allow"));
     blocklist.refresh(false).await.unwrap();
     assert!(blocklist.should_block_for("cdn.example", None));
 }
@@ -652,7 +668,12 @@ fn load_from_disk_restores_allowlist_fst_and_counts() {
     // allow tier wins, straight from the disk caches (no refresh).
     assert!(blocklist.is_whitelisted_normalized("cdn.example"));
     assert!(!blocklist.should_block_for("cdn.example", None));
-    assert_eq!(blocklist.allow_domain_count("Allow"), Some(1));
+    assert_eq!(
+        blocklist
+            .subscriptions(ListPolarity::Allow)
+            .domain_count("Allow"),
+        Some(1)
+    );
 }
 
 #[test]
@@ -714,17 +735,36 @@ fn allow_list_crud_mirrors_blocklist_semantics() {
         url: "https://x.test/allow".into(),
         enabled: true,
     };
-    blocklist.add_allow_list(cfg.clone()).unwrap();
+    blocklist
+        .subscriptions(ListPolarity::Allow)
+        .add(cfg.clone())
+        .unwrap();
     assert!(
-        blocklist.add_allow_list(cfg).is_err(),
+        blocklist
+            .subscriptions(ListPolarity::Allow)
+            .add(cfg)
+            .is_err(),
         "duplicate name must be rejected"
     );
-    assert!(blocklist.set_allow_list_enabled("Allow", false));
-    assert!(!blocklist.get_allow_lists()[0].enabled);
-    assert!(!blocklist.set_allow_list_enabled("Ghost", false));
-    assert!(blocklist.remove_allow_list("Allow"));
-    assert!(!blocklist.remove_allow_list("Allow"));
-    assert!(blocklist.get_allow_lists().is_empty());
+    assert!(
+        blocklist
+            .subscriptions(ListPolarity::Allow)
+            .set_enabled("Allow", false)
+    );
+    assert!(!blocklist.subscriptions(ListPolarity::Allow).lists()[0].enabled);
+    assert!(
+        !blocklist
+            .subscriptions(ListPolarity::Allow)
+            .set_enabled("Ghost", false)
+    );
+    assert!(blocklist.subscriptions(ListPolarity::Allow).remove("Allow"));
+    assert!(!blocklist.subscriptions(ListPolarity::Allow).remove("Allow"));
+    assert!(
+        blocklist
+            .subscriptions(ListPolarity::Allow)
+            .lists()
+            .is_empty()
+    );
 }
 
 #[tokio::test]

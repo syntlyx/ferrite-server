@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 
 use crate::ApiError;
 use ferrite_app::AppState;
+use ferrite_blocklist::ListPolarity;
 use ferrite_core::config::BlocklistProfileConfig;
 use ferrite_core::error::FeriteError;
 
@@ -23,14 +24,16 @@ pub async fn get_profiles(State(state): State<AppState>) -> Json<Value> {
     let available_lists: Vec<String> = state
         .inner
         .blocklist
-        .get_lists()
+        .subscriptions(ListPolarity::Block)
+        .lists()
         .into_iter()
         .map(|l| l.name)
         .collect();
     let available_allowlists: Vec<String> = state
         .inner
         .blocklist
-        .get_allow_lists()
+        .subscriptions(ListPolarity::Allow)
+        .lists()
         .into_iter()
         .map(|l| l.name)
         .collect();
@@ -49,14 +52,16 @@ pub async fn put_profiles(
     let known: HashSet<String> = state
         .inner
         .blocklist
-        .get_lists()
+        .subscriptions(ListPolarity::Block)
+        .lists()
         .into_iter()
         .map(|l| l.name)
         .collect();
     let known_allow: HashSet<String> = state
         .inner
         .blocklist
-        .get_allow_lists()
+        .subscriptions(ListPolarity::Allow)
+        .lists()
         .into_iter()
         .map(|l| l.name)
         .collect();
@@ -171,7 +176,8 @@ mod tests {
         state
             .inner
             .blocklist
-            .add_allow_list(ferrite_core::config::ListConfig {
+            .subscriptions(ListPolarity::Allow)
+            .add(ferrite_core::config::ListConfig {
                 name: "KidSafe".into(),
                 url: "https://x.test/kidsafe".into(),
                 enabled: true,
@@ -231,7 +237,8 @@ mod tests {
         state
             .inner
             .blocklist
-            .add_list(ferrite_core::config::ListConfig {
+            .subscriptions(ListPolarity::Block)
+            .add(ferrite_core::config::ListConfig {
                 name: "Ads".into(),
                 url: "https://x.test/ads".into(),
                 enabled: true,

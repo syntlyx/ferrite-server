@@ -1,51 +1,23 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwap;
-use fst::Map;
 use parking_lot::RwLock;
 use regex::Regex;
 
+use crate::ListPolarity;
 use crate::cache::BlocklistCache;
-use crate::loader::{self, FstMap, empty_fst};
+use crate::loader::FstMap;
 use crate::names::{
     has_suffix, is_registrable_or_deeper, matched_key, normalise, wildcard_to_regex,
 };
 use crate::profiles::{CompiledProfile, compile_profiles};
-use crate::{AdblockStats, ListPolarity, refresh};
-use ferrite_core::config::{AllowlistConfig, BlocklistConfig, ListConfig};
-use ferrite_core::error::{FeriteError, Result};
+use crate::subscriptions::Subscriptions;
+use ferrite_core::config::{AllowlistConfig, BlocklistConfig};
+use ferrite_core::error::Result;
 use ferrite_core::net::normalize_client_key;
-
-/// What [`refresh_list_set`] hands back.
-struct ListSetRefresh {
-    fst: FstMap,
-    /// Per-list domain counts and Adblock parse stats, for the API.
-    counts: HashMap<String, usize>,
-    stats: HashMap<String, AdblockStats>,
-    unique_count: usize,
-    /// `false` when every list still matched the fingerprints the merged FST on
-    /// disk was built from — the merge was skipped and nothing downstream (the
-    /// decision cache, the compiled profiles) needs rebuilding either.
-    changed: bool,
-    /// `fst` is the mmap of `merged_path`, so a profile covering exactly the
-    /// same lists can map that file instead of merging them a second time.
-    persisted: bool,
-}
-
-/// Sidecar next to a merged FST — the global one or a profile's — recording the
-/// per-list fingerprints it was built from. A compile whose lists all report the
-/// same fingerprints can serve the file as it stands: the union would only
-/// reproduce it.
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
-pub(crate) struct FstInputs {
-    /// `(sanitised list name, digest)`, sorted — an added, removed or changed
-    /// list all show up as a difference.
-    pub(crate) inputs: Vec<(String, String)>,
-}
-const MAX_CONCURRENT_LIST_REFRESHES: usize = 2;
 
 /// A diagnostic explanation of why a domain is (or isn't) blocked — produced by
 /// [`Blocklist::explain`] for the Tools UI. Built off the DNS hot path: it scans
@@ -87,17 +59,6 @@ pub struct BlockSource {
     pub matched: String,
 }
 
-/// The hot-swappable core data: the merged subscription FST.
-///
-/// Manual block patterns are *not* here — they live in `blacklist` /
-/// `blacklist_wildcards`, which the API can also remove from. Config-sourced
-/// entries used to be compiled into a second, parallel wildcard set here, which
-/// meant an entry written in the file could be matched but never listed or
-/// deleted through the UI. One set, one lifecycle.
-struct BlocklistData {
-    fst: FstMap,
-}
-
 /// Thread-safe blocklist engine.
 ///
 /// - FST map: atomically swappable, built from all enabled remote lists.
@@ -108,7 +69,17 @@ pub struct Blocklist {
     enabled: AtomicBool,
     has_client_bypass: AtomicBool,
     has_profiles: AtomicBool,
-    data: ArcSwap<BlocklistData>,
+    /// Subscribed blocklists and their merged FST — the subscription tier of
+    /// the block decision.
+    ///
+    /// Manual block patterns are *not* here — they live in `blacklist` /
+    /// `blacklist_wildcards`, which the API can also remove from. Config-sourced
+    /// entries used to be compiled into a second, parallel wildcard set, which
+    /// meant an entry written in the file could be matched but never listed or
+    /// deleted through the UI. One set, one lifecycle.
+    block: Subscriptions,
+    /// Subscribed allowlists — the same decision tier as the manual whitelist.
+    allow: Subscriptions,
     /// Per-device profiles (each a subset-of-lists FST + private cache), compiled
     /// from `profiles_config` and the on-disk per-list FSTs. Rebuilt on refresh,
     /// on startup load, and when the profile set changes via the API.
@@ -123,47 +94,17 @@ pub struct Blocklist {
     blacklist: RwLock<HashSet<String>>,
     blacklist_wildcards: RwLock<Vec<(String, Regex)>>,
     cache: BlocklistCache,
-    lists: RwLock<Vec<ListConfig>>,
-    /// Domain count per list name, updated after each refresh.
-    domain_counts: RwLock<HashMap<String, usize>>,
-    /// Adblock parse breakdown per list name (only for Adblock-format lists),
-    /// updated after each refresh. Explains the rules-vs-domains gap in the UI.
-    adblock_stats: RwLock<HashMap<String, AdblockStats>>,
-    /// Merged FST of all subscribed allowlists — the same decision tier as the
-    /// manual whitelist, hot-swapped on refresh like `data`.
-    allow_fst: ArcSwap<FstMap>,
-    /// Remote allowlist subscriptions, mutable at runtime like `lists`.
-    allow_lists: RwLock<Vec<ListConfig>>,
-    /// Domain count per allowlist name, updated after each refresh.
-    allow_domain_counts: RwLock<HashMap<String, usize>>,
-    /// Adblock parse breakdown per allowlist name (Adblock-format lists only).
-    allow_adblock_stats: RwLock<HashMap<String, AdblockStats>>,
     /// Configured `[[zones]]` suffixes (normalised), exempt from profile
     /// default-deny alongside the built-in local suffixes. Set once at startup
     /// via [`Self::set_local_zones`] (zones are restart-required config).
     local_zones: RwLock<Vec<String>>,
     /// Serialises [`Self::refresh`] so concurrent API-triggered refreshes don't
-    /// race on `data`/`domain_counts` or pile up duplicate network fetches.
+    /// race on the swapped FSTs and counts or pile up duplicate network fetches.
     refresh_lock: tokio::sync::Mutex<()>,
-    fst_path: PathBuf,
-    list_cache_dir: PathBuf,
-    /// Merged allowlist FST on disk, sibling of `fst_path` (`allowlist.fst`).
-    allow_fst_path: PathBuf,
-    /// Per-allowlist cache dir, separate from `list_cache_dir` so a blocklist
-    /// and an allowlist with the same name can't collide on a cache file.
-    allow_cache_dir: PathBuf,
-    /// `true` while the merged FST being served *is* the mmap of `fst_path`.
-    /// Then a profile whose lists are exactly the enabled set can map that same
-    /// file instead of merging the very same inputs a second time.
-    merged_on_disk: AtomicBool,
-    /// The allowlist half of `merged_on_disk`.
-    allow_merged_on_disk: AtomicBool,
 }
 
 impl Blocklist {
     pub fn new(config: BlocklistConfig, allowlist: AllowlistConfig, fst_path: PathBuf) -> Self {
-        let empty = empty_fst();
-
         let client_bypass: HashSet<String> = normalize_client_keys(&config.client_bypass)
             .into_iter()
             .collect();
@@ -207,24 +148,27 @@ impl Blocklist {
             })
             .collect();
 
-        let list_cache_dir = fst_path
-            .parent()
-            .map(|p| p.join("lists"))
-            .unwrap_or_else(|| PathBuf::from("lists"));
-        let allow_cache_dir = fst_path
-            .parent()
-            .map(|p| p.join("allowlists"))
-            .unwrap_or_else(|| PathBuf::from("allowlists"));
-        let allow_fst_path = fst_path
-            .parent()
-            .map(|p| p.join("allowlist.fst"))
-            .unwrap_or_else(|| PathBuf::from("allowlist.fst"));
+        // Per-list caches and the merged allowlist sit beside the merged blocklist.
+        let dir = fst_path.parent().unwrap_or(Path::new("")).to_path_buf();
+        let block = Subscriptions::new(
+            ListPolarity::Block,
+            config.lists,
+            fst_path,
+            dir.join("lists"),
+        );
+        let allow = Subscriptions::new(
+            ListPolarity::Allow,
+            allowlist.lists,
+            dir.join("allowlist.fst"),
+            dir.join("allowlists"),
+        );
 
         Self {
             enabled: AtomicBool::new(config.enabled),
             has_client_bypass: AtomicBool::new(!client_bypass.is_empty()),
             has_profiles: AtomicBool::new(!config.profiles.is_empty()),
-            data: ArcSwap::from_pointee(BlocklistData { fst: empty }),
+            block,
+            allow,
             profiles: ArcSwap::from_pointee(Vec::new()),
             profiles_config: RwLock::new(config.profiles),
             client_bypass: ArcSwap::from_pointee(client_bypass),
@@ -233,21 +177,8 @@ impl Blocklist {
             blacklist: RwLock::new(blacklist),
             blacklist_wildcards: RwLock::new(blacklist_wildcards),
             cache: BlocklistCache::new(config.decision_cache_size),
-            lists: RwLock::new(config.lists),
-            domain_counts: RwLock::new(HashMap::new()),
-            adblock_stats: RwLock::new(HashMap::new()),
-            allow_fst: ArcSwap::from_pointee(empty_fst()),
-            allow_lists: RwLock::new(allowlist.lists),
-            allow_domain_counts: RwLock::new(HashMap::new()),
-            allow_adblock_stats: RwLock::new(HashMap::new()),
             local_zones: RwLock::new(Vec::new()),
             refresh_lock: tokio::sync::Mutex::new(()),
-            fst_path,
-            list_cache_dir,
-            allow_fst_path,
-            allow_cache_dir,
-            merged_on_disk: AtomicBool::new(false),
-            allow_merged_on_disk: AtomicBool::new(false),
         }
     }
 
@@ -257,16 +188,9 @@ impl Blocklist {
     /// invalid — the caller then runs a refresh, which reuses whatever per-list
     /// caches are still fresh.
     pub fn load_from_disk(&self) -> bool {
-        if !self.fst_path.exists() {
-            return false; // first boot — nothing cached yet
-        }
-        match loader::mmap_fst(&self.fst_path) {
-            Ok(fst) => {
-                let count = fst.len();
-                self.data.store(Arc::new(BlocklistData { fst }));
-                self.merged_on_disk.store(true, Ordering::Relaxed);
+        match self.block.load_merged() {
+            Ok(Some(count)) => {
                 self.cache.clear();
-                self.restore_list_stats_from_cache();
                 // Settled before the profiles compile: both merged FSTs are then
                 // known to be the files on disk, which is what lets a profile
                 // covering every list map one instead of rebuilding it.
@@ -278,6 +202,7 @@ impl Blocklist {
                 tracing::info!("blocklist loaded from disk: {} domains", count);
                 allow_ok
             }
+            Ok(None) => false, // first boot — nothing cached yet
             Err(e) => {
                 tracing::warn!("cached FST on disk is invalid, will re-fetch: {}", e);
                 false
@@ -292,21 +217,15 @@ impl Blocklist {
     /// [`Self::load_from_disk`] report a miss so startup triggers a refresh —
     /// which is cheap for the blocklists, whose per-list caches are still fresh.
     fn load_allow_from_disk(&self) -> bool {
-        let configured = !self.allow_lists.read().is_empty();
-        if !self.allow_fst_path.exists() {
-            return !configured;
-        }
-        match loader::mmap_fst(&self.allow_fst_path) {
-            Ok(fst) => {
-                let count = fst.len();
-                self.allow_fst.store(Arc::new(fst));
-                self.allow_merged_on_disk.store(true, Ordering::Relaxed);
-                self.restore_allow_stats_from_cache();
+        let configured = self.allow.is_configured();
+        match self.allow.load_merged() {
+            Ok(Some(count)) => {
                 if configured || count > 0 {
                     tracing::info!("allowlist loaded from disk: {} domains", count);
                 }
                 true
             }
+            Ok(None) => !configured,
             Err(e) => {
                 tracing::warn!(
                     "cached allowlist FST on disk is invalid, will re-fetch: {}",
@@ -314,62 +233,6 @@ impl Blocklist {
                 );
                 !configured
             }
-        }
-    }
-
-    /// Restore per-list domain counts and Adblock parse stats from the on-disk
-    /// caches the last refresh wrote (`<list>.fst` / `<list>.stats.json` under the
-    /// list cache dir). `load_from_disk` only loads the merged FST, so without this
-    /// the Lists page would show blank counts/stats after a restart until the next
-    /// refresh repopulated them over the network. Read-only and synchronous —
-    /// missing/garbage caches are simply skipped, and a later refresh overwrites
-    /// these with authoritative values.
-    fn restore_list_stats_from_cache(&self) {
-        let lists: Vec<ListConfig> = self.lists.read().iter().cloned().collect();
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        let mut stats: HashMap<String, AdblockStats> = HashMap::new();
-        for list in &lists {
-            let safe = refresh::sanitize_name(&list.name);
-            // Count = entries in the per-list FST (exactly what a refresh records).
-            if let Ok(map) = loader::mmap_fst(&self.list_cache_dir.join(format!("{safe}.fst"))) {
-                counts.insert(list.name.clone(), map.len());
-            }
-            if let Ok(bytes) = std::fs::read(self.list_cache_dir.join(format!("{safe}.stats.json")))
-                && let Ok(s) = serde_json::from_slice::<AdblockStats>(&bytes)
-            {
-                stats.insert(list.name.clone(), s);
-            }
-        }
-        if !counts.is_empty() {
-            *self.domain_counts.write() = counts;
-        }
-        if !stats.is_empty() {
-            *self.adblock_stats.write() = stats;
-        }
-    }
-
-    /// Allowlist counterpart of [`Self::restore_list_stats_from_cache`].
-    fn restore_allow_stats_from_cache(&self) {
-        let lists: Vec<ListConfig> = self.allow_lists.read().iter().cloned().collect();
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        let mut stats: HashMap<String, AdblockStats> = HashMap::new();
-        for list in &lists {
-            let safe = refresh::sanitize_name(&list.name);
-            if let Ok(map) = loader::mmap_fst(&self.allow_cache_dir.join(format!("{safe}.fst"))) {
-                counts.insert(list.name.clone(), map.len());
-            }
-            if let Ok(bytes) =
-                std::fs::read(self.allow_cache_dir.join(format!("{safe}.stats.json")))
-                && let Ok(s) = serde_json::from_slice::<AdblockStats>(&bytes)
-            {
-                stats.insert(list.name.clone(), s);
-            }
-        }
-        if !counts.is_empty() {
-            *self.allow_domain_counts.write() = counts;
-        }
-        if !stats.is_empty() {
-            *self.allow_adblock_stats.write() = stats;
         }
     }
 
@@ -433,8 +296,7 @@ impl Blocklist {
         if let Some(cached) = self.cache.get(domain) {
             return cached;
         }
-        let data = self.data.load();
-        let result = self.check_blocked_in(domain, &data.fst);
+        let result = self.check_blocked_in(domain, &self.block.fst());
         self.cache.insert(domain, result);
         result
     }
@@ -642,10 +504,10 @@ impl Blocklist {
         let configs = self.profiles_config.read().clone();
         let compiled = compile_profiles(
             &configs,
-            &self.list_cache_dir,
-            &self.allow_cache_dir,
-            self.merged_set().as_ref(),
-            self.allow_merged_set().as_ref(),
+            self.block.cache_dir(),
+            self.allow.cache_dir(),
+            self.block.merged_set().as_ref(),
+            self.allow.merged_set().as_ref(),
         );
         self.profiles.store(Arc::new(compiled));
         if !configs.is_empty() {
@@ -659,10 +521,10 @@ impl Blocklist {
     /// On a join error the previous compiled set stays in place.
     pub async fn rebuild_profiles_off_thread(&self) {
         let configs = self.profiles_config.read().clone();
-        let list_dir = self.list_cache_dir.clone();
-        let allow_dir = self.allow_cache_dir.clone();
-        let merged = self.merged_set();
-        let allow_merged = self.allow_merged_set();
+        let list_dir = self.block.cache_dir().to_path_buf();
+        let allow_dir = self.allow.cache_dir().to_path_buf();
+        let merged = self.block.merged_set();
+        let allow_merged = self.allow.merged_set();
         let compiled = tokio::task::spawn_blocking(move || {
             compile_profiles(
                 &configs,
@@ -683,27 +545,6 @@ impl Blocklist {
             }
             Err(e) => tracing::error!("profile rebuild task panicked, keeping previous set: {}", e),
         }
-    }
-
-    /// The merged block FST as an input for profile compilation — `None` unless
-    /// the file on disk is the map currently being served.
-    fn merged_set(&self) -> Option<MergedSet> {
-        self.merged_on_disk
-            .load(Ordering::Relaxed)
-            .then(|| MergedSet {
-                path: self.fst_path.clone(),
-                names: enabled_list_names(&self.lists.read()),
-            })
-    }
-
-    /// Allowlist counterpart of [`Self::merged_set`].
-    fn allow_merged_set(&self) -> Option<MergedSet> {
-        self.allow_merged_on_disk
-            .load(Ordering::Relaxed)
-            .then(|| MergedSet {
-                path: self.allow_fst_path.clone(),
-                names: enabled_list_names(&self.allow_lists.read()),
-            })
     }
 
     /// Returns `true` if `domain` is explicitly whitelisted (exact or wildcard
@@ -773,7 +614,7 @@ impl Blocklist {
         match profile.and_then(|p| p.allow_fst.as_ref()) {
             Some(fst) => matched_key(domain, |k| fst.contains_key(k.as_bytes())).is_some(),
             None => {
-                let allow = self.allow_fst.load();
+                let allow = self.allow.fst();
                 !allow.is_empty()
                     && matched_key(domain, |k| allow.contains_key(k.as_bytes())).is_some()
             }
@@ -815,30 +656,18 @@ impl Blocklist {
         }
         // Subscription lists: scan each enabled list's own on-disk FST so the
         // match attributes to a specific list (the merged hot-path FST can't).
-        let lists = self.lists.read().clone();
         let mut list_matched = false;
-        for list in lists.iter().filter(|l| l.enabled) {
-            let path = self
-                .list_cache_dir
-                .join(format!("{}.fst", refresh::sanitize_name(&list.name)));
-            let Ok(map) = loader::mmap_fst(&path) else {
-                continue;
-            };
-            if let Some(key) = matched_key(&domain, |k| map.contains_key(k.as_bytes())) {
-                list_matched = true;
-                sources.push(BlockSource {
-                    kind: "list".into(),
-                    name: list.name.clone(),
-                    matched: key,
-                });
-            }
+        for (name, key) in self.block.attribute(&domain) {
+            list_matched = true;
+            sources.push(BlockSource {
+                kind: "list".into(),
+                name,
+                matched: key,
+            });
         }
         // Fallback: the merged FST matches but no per-list file attributed it
         // (e.g. a source file is missing) — still report the block.
-        if !list_matched
-            && let Some(key) =
-                matched_key(&domain, |k| self.data.load().fst.contains_key(k.as_bytes()))
-        {
+        if !list_matched && let Some(key) = self.block.merged_match(&domain) {
             sources.push(BlockSource {
                 kind: "list".into(),
                 name: "subscription (source file unavailable)".into(),
@@ -882,26 +711,16 @@ impl Blocklist {
                 });
             }
         }
-        let allow_lists = self.allow_lists.read().clone();
-        for list in allow_lists.iter().filter(|l| l.enabled) {
-            let path = self
-                .allow_cache_dir
-                .join(format!("{}.fst", refresh::sanitize_name(&list.name)));
-            let Ok(map) = loader::mmap_fst(&path) else {
-                continue;
-            };
-            if let Some(key) = matched_key(domain, |k| map.contains_key(k.as_bytes())) {
-                return Some(MatchInfo {
-                    entry: key.clone(),
-                    matched: key,
-                    list: Some(list.name.clone()),
-                });
-            }
+        if let Some((name, key)) = self.allow.attribute(domain).next() {
+            return Some(MatchInfo {
+                entry: key.clone(),
+                matched: key,
+                list: Some(name),
+            });
         }
         // Fallback: the merged allow FST matches but no per-list file attributed
         // it (e.g. a source file is missing) — still report the exemption.
-        let allow = self.allow_fst.load();
-        if let Some(key) = matched_key(domain, |k| allow.contains_key(k.as_bytes())) {
+        if let Some(key) = self.allow.merged_match(domain) {
             return Some(MatchInfo {
                 entry: key.clone(),
                 matched: key,
@@ -998,93 +817,13 @@ impl Blocklist {
         result
     }
 
-    // ── Subscription list management ─────────────────────────────────────────
+    // ── Subscriptions ────────────────────────────────────────────────────────
 
-    pub fn get_lists(&self) -> Vec<ListConfig> {
-        self.lists.read().clone()
-    }
-
-    pub fn domain_count(&self, name: &str) -> Option<usize> {
-        self.domain_counts.read().get(name).copied()
-    }
-
-    /// Adblock parse breakdown for `name`, if it is an Adblock-format list and
-    /// has been refreshed at least once. `None` for hosts/plain lists.
-    pub fn parse_stats(&self, name: &str) -> Option<AdblockStats> {
-        self.adblock_stats.read().get(name).copied()
-    }
-
-    pub fn add_list(&self, cfg: ListConfig) -> Result<()> {
-        let mut lists = self.lists.write();
-        if lists.iter().any(|l| l.name == cfg.name) {
-            return Err(FeriteError::Config(format!(
-                "list '{}' already exists",
-                cfg.name
-            )));
-        }
-        lists.push(cfg);
-        Ok(())
-    }
-
-    pub fn remove_list(&self, name: &str) -> bool {
-        let mut lists = self.lists.write();
-        let before = lists.len();
-        lists.retain(|l| l.name != name);
-        lists.len() < before
-    }
-
-    pub fn set_list_enabled(&self, name: &str, enabled: bool) -> bool {
-        let mut lists = self.lists.write();
-        if let Some(l) = lists.iter_mut().find(|l| l.name == name) {
-            l.enabled = enabled;
-            true
-        } else {
-            false
-        }
-    }
-
-    // ── Allowlist subscription management ────────────────────────────────────
-
-    pub fn get_allow_lists(&self) -> Vec<ListConfig> {
-        self.allow_lists.read().clone()
-    }
-
-    pub fn allow_domain_count(&self, name: &str) -> Option<usize> {
-        self.allow_domain_counts.read().get(name).copied()
-    }
-
-    /// Adblock parse breakdown for allowlist `name` (Adblock-format lists only —
-    /// there `kept` counts the `@@` exception domains harvested as allows).
-    pub fn allow_parse_stats(&self, name: &str) -> Option<AdblockStats> {
-        self.allow_adblock_stats.read().get(name).copied()
-    }
-
-    pub fn add_allow_list(&self, cfg: ListConfig) -> Result<()> {
-        let mut lists = self.allow_lists.write();
-        if lists.iter().any(|l| l.name == cfg.name) {
-            return Err(FeriteError::Config(format!(
-                "allowlist '{}' already exists",
-                cfg.name
-            )));
-        }
-        lists.push(cfg);
-        Ok(())
-    }
-
-    pub fn remove_allow_list(&self, name: &str) -> bool {
-        let mut lists = self.allow_lists.write();
-        let before = lists.len();
-        lists.retain(|l| l.name != name);
-        lists.len() < before
-    }
-
-    pub fn set_allow_list_enabled(&self, name: &str, enabled: bool) -> bool {
-        let mut lists = self.allow_lists.write();
-        if let Some(l) = lists.iter_mut().find(|l| l.name == name) {
-            l.enabled = enabled;
-            true
-        } else {
-            false
+    /// The subscription set of `polarity` — the blocklists or the allowlists.
+    pub fn subscriptions(&self, polarity: ListPolarity) -> &Subscriptions {
+        match polarity {
+            ListPolarity::Block => &self.block,
+            ListPolarity::Allow => &self.allow,
         }
     }
 
@@ -1104,50 +843,26 @@ impl Blocklist {
         // interleave their `data`/`domain_counts` stores. One at a time.
         let _refresh_guard = self.refresh_lock.lock().await;
 
-        let lists: Vec<ListConfig> = self
-            .lists
-            .read()
-            .iter()
-            .filter(|l| l.enabled)
-            .cloned()
-            .collect();
-
-        let set = refresh_list_set(
-            &lists,
-            &self.list_cache_dir,
-            &self.fst_path,
-            force,
-            ListPolarity::Block,
-        )
-        .await?;
-        let unique_count = set.unique_count;
-
-        // Install the new FST and its domain counts together so a reader never
-        // sees counts from one refresh paired with the FST of another.
-        self.data.store(Arc::new(BlocklistData { fst: set.fst }));
-        *self.domain_counts.write() = set.counts;
-        *self.adblock_stats.write() = set.stats;
-        self.merged_on_disk.store(set.persisted, Ordering::Relaxed);
-
+        let block = self.block.refresh(force).await?;
         let allow_changed = self.refresh_allowlists(force).await;
 
         // Nothing moved: the decision cache is still answering off the same sets,
         // and the compiled profiles off the same per-list FSTs. Clearing and
         // recompiling them here would cost seconds of CPU and a cold cache to
         // arrive at exactly what is already in place.
-        if set.changed || allow_changed {
+        if block.changed || allow_changed {
             self.cache.clear();
             // The per-list FSTs just refreshed — recompile profiles off the fresh
             // subset caches so device profiles track list updates.
             self.rebuild_profiles_off_thread().await;
-            tracing::info!("blocklist refreshed: {} unique domains", unique_count);
+            tracing::info!("blocklist refreshed: {} unique domains", block.unique_count);
         } else {
             tracing::info!(
                 "blocklist unchanged: {} unique domains, nothing rebuilt",
-                unique_count
+                block.unique_count
             );
         }
-        Ok(unique_count)
+        Ok(block.unique_count)
     }
 
     /// Allowlist half of [`Self::refresh`] — same pipeline, opposite polarity.
@@ -1157,42 +872,20 @@ impl Blocklist {
     ///
     /// Returns `true` when the allow set actually moved.
     async fn refresh_allowlists(&self, force: bool) -> bool {
-        let lists: Vec<ListConfig> = self
-            .allow_lists
-            .read()
-            .iter()
-            .filter(|l| l.enabled)
-            .cloned()
-            .collect();
-
+        let has_enabled = self.allow.has_enabled();
         // Nothing subscribed and nothing persisted → keep the in-memory empty
         // FST and don't create cache dirs/files for an unused feature. (With a
         // stale merged file still on disk the rebuild below runs and overwrites
         // it with an empty FST, so removing the last allowlist takes effect.)
-        if lists.is_empty() && !self.allow_fst_path.exists() {
+        if !has_enabled && !self.allow.merged_path().exists() {
             return false;
         }
-
-        match refresh_list_set(
-            &lists,
-            &self.allow_cache_dir,
-            &self.allow_fst_path,
-            force,
-            ListPolarity::Allow,
-        )
-        .await
-        {
+        match self.allow.refresh(force).await {
             Ok(set) => {
-                let changed = set.changed;
-                self.allow_fst.store(Arc::new(set.fst));
-                *self.allow_domain_counts.write() = set.counts;
-                *self.allow_adblock_stats.write() = set.stats;
-                self.allow_merged_on_disk
-                    .store(set.persisted, Ordering::Relaxed);
-                if !lists.is_empty() && changed {
+                if has_enabled && set.changed {
                     tracing::info!("allowlist refreshed: {} unique domains", set.unique_count);
                 }
-                changed
+                set.changed
             }
             Err(e) => {
                 tracing::error!(
@@ -1204,8 +897,9 @@ impl Blocklist {
         }
     }
 
+    /// Unique domains in the merged blocklist FST.
     pub fn blocked_count(&self) -> u64 {
-        self.data.load().fst.len() as u64
+        self.block.fst().len() as u64
     }
 
     /// Decision-cache entry count (memory introspection).
@@ -1217,236 +911,6 @@ impl Blocklist {
     pub fn invalidate(&self, domain: &str) {
         self.cache.invalidate(domain);
     }
-}
-
-/// Fetch every enabled list in `lists` (at most [`MAX_CONCURRENT_LIST_REFRESHES`]
-/// at a time), resolve each to a per-list FST under `cache_dir`, k-way-merge
-/// them, and atomically persist + mmap the merged FST at `merged_path`. Shared
-/// by the blocklist and allowlist halves of [`Blocklist::refresh`]; `polarity`
-/// only changes how Adblock-format content is parsed.
-///
-/// Errors when every list failed and nothing is cached — the caller decides
-/// whether that is fatal.
-async fn refresh_list_set(
-    lists: &[ListConfig],
-    cache_dir: &Path,
-    merged_path: &Path,
-    force: bool,
-    polarity: ListPolarity,
-) -> Result<ListSetRefresh> {
-    let _ = tokio::fs::create_dir_all(cache_dir).await;
-    let refresh_permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LIST_REFRESHES));
-
-    let tasks: Vec<_> = lists
-        .iter()
-        .map(|list| {
-            let name = list.name.clone();
-            let url = list.url.clone();
-            let permits = Arc::clone(&refresh_permits);
-            let cache = refresh::ListCache::new(cache_dir, &list.name);
-            tokio::spawn(async move {
-                let Ok(_permit) = permits.acquire_owned().await else {
-                    return refresh::ListOutcome::skipped();
-                };
-                refresh::load_or_build_list_fst(name, url, cache, force, polarity).await
-            })
-        })
-        .collect();
-
-    let mut per_list_fsts: Vec<refresh::ListFst> = Vec::with_capacity(lists.len());
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    let mut stats: HashMap<String, AdblockStats> = HashMap::new();
-    // What this refresh would merge, for the sidecar. A list that couldn't prove
-    // what its FST holds turns this into `None`, and the merge then has to run.
-    // A list that contributed nothing at all is simply absent — so does it stay
-    // in the recorded set, which is why a permanently failing list doesn't force
-    // a merge on every refresh.
-    let mut fingerprint: Option<Vec<(String, String)>> = Some(Vec::with_capacity(lists.len()));
-
-    for task in tasks {
-        let outcome = task.await.unwrap_or_else(|e| {
-            tracing::error!("list task panicked: {}", e);
-            refresh::ListOutcome::skipped()
-        });
-        if outcome.name.is_empty() {
-            continue;
-        }
-        match (fingerprint.as_mut(), &outcome.digest) {
-            (Some(inputs), Some(digest)) => {
-                inputs.push((refresh::sanitize_name(&outcome.name), digest.clone()))
-            }
-            _ => fingerprint = None,
-        }
-        if let Some(list_stats) = outcome.stats {
-            stats.insert(outcome.name.clone(), list_stats);
-        }
-        counts.insert(outcome.name, outcome.count);
-        per_list_fsts.push(outcome.fst);
-    }
-
-    if !lists.is_empty() && per_list_fsts.is_empty() {
-        let label = match polarity {
-            ListPolarity::Block => "blocklists",
-            ListPolarity::Allow => "allowlists",
-        };
-        return Err(FeriteError::Fst(format!(
-            "all enabled {label} failed and no cached domains are available"
-        )));
-    }
-
-    // Nothing that went into the merged FST moved, so the file on disk is still
-    // precisely what the union would produce. Map it and skip the merge — on a
-    // Pi-class box that is tens of seconds, every refresh, for an identical file.
-    if let Some(inputs) = fingerprint.as_mut() {
-        inputs.sort();
-        if load_merged_meta(merged_path)
-            .await
-            .is_some_and(|meta| meta.inputs == *inputs)
-            && let Ok(fst) = loader::mmap_fst(merged_path)
-        {
-            let unique_count = fst.len();
-            tracing::info!(
-                "merged FST unchanged ({} domains), skipping merge",
-                unique_count
-            );
-            return Ok(ListSetRefresh {
-                fst,
-                counts,
-                stats,
-                unique_count,
-                changed: false,
-                persisted: true,
-            });
-        }
-    }
-
-    let merged_path_owned = merged_path.to_path_buf();
-    let (fst, unique_count, persisted) =
-        tokio::task::spawn_blocking(move || -> Result<(FstMap, usize, bool)> {
-            // Open every input as a Map first — File sources mmap straight from
-            // the per-list cache, so the k-way union streams them out of the page
-            // cache instead of holding each list's bytes in RAM.
-            let mut maps: Vec<FstMap> = Vec::with_capacity(per_list_fsts.len());
-            for src in per_list_fsts {
-                let map = match src {
-                    refresh::ListFst::File(p) => loader::mmap_fst(&p),
-                    refresh::ListFst::Ram(b) => loader::ram_fst(b),
-                };
-                match map {
-                    Ok(m) => maps.push(m),
-                    // A cache file that vanished between fetch and merge is
-                    // skipped this refresh, like any other per-list failure.
-                    Err(e) => tracing::warn!("skipping list FST in merge: {}", e),
-                }
-            }
-            if let Some(parent) = merged_path_owned.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            // Merged straight into the temporary file: the union streams out of the
-            // page cache and into the disk, never existing as a second copy in RAM.
-            let tmp = merged_path_owned.with_extension("fst.tmp");
-            let (unique_count, ram_bytes) = match loader::merge_fsts_file(&maps, &tmp)? {
-                loader::BuiltFst::File(count) => (count, None),
-                loader::BuiltFst::Ram(bytes) => {
-                    let count = Map::new(bytes.as_slice())
-                        .map_err(|e| FeriteError::Fst(e.to_string()))?
-                        .len();
-                    (count, Some(bytes))
-                }
-            };
-            let persisted =
-                ram_bytes.is_none() && std::fs::rename(&tmp, &merged_path_owned).is_ok();
-            let fst = if persisted {
-                tracing::info!("merged FST saved to {}", merged_path_owned.display());
-                // Serve from the mmap'd file: the merged map then sits in the
-                // page cache (evictable) instead of RSS-pinned RAM.
-                loader::mmap_fst(&merged_path_owned)
-                    .or_else(|_| loader::merge_fsts(&maps).and_then(loader::ram_fst))?
-            } else {
-                // Either the merge never reached the disk, or the rename did not.
-                let bytes = match ram_bytes {
-                    Some(bytes) => bytes,
-                    None => loader::merge_fsts(&maps)?,
-                };
-                let _ = std::fs::remove_file(&tmp);
-                loader::ram_fst(bytes)?
-            };
-            // `persisted` says the rename landed, which is what the sidecar and
-            // the profile shortcut key off: the file then *is* this merge, even
-            // in the branch above where mapping it failed and we serve the RAM
-            // copy instead. A reader that can't map it falls back the same way.
-            Ok((fst, unique_count, persisted))
-        })
-        .await
-        .map_err(|e| FeriteError::Internal(e.to_string()))??;
-
-    match (persisted, fingerprint) {
-        (true, Some(inputs)) => save_merged_meta(merged_path, &FstInputs { inputs }).await,
-        // The file on disk isn't what we're serving, or we can't vouch for what
-        // went into it — then no sidecar may claim otherwise.
-        _ => {
-            let _ = tokio::fs::remove_file(meta_path(merged_path)).await;
-        }
-    }
-
-    Ok(ListSetRefresh {
-        fst,
-        counts,
-        stats,
-        unique_count,
-        changed: true,
-        persisted,
-    })
-}
-
-/// Sidecar path for an FST: `blocklist.fst` → `blocklist.meta.json`.
-pub(crate) fn meta_path(fst_path: &Path) -> PathBuf {
-    fst_path.with_extension("meta.json")
-}
-
-async fn load_merged_meta(merged_path: &Path) -> Option<FstInputs> {
-    let bytes = tokio::fs::read(meta_path(merged_path)).await.ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-async fn save_merged_meta(merged_path: &Path, meta: &FstInputs) {
-    let path = meta_path(merged_path);
-    match serde_json::to_vec(meta) {
-        Ok(bytes) => {
-            if let Err(e) = tokio::fs::write(&path, bytes).await {
-                tracing::warn!("could not write merged meta {}: {}", path.display(), e);
-            }
-        }
-        Err(e) => tracing::warn!("could not serialise merged meta: {}", e),
-    }
-}
-
-/// The merged FST on disk, plus the lists that went into it.
-pub(crate) struct MergedSet {
-    pub(crate) path: PathBuf,
-    /// Sanitised names — the granularity the cache files, and the merge, use.
-    names: BTreeSet<String>,
-}
-
-impl MergedSet {
-    /// `true` when `lists` names exactly what the merged FST holds.
-    pub(crate) fn covers(&self, lists: &[String]) -> bool {
-        lists
-            .iter()
-            .map(|name| refresh::sanitize_name(name))
-            .collect::<BTreeSet<String>>()
-            == self.names
-    }
-}
-
-/// Sanitised names of the enabled lists in `lists` — what a merge of them would
-/// be recorded as.
-fn enabled_list_names(lists: &[ListConfig]) -> BTreeSet<String> {
-    lists
-        .iter()
-        .filter(|l| l.enabled)
-        .map(|l| refresh::sanitize_name(&l.name))
-        .collect()
 }
 
 pub(crate) fn normalize_client_keys(entries: &[String]) -> Vec<String> {

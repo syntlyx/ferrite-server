@@ -28,6 +28,7 @@ use axum::{
 use tower_http::trace::TraceLayer;
 
 use ferrite_app::AppState;
+use ferrite_blocklist::ListPolarity;
 
 /// Build the full Axum router with all API routes.
 pub fn build_router(state: AppState) -> Router {
@@ -72,20 +73,10 @@ pub fn build_router(state: AppState) -> Router {
         // Per-device blocking profiles (replace-whole-set, like /api/proxy)
         .route("/blocklist/profiles", get(profiles::get_profiles))
         .route("/blocklist/profiles", put(profiles::put_profiles))
-        // Remote list subscriptions
-        .route("/lists", get(lists::list_lists))
-        .route("/lists", post(lists::add_list))
-        .route("/lists/{name}", delete(lists::del_list))
-        .route("/lists/{name}", patch(lists::patch_list))
-        .route("/lists/refresh", post(lists::refresh_all_lists))
-        .route("/lists/{name}/refresh", post(lists::refresh_list))
-        // Remote allowlist subscriptions (mirror of /lists, opposite polarity)
-        .route("/allowlists", get(lists::list_allowlists))
-        .route("/allowlists", post(lists::add_allowlist))
-        .route("/allowlists/{name}", delete(lists::del_allowlist))
-        .route("/allowlists/{name}", patch(lists::patch_allowlist))
-        .route("/allowlists/refresh", post(lists::refresh_all_allowlists))
-        .route("/allowlists/{name}/refresh", post(lists::refresh_allowlist))
+        // Remote list subscriptions: blocklists and allowlists share one set
+        // of handlers, the polarity picks the set.
+        .merge(lists::routes("/lists", ListPolarity::Block))
+        .merge(lists::routes("/allowlists", ListPolarity::Allow))
         // Custom DNS records (A / AAAA / CNAME overrides)
         .route("/custom-records", get(custom_records::list_records))
         .route("/custom-records", post(custom_records::add_record))
@@ -301,6 +292,79 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
+    }
+
+    async fn json_body(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// `/lists` and `/allowlists` share one set of handlers; each mount must
+    /// act on its own subscription set, and both stay behind the API key.
+    #[tokio::test]
+    async fn list_routes_act_on_their_own_polarity_behind_auth() {
+        let (state, db_path) = test_support::app_state("api-list-routes").await;
+        state
+            .inner
+            .blocklist
+            .subscriptions(ListPolarity::Block)
+            .add(ferrite_core::config::ListConfig {
+                name: "Ads".into(),
+                url: "https://x.test/ads".into(),
+                enabled: true,
+            })
+            .unwrap();
+        let app = build_router(state.clone());
+
+        let names = |body: serde_json::Value| -> Vec<String> {
+            body["lists"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|l| l["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let block = app.clone().oneshot(request("/api/lists")).await.unwrap();
+        assert_eq!(block.status(), StatusCode::OK);
+        assert_eq!(names(json_body(block).await), ["Ads"]);
+        let allow = app
+            .clone()
+            .oneshot(request("/api/allowlists"))
+            .await
+            .unwrap();
+        assert_eq!(allow.status(), StatusCode::OK);
+        assert!(names(json_body(allow).await).is_empty());
+
+        // "Ads" is a blocklist: the allowlist mount must not find it.
+        let patch = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/allowlists/Ads")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"enabled":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(patch.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            json_body(patch).await["error"],
+            "not found: allowlist 'Ads' not found"
+        );
+
+        state.live_config.write().api.api_key = Some("secret-key".to_string());
+        let app = build_router(state.clone());
+        for uri in ["/api/lists", "/api/allowlists"] {
+            let response = app.clone().oneshot(request(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
 
         drop(state);
         test_support::cleanup_sqlite(&db_path);

@@ -8,10 +8,11 @@ use std::sync::Arc;
 use regex::Regex;
 
 use crate::cache::BlocklistCache;
-use crate::engine::{FstInputs, MergedSet, meta_path, normalize_client_keys};
+use crate::engine::normalize_client_keys;
 use crate::loader::{self, FstMap, empty_fst};
 use crate::names::{domain_in_set, normalise, wildcard_to_regex};
 use crate::refresh;
+use crate::subscriptions::{FstInputs, MergedSet, meta_path};
 
 /// Decision-cache size for a per-device profile. Smaller than the global cache
 /// (there are usually only a handful of profiles, each seeing one device's

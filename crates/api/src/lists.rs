@@ -1,18 +1,66 @@
+//! Remote list subscriptions: `/api/lists` for blocklists and `/api/allowlists`
+//! for allowlists. One set of handlers serves both; the polarity bound in
+//! [`routes`] picks which subscription set they act on.
+
 use std::sync::Arc;
 
 use axum::{
-    Json,
+    Json, Router,
     extract::{Path, State},
     http::StatusCode,
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::ApiError;
 use ferrite_app::AppState;
-use ferrite_blocklist::{AdblockStats, Blocklist};
+use ferrite_blocklist::{AdblockStats, ListPolarity, Subscriptions};
 use ferrite_core::config::ListConfig;
 use ferrite_core::error::FeriteError;
+
+/// The subscription routes for one polarity, mounted under `prefix`:
+///
+/// - `GET    {prefix}` — every subscription with its live counts
+/// - `POST   {prefix}` — add one and refresh in the background
+/// - `DELETE {prefix}/{name}` — remove one and rebuild
+/// - `PATCH  {prefix}/{name}` — enable or disable without removing
+/// - `POST   {prefix}/refresh` — re-fetch everything (both polarities) now
+/// - `POST   {prefix}/{name}/refresh` — the same, answering for one list
+pub fn routes(prefix: &str, polarity: ListPolarity) -> Router<AppState> {
+    Router::new()
+        .route(
+            prefix,
+            get(move |state: State<AppState>| list(state, polarity)).post(
+                move |state: State<AppState>, Json(payload): Json<AddListPayload>| {
+                    add(state, payload, polarity)
+                },
+            ),
+        )
+        .route(
+            &format!("{prefix}/refresh"),
+            post(move |state: State<AppState>| refresh_all(state, polarity)),
+        )
+        .route(
+            &format!("{prefix}/{{name}}"),
+            axum::routing::delete(move |state: State<AppState>, Path(name): Path<String>| {
+                remove(state, name, polarity)
+            })
+            .patch(
+                move |state: State<AppState>,
+                      Path(name): Path<String>,
+                      Json(payload): Json<PatchListPayload>| {
+                    set_enabled(state, name, payload, polarity)
+                },
+            ),
+        )
+        .route(
+            &format!("{prefix}/{{name}}/refresh"),
+            post(move |state: State<AppState>, Path(name): Path<String>| {
+                refresh_one(state, name, polarity)
+            }),
+        )
+}
 
 /// `ListConfig` enriched with the live domain count from the last refresh, plus
 /// the Adblock parse breakdown for Adblock-format lists (absent otherwise).
@@ -27,36 +75,58 @@ struct ListInfo {
     parse_stats: Option<AdblockStats>,
 }
 
-fn to_list_info(cfg: &ListConfig, bl: &Blocklist) -> ListInfo {
+fn to_list_info(cfg: &ListConfig, subs: &Subscriptions) -> ListInfo {
     ListInfo {
         name: cfg.name.clone(),
         url: cfg.url.clone(),
         enabled: cfg.enabled,
-        domains_loaded: bl.domain_count(&cfg.name),
-        parse_stats: bl.parse_stats(&cfg.name),
+        domains_loaded: subs.domain_count(&cfg.name),
+        parse_stats: subs.parse_stats(&cfg.name),
     }
 }
 
-fn to_allow_list_info(cfg: &ListConfig, bl: &Blocklist) -> ListInfo {
-    ListInfo {
-        name: cfg.name.clone(),
-        url: cfg.url.clone(),
-        enabled: cfg.enabled,
-        domains_loaded: bl.allow_domain_count(&cfg.name),
-        parse_stats: bl.allow_parse_stats(&cfg.name),
-    }
-}
-
-/// GET /api/lists — enumerate all configured blocklist subscriptions
-pub async fn list_lists(State(state): State<AppState>) -> Json<Value> {
-    let lists: Vec<ListInfo> = state
-        .inner
-        .blocklist
-        .get_lists()
+fn all_list_info(subs: &Subscriptions) -> Vec<ListInfo> {
+    subs.lists()
         .iter()
-        .map(|cfg| to_list_info(cfg, &state.inner.blocklist))
-        .collect();
-    Json(json!({ "lists": lists }))
+        .map(|cfg| to_list_info(cfg, subs))
+        .collect()
+}
+
+fn not_found(polarity: ListPolarity, name: &str) -> ApiError {
+    ApiError(FeriteError::NotFound(format!(
+        "{} '{}' not found",
+        polarity.noun(),
+        name
+    )))
+}
+
+/// Rebuild the FSTs off the request, so a list change answers right away and
+/// still takes effect as soon as the fetch and merge are done.
+fn refresh_in_background(state: &AppState, what: String) {
+    let blocklist = Arc::clone(&state.inner.blocklist);
+    tokio::spawn(async move {
+        if let Err(e) = blocklist.refresh(false).await {
+            tracing::error!("refresh after {} failed: {}", what, e);
+        }
+    });
+}
+
+/// Sync the current in-memory subscription sets (block and allow) into
+/// `live_config` and save to disk.
+async fn sync_lists_to_config(state: &AppState) {
+    {
+        let blocklist = &state.inner.blocklist;
+        let mut cfg = state.live_config.write();
+        cfg.blocklist.lists = blocklist.subscriptions(ListPolarity::Block).lists();
+        cfg.allowlist.lists = blocklist.subscriptions(ListPolarity::Allow).lists();
+    }
+
+    state.persist_config().await;
+}
+
+async fn list(State(state): State<AppState>, polarity: ListPolarity) -> Json<Value> {
+    let subs = state.inner.blocklist.subscriptions(polarity);
+    Json(json!({ "lists": all_list_info(subs) }))
 }
 
 #[derive(Deserialize)]
@@ -66,10 +136,10 @@ pub struct AddListPayload {
     pub enabled: Option<bool>,
 }
 
-/// POST /api/lists — add a new subscription list and trigger a refresh
-pub async fn add_list(
+async fn add(
     State(state): State<AppState>,
-    Json(payload): Json<AddListPayload>,
+    payload: AddListPayload,
+    polarity: ListPolarity,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     // SSRF / local-file-read guard: validate the user-supplied URL before it is
     // persisted or fetched. Config-defined lists (incl. file://) bypass this by
@@ -77,336 +147,108 @@ pub async fn add_list(
     ferrite_blocklist::loader::validate_remote_list_url(&payload.url).await?;
 
     let cfg = ListConfig {
-        url: payload.url.clone(),
-        name: payload.name.clone(),
+        url: payload.url,
+        name: payload.name,
         enabled: payload.enabled.unwrap_or(true),
     };
 
-    state.inner.blocklist.add_list(cfg.clone())?;
-    tracing::info!("added blocklist '{}' ({})", cfg.name, cfg.url);
+    let subs = state.inner.blocklist.subscriptions(polarity);
+    subs.add(cfg.clone())?;
+    tracing::info!("added {} '{}' ({})", polarity.noun(), cfg.name, cfg.url);
 
-    // Persist to config file.
     sync_lists_to_config(&state).await;
-
-    // Trigger a background refresh so the new list is loaded immediately.
-    {
-        let blocklist = Arc::clone(&state.inner.blocklist);
-        tokio::spawn(async move {
-            if let Err(e) = blocklist.refresh(false).await {
-                tracing::error!("refresh after add_list failed: {}", e);
-            }
-        });
-    }
+    // Load the new list right away.
+    refresh_in_background(&state, format!("adding {} '{}'", polarity.noun(), cfg.name));
 
     Ok((
         StatusCode::CREATED,
-        Json(json!({ "list": to_list_info(&cfg, &state.inner.blocklist) })),
+        Json(json!({ "list": to_list_info(&cfg, subs) })),
     ))
 }
 
-/// DELETE /api/lists/:name — remove a list and rebuild the FST
-pub async fn del_list(
+async fn remove(
     State(state): State<AppState>,
-    Path(name): Path<String>,
+    name: String,
+    polarity: ListPolarity,
 ) -> Result<Json<Value>, ApiError> {
-    if !state.inner.blocklist.remove_list(&name) {
-        return Err(ApiError(FeriteError::NotFound(format!(
-            "list '{}' not found",
-            name
-        ))));
+    if !state.inner.blocklist.subscriptions(polarity).remove(&name) {
+        return Err(not_found(polarity, &name));
     }
-    tracing::info!("removed blocklist '{}'", name);
+    tracing::info!("removed {} '{}'", polarity.noun(), name);
 
-    // Persist to config file.
     sync_lists_to_config(&state).await;
-
-    // Rebuild FST without the removed list.
-    {
-        let blocklist = Arc::clone(&state.inner.blocklist);
-        tokio::spawn(async move {
-            if let Err(e) = blocklist.refresh(false).await {
-                tracing::error!("refresh after del_list failed: {}", e);
-            }
-        });
-    }
+    // Rebuild the FST without the removed list.
+    refresh_in_background(&state, format!("removing {} '{}'", polarity.noun(), name));
 
     Ok(Json(json!({ "name": name, "status": "removed" })))
 }
 
-/// Sync the current in-memory subscription sets (block and allow) into
-/// `live_config` and save to disk.
-async fn sync_lists_to_config(state: &AppState) {
-    {
-        let mut cfg = state.live_config.write();
-        cfg.blocklist.lists = state.inner.blocklist.get_lists();
-        cfg.allowlist.lists = state.inner.blocklist.get_allow_lists();
-    }
-
-    state.persist_config().await;
-}
-
-/// PATCH /api/lists/:name — enable or disable a list without removing it
 #[derive(Deserialize, Serialize)]
 pub struct PatchListPayload {
     pub enabled: bool,
 }
 
-pub async fn patch_list(
+async fn set_enabled(
     State(state): State<AppState>,
-    Path(name): Path<String>,
-    Json(payload): Json<PatchListPayload>,
+    name: String,
+    payload: PatchListPayload,
+    polarity: ListPolarity,
 ) -> Result<Json<Value>, ApiError> {
-    if !state
-        .inner
-        .blocklist
-        .set_list_enabled(&name, payload.enabled)
-    {
-        return Err(ApiError(FeriteError::NotFound(format!(
-            "list '{}' not found",
-            name
-        ))));
+    let subs = state.inner.blocklist.subscriptions(polarity);
+    if !subs.set_enabled(&name, payload.enabled) {
+        return Err(not_found(polarity, &name));
     }
-    tracing::info!(
-        "blocklist '{}' {}",
-        name,
-        if payload.enabled {
-            "enabled"
-        } else {
-            "disabled"
-        }
-    );
-
-    sync_lists_to_config(&state).await;
-
-    // Rebuild FST: disabling a list should remove its domains immediately,
-    // enabling should add them back.
-    {
-        let blocklist = Arc::clone(&state.inner.blocklist);
-        tokio::spawn(async move {
-            if let Err(e) = blocklist.refresh(false).await {
-                tracing::error!("refresh after patch_list failed: {}", e);
-            }
-        });
-    }
-
-    let updated = state
-        .inner
-        .blocklist
-        .get_lists()
-        .iter()
-        .find(|l| l.name == name)
-        .map(|cfg| to_list_info(cfg, &state.inner.blocklist));
-    Ok(Json(json!({ "list": updated })))
-}
-
-/// POST /api/lists/refresh — re-fetch all lists and rebuild FST
-pub async fn refresh_all_lists(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    state.inner.blocklist.refresh(true).await?;
-    let lists: Vec<ListInfo> = state
-        .inner
-        .blocklist
-        .get_lists()
-        .iter()
-        .map(|cfg| to_list_info(cfg, &state.inner.blocklist))
-        .collect();
-    Ok(Json(json!({ "lists": lists })))
-}
-
-/// POST /api/lists/:name/refresh — re-fetch a specific list and rebuild FST
-pub async fn refresh_list(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let exists = state
-        .inner
-        .blocklist
-        .get_lists()
-        .iter()
-        .any(|l| l.name == name);
-
-    if !exists {
-        return Err(ApiError(FeriteError::NotFound(format!(
-            "list '{}' not found",
-            name
-        ))));
-    }
-
-    state.inner.blocklist.refresh(true).await?;
-    let count = state.inner.blocklist.domain_count(&name);
-    let parse_stats = state.inner.blocklist.parse_stats(&name);
-    Ok(Json(json!({
-        "name": name,
-        "domains_loaded": count,
-        "parse_stats": parse_stats,
-    })))
-}
-
-// ── Allowlist subscriptions ───────────────────────────────────────────────────
-// Mirrors of the blocklist handlers above, populating the allow decision set
-// (domains exempted from blocking) instead of the block set.
-
-/// GET /api/allowlists — enumerate all configured allowlist subscriptions
-pub async fn list_allowlists(State(state): State<AppState>) -> Json<Value> {
-    let lists: Vec<ListInfo> = state
-        .inner
-        .blocklist
-        .get_allow_lists()
-        .iter()
-        .map(|cfg| to_allow_list_info(cfg, &state.inner.blocklist))
-        .collect();
-    Json(json!({ "lists": lists }))
-}
-
-/// POST /api/allowlists — add a new allowlist subscription and trigger a refresh
-pub async fn add_allowlist(
-    State(state): State<AppState>,
-    Json(payload): Json<AddListPayload>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
-    // Same SSRF / local-file-read guard as blocklist subscriptions.
-    ferrite_blocklist::loader::validate_remote_list_url(&payload.url).await?;
-
-    let cfg = ListConfig {
-        url: payload.url.clone(),
-        name: payload.name.clone(),
-        enabled: payload.enabled.unwrap_or(true),
+    let state_word = if payload.enabled {
+        "enabled"
+    } else {
+        "disabled"
     };
-
-    state.inner.blocklist.add_allow_list(cfg.clone())?;
-    tracing::info!("added allowlist '{}' ({})", cfg.name, cfg.url);
+    tracing::info!("{} '{}' {}", polarity.noun(), name, state_word);
 
     sync_lists_to_config(&state).await;
-
-    {
-        let blocklist = Arc::clone(&state.inner.blocklist);
-        tokio::spawn(async move {
-            if let Err(e) = blocklist.refresh(false).await {
-                tracing::error!("refresh after add_allowlist failed: {}", e);
-            }
-        });
-    }
-
-    Ok((
-        StatusCode::CREATED,
-        Json(json!({ "list": to_allow_list_info(&cfg, &state.inner.blocklist) })),
-    ))
-}
-
-/// DELETE /api/allowlists/:name — remove an allowlist and rebuild the allow FST
-pub async fn del_allowlist(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    if !state.inner.blocklist.remove_allow_list(&name) {
-        return Err(ApiError(FeriteError::NotFound(format!(
-            "allowlist '{}' not found",
-            name
-        ))));
-    }
-    tracing::info!("removed allowlist '{}'", name);
-
-    sync_lists_to_config(&state).await;
-
-    {
-        let blocklist = Arc::clone(&state.inner.blocklist);
-        tokio::spawn(async move {
-            if let Err(e) = blocklist.refresh(false).await {
-                tracing::error!("refresh after del_allowlist failed: {}", e);
-            }
-        });
-    }
-
-    Ok(Json(json!({ "name": name, "status": "removed" })))
-}
-
-/// PATCH /api/allowlists/:name — enable or disable an allowlist without removing it
-pub async fn patch_allowlist(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-    Json(payload): Json<PatchListPayload>,
-) -> Result<Json<Value>, ApiError> {
-    if !state
-        .inner
-        .blocklist
-        .set_allow_list_enabled(&name, payload.enabled)
-    {
-        return Err(ApiError(FeriteError::NotFound(format!(
-            "allowlist '{}' not found",
-            name
-        ))));
-    }
-    tracing::info!(
-        "allowlist '{}' {}",
-        name,
-        if payload.enabled {
-            "enabled"
-        } else {
-            "disabled"
-        }
+    // Disabling a list should remove its domains immediately, enabling should
+    // add them back.
+    refresh_in_background(
+        &state,
+        format!("{} {} '{}'", state_word, polarity.noun(), name),
     );
 
-    sync_lists_to_config(&state).await;
-
-    {
-        let blocklist = Arc::clone(&state.inner.blocklist);
-        tokio::spawn(async move {
-            if let Err(e) = blocklist.refresh(false).await {
-                tracing::error!("refresh after patch_allowlist failed: {}", e);
-            }
-        });
-    }
-
-    let updated = state
-        .inner
-        .blocklist
-        .get_allow_lists()
+    let updated = subs
+        .lists()
         .iter()
         .find(|l| l.name == name)
-        .map(|cfg| to_allow_list_info(cfg, &state.inner.blocklist));
+        .map(|cfg| to_list_info(cfg, subs));
     Ok(Json(json!({ "list": updated })))
 }
 
-/// POST /api/allowlists/refresh — re-fetch all lists (block and allow) and
-/// rebuild the FSTs; responds with the allowlist set.
-pub async fn refresh_all_allowlists(
+/// Re-fetch every list — one pass rebuilds both polarities — and answer with
+/// this polarity's set.
+async fn refresh_all(
     State(state): State<AppState>,
+    polarity: ListPolarity,
 ) -> Result<Json<Value>, ApiError> {
     state.inner.blocklist.refresh(true).await?;
-    let lists: Vec<ListInfo> = state
-        .inner
-        .blocklist
-        .get_allow_lists()
-        .iter()
-        .map(|cfg| to_allow_list_info(cfg, &state.inner.blocklist))
-        .collect();
-    Ok(Json(json!({ "lists": lists })))
+    let subs = state.inner.blocklist.subscriptions(polarity);
+    Ok(Json(json!({ "lists": all_list_info(subs) })))
 }
 
-/// POST /api/allowlists/:name/refresh — re-fetch a specific allowlist
-pub async fn refresh_allowlist(
+/// Re-fetch every list, answering for one of them. A single list can't be
+/// refreshed on its own: the merged FST is rebuilt from the whole set.
+async fn refresh_one(
     State(state): State<AppState>,
-    Path(name): Path<String>,
+    name: String,
+    polarity: ListPolarity,
 ) -> Result<Json<Value>, ApiError> {
-    let exists = state
-        .inner
-        .blocklist
-        .get_allow_lists()
-        .iter()
-        .any(|l| l.name == name);
-
-    if !exists {
-        return Err(ApiError(FeriteError::NotFound(format!(
-            "allowlist '{}' not found",
-            name
-        ))));
+    let subs = state.inner.blocklist.subscriptions(polarity);
+    if !subs.lists().iter().any(|l| l.name == name) {
+        return Err(not_found(polarity, &name));
     }
 
     state.inner.blocklist.refresh(true).await?;
-    let count = state.inner.blocklist.allow_domain_count(&name);
-    let parse_stats = state.inner.blocklist.allow_parse_stats(&name);
     Ok(Json(json!({
         "name": name,
-        "domains_loaded": count,
-        "parse_stats": parse_stats,
+        "domains_loaded": subs.domain_count(&name),
+        "parse_stats": subs.parse_stats(&name),
     })))
 }
 
@@ -421,18 +263,26 @@ mod tests {
 
         // The same SSRF/local-file guard as blocklist subscriptions must apply.
         for url in ["file:///etc/passwd", "http://127.0.0.1/allow.txt"] {
-            let res = add_allowlist(
+            let res = add(
                 State(state.clone()),
-                Json(AddListPayload {
+                AddListPayload {
                     url: url.into(),
                     name: "x".into(),
                     enabled: None,
-                }),
+                },
+                ListPolarity::Allow,
             )
             .await;
             assert!(res.is_err(), "expected {url} to be rejected");
         }
-        assert!(state.inner.blocklist.get_allow_lists().is_empty());
+        assert!(
+            state
+                .inner
+                .blocklist
+                .subscriptions(ListPolarity::Allow)
+                .lists()
+                .is_empty()
+        );
 
         drop(state);
         test_support::cleanup_sqlite(&db_path);
