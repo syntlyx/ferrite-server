@@ -32,8 +32,8 @@ use ferrite_core::recording::RecordScope;
 use ferrite_core::types::{QueryEntry, QueryStatus, TimeseriesBucket};
 
 use crate::{
-    ClientStats, LegacyConfigRows, QueryFilter, SizeTrim, Storage, StoredDevice, StoredSession,
-    SummaryStats, align_bucket,
+    ClientStats, DeviceActivity, DeviceDomain, LegacyConfigRows, QueryFilter, SizeTrim, Storage,
+    StoredDevice, StoredSession, SummaryStats, align_bucket,
 };
 
 /// Rough live size of one retained entry: the struct, plus its heap strings
@@ -394,6 +394,60 @@ impl Storage for MemoryStorage {
             stats.last_seen = stats.last_seen.max(agg.last_seen);
         }
         Ok(found.then_some(stats))
+    }
+
+    async fn device_domains(
+        &self,
+        device: &str,
+        from_ts: i64,
+        n: usize,
+        blocked_first: bool,
+    ) -> Result<Vec<DeviceDomain>> {
+        let inner = self.inner.read();
+        let mut by_domain: HashMap<&str, (u64, u64)> = HashMap::new();
+        for q in inner
+            .queries
+            .iter()
+            .filter(|q| q.device == device && q.timestamp.timestamp() >= from_ts)
+        {
+            let e = by_domain.entry(q.domain.as_str()).or_default();
+            e.0 += 1;
+            e.1 += u64::from(q.status == QueryStatus::Blocked);
+        }
+        let mut rows: Vec<DeviceDomain> = by_domain
+            .into_iter()
+            .filter(|(_, (_, blocked))| !blocked_first || *blocked > 0)
+            .map(|(domain, (total, blocked))| DeviceDomain {
+                domain: domain.to_string(),
+                total,
+                blocked,
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            let (x, y) = if blocked_first {
+                (a.blocked, b.blocked)
+            } else {
+                (a.total, b.total)
+            };
+            y.cmp(&x).then_with(|| a.domain.cmp(&b.domain))
+        });
+        rows.truncate(n);
+        Ok(rows)
+    }
+
+    async fn device_activity(&self, device: &str, from_ts: i64) -> Result<Vec<DeviceActivity>> {
+        let inner = self.inner.read();
+        let from_bucket = align_bucket(from_ts);
+        Ok(inner
+            .device_buckets
+            .range((from_bucket, String::new())..)
+            .filter(|((_, d), _)| d == device)
+            .map(|((bucket, _), agg)| DeviceActivity {
+                bucket: *bucket,
+                total: agg.total,
+                blocked: agg.blocked,
+            })
+            .collect())
     }
 
     async fn summary(&self, secs: u64) -> Result<(u64, u64)> {

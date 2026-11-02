@@ -258,11 +258,38 @@ pub async fn add_alias(
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct DeviceStatsParams {
+    /// How far back the domain lists, services and activity reach; 24 by
+    /// default, at most a week.
+    pub hours: Option<u64>,
+}
+
+/// How many domains the panel's lists show.
+const DEVICE_TOP: usize = 10;
+/// How many distinct domains are looked at to find the services a device uses
+/// — enough to see past its handful of noisiest names.
+const DEVICE_SERVICE_SCAN: usize = 500;
+
+/// One catalog service a device used, from the domains it asked for.
+#[derive(Debug, Serialize)]
+struct ServiceUse {
+    id: &'static str,
+    name: &'static str,
+    queries: u64,
+    blocked: u64,
+}
+
 /// GET /api/clients/:device/stats — per-device query stats.
 /// `:device` is a device identity token: a MAC, or an IP fallback.
+///
+/// Alongside the all-time counters: what the device asked for in the last
+/// `hours` — its top domains, its top blocked domains, the catalog services
+/// those belong to — and its 10-minute activity.
 pub async fn client_ip_stats(
     State(state): State<AppState>,
     Path(device): Path<String>,
+    Query(params): Query<DeviceStatsParams>,
 ) -> Result<Json<Value>, ApiError> {
     // Same surface as the list: per-device history, gone while statistics are
     // off. Reported as "not found" because that is exactly what it is — there
@@ -273,20 +300,55 @@ pub async fn client_ip_stats(
         )));
     }
 
-    let stats = state
-        .inner
-        .storage
-        .client_stats(&device)
-        .await?
-        .ok_or_else(|| {
-            ApiError(ferrite_core::error::FeriteError::NotFound(format!(
-                "client '{}' not found",
-                device
-            )))
-        })?;
+    let storage = &state.inner.storage;
+    let stats = storage.client_stats(&device).await?.ok_or_else(|| {
+        ApiError(ferrite_core::error::FeriteError::NotFound(format!(
+            "client '{}' not found",
+            device
+        )))
+    })?;
+
+    let hours = params.hours.unwrap_or(24).clamp(1, 168);
+    let since = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default()
+        - (hours * 3600) as i64;
+    let scan = storage
+        .device_domains(&device, since, DEVICE_SERVICE_SCAN, false)
+        .await?;
+    let top_blocked = storage
+        .device_domains(&device, since, DEVICE_TOP, true)
+        .await?;
+    let activity = storage.device_activity(&device, since).await?;
+
+    let mut services: Vec<ServiceUse> = Vec::new();
+    for d in &scan {
+        if let Some(s) = ferrite_core::services::owner_of(&d.domain) {
+            match services.iter_mut().find(|u| u.id == s.id) {
+                Some(u) => {
+                    u.queries += d.total;
+                    u.blocked += d.blocked;
+                }
+                None => services.push(ServiceUse {
+                    id: &s.id,
+                    name: &s.name,
+                    queries: d.total,
+                    blocked: d.blocked,
+                }),
+            }
+        }
+    }
+    services.sort_by(|a, b| b.queries.cmp(&a.queries).then(a.id.cmp(b.id)));
 
     ClientRegistry::trigger_resolve_device(&state.inner.client_registry, &device);
     let info = state.inner.client_registry.describe_device(&device);
+    let first_seen = info
+        .macs
+        .iter()
+        .filter_map(|m| state.inner.client_registry.first_seen(m))
+        .filter(|&t| t > 0)
+        .min();
 
     Ok(Json(json!({
         "device": stats.device,
@@ -296,6 +358,12 @@ pub async fn client_ip_stats(
         "total": stats.total,
         "blocked": stats.blocked,
         "last_seen": stats.last_seen,
+        "first_seen": first_seen,
+        "hours": hours,
+        "top_domains": scan.iter().take(DEVICE_TOP).collect::<Vec<_>>(),
+        "top_blocked": top_blocked,
+        "services": services,
+        "activity": activity,
     })))
 }
 
@@ -388,5 +456,57 @@ mod tests {
         let (now, from) = client_time_window(&params);
 
         assert_eq!(now - from, 24 * 3600);
+    }
+
+    #[tokio::test]
+    async fn device_stats_name_its_domains_and_the_services_behind_them() {
+        use ferrite_core::recording::RecordScope;
+        use ferrite_core::types::{QueryEntry, QueryStatus};
+
+        let (state, db) = ferrite_app::test_support::app_state("device-stats").await;
+        let now = chrono::Utc::now();
+        let q = |id: u64, domain: &str, status: QueryStatus| QueryEntry {
+            id,
+            timestamp: now,
+            domain: domain.into(),
+            query_type: 1,
+            client_ip: "192.168.1.40".into(),
+            device: "192.168.1.40".into(),
+            status,
+            latency_ms: 1,
+            upstream: None,
+            rcode: 0,
+        };
+        state
+            .inner
+            .storage
+            .write_batch(
+                vec![
+                    q(1, "www.youtube.com", QueryStatus::Cached),
+                    q(2, "rr1.googlevideo.com", QueryStatus::Upstream),
+                    q(3, "ads.example.test", QueryStatus::Blocked),
+                ],
+                RecordScope::ALL,
+            )
+            .await
+            .unwrap();
+
+        let Json(v) = client_ip_stats(
+            State(state.clone()),
+            Path("192.168.1.40".into()),
+            Query(DeviceStatsParams::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v["total"], 3);
+        assert_eq!(v["hours"], 24);
+        assert_eq!(v["top_domains"].as_array().unwrap().len(), 3);
+        assert_eq!(v["top_blocked"][0]["domain"], "ads.example.test");
+        assert_eq!(v["services"][0]["id"], "youtube");
+        assert_eq!(v["services"][0]["queries"], 2);
+        assert_eq!(v["activity"][0]["total"], 3);
+
+        drop(state);
+        ferrite_app::test_support::cleanup_sqlite(&db);
     }
 }

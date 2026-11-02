@@ -8,8 +8,8 @@ use tokio_rusqlite::Connection;
 
 use crate::schema::SCHEMA;
 use crate::{
-    ClientStats, LegacyConfigRows, QueryFilter, SizeTrim, Storage, StoredDevice, StoredSession,
-    SummaryStats, align_bucket,
+    ClientStats, DeviceActivity, DeviceDomain, LegacyConfigRows, QueryFilter, SizeTrim, Storage,
+    StoredDevice, StoredSession, SummaryStats, align_bucket,
 };
 use ferrite_core::error::{FeriteError, Result};
 use ferrite_core::recording::RecordScope;
@@ -506,6 +506,69 @@ impl Storage for SqliteStorage {
             .await
             .map_err(FeriteError::TokioDatabase)?;
         Ok(result)
+    }
+
+    async fn device_domains(
+        &self,
+        device: &str,
+        from_ts: i64,
+        n: usize,
+        blocked_first: bool,
+    ) -> Result<Vec<DeviceDomain>> {
+        let device = device.to_string();
+        let (having, order) = if blocked_first {
+            ("HAVING blocked > 0", "blocked")
+        } else {
+            ("", "total")
+        };
+        // Served by idx_queries_device_time_id_desc: one device's rows in the
+        // window, then grouped.
+        let sql = format!(
+            "SELECT domain, COUNT(*) AS total, SUM(status = 'blocked') AS blocked
+             FROM queries WHERE device = ?1 AND timestamp >= ?2
+             GROUP BY domain {having}
+             ORDER BY {order} DESC, domain ASC LIMIT ?3"
+        );
+        self.conn
+            .call(move |c| {
+                let mut stmt = c.prepare(&sql)?;
+                let rows = stmt
+                    .query_map(rusqlite::params![device, from_ts, n as i64], |row| {
+                        Ok(DeviceDomain {
+                            domain: row.get(0)?,
+                            total: row.get::<_, i64>(1)? as u64,
+                            blocked: row.get::<_, i64>(2)? as u64,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .map_err(FeriteError::TokioDatabase)
+    }
+
+    async fn device_activity(&self, device: &str, from_ts: i64) -> Result<Vec<DeviceActivity>> {
+        let device = device.to_string();
+        let from_bucket = align_bucket(from_ts);
+        self.conn
+            .call(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT bucket, total, blocked FROM device_buckets_10m
+                     WHERE device = ?1 AND bucket >= ?2 ORDER BY bucket ASC",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![device, from_bucket], |row| {
+                        Ok(DeviceActivity {
+                            bucket: row.get(0)?,
+                            total: row.get::<_, i64>(1)? as u64,
+                            blocked: row.get::<_, i64>(2)? as u64,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .map_err(FeriteError::TokioDatabase)
     }
 
     async fn delete_all_queries(&self) -> Result<()> {

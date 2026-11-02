@@ -85,6 +85,23 @@ pub struct ClientStats {
     pub last_seen: i64,
 }
 
+/// One domain a device asked for: how often, and how often it was blocked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceDomain {
+    pub domain: String,
+    pub total: u64,
+    pub blocked: u64,
+}
+
+/// A device's queries in one 10-minute rollup bucket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceActivity {
+    /// Unix seconds the bucket starts at.
+    pub bucket: i64,
+    pub total: u64,
+    pub blocked: u64,
+}
+
 /// Aggregated DNS query counters.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SummaryStats {
@@ -137,6 +154,20 @@ pub trait Storage: Send + Sync {
 
     /// Return aggregated stats for a specific device identity token (MAC or IP).
     async fn client_stats(&self, device: &str) -> Result<Option<ClientStats>>;
+
+    /// The domains a device asked for since `from_ts`, from the query log:
+    /// most asked first, or — with `blocked_first` — only blocked ones, most
+    /// blocked first. Ties go alphabetically. Empty while the log is off.
+    async fn device_domains(
+        &self,
+        device: &str,
+        from_ts: i64,
+        n: usize,
+        blocked_first: bool,
+    ) -> Result<Vec<DeviceDomain>>;
+
+    /// A device's 10-minute rollups since `from_ts`, oldest first.
+    async fn device_activity(&self, device: &str, from_ts: i64) -> Result<Vec<DeviceActivity>>;
 
     /// Return summary stats: (total, blocked) for the last `secs` seconds.
     async fn summary(&self, secs: u64) -> Result<(u64, u64)>;

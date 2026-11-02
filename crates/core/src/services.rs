@@ -4,7 +4,7 @@
 //! `data/services.toml` and is compiled into the binary, so it ships and
 //! updates with releases — no fetch, no cache, nothing to go stale on disk.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
@@ -65,6 +65,25 @@ pub fn find(id: &str) -> Option<&'static Service> {
     CATALOG.iter().find(|s| s.id == id)
 }
 
+static OWNERS: LazyLock<HashMap<&'static str, &'static Service>> = LazyLock::new(|| {
+    CATALOG
+        .iter()
+        .flat_map(|s| s.domains.iter().map(move |d| (d.as_str(), s)))
+        .collect()
+});
+
+/// The service a domain belongs to — the one listing it or a parent of it.
+pub fn owner_of(domain: &str) -> Option<&'static Service> {
+    let domain = domain.trim_end_matches('.');
+    let mut rest = domain;
+    loop {
+        if let Some(s) = OWNERS.get(rest) {
+            return Some(s);
+        }
+        rest = rest.split_once('.')?.1;
+    }
+}
+
 /// Configured service ids, cleaned up: trimmed, lowercased, empties and
 /// repeats dropped, order kept. Ids the catalog doesn't know come back
 /// separately so the caller decides — the API rejects them, loading a config
@@ -98,6 +117,20 @@ pub fn domains_of(ids: &[String]) -> impl Iterator<Item = &'static str> + '_ {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_domain_belongs_to_the_service_listing_it_or_a_parent() {
+        assert_eq!(
+            owner_of("youtube.com").map(|s| s.id.as_str()),
+            Some("youtube")
+        );
+        assert_eq!(
+            owner_of("rr3---sn-abc.googlevideo.com.").map(|s| s.id.as_str()),
+            Some("youtube")
+        );
+        assert!(owner_of("example.com").is_none());
+        assert!(owner_of("com").is_none());
+    }
 
     #[test]
     fn catalog_parses_and_is_not_empty() {

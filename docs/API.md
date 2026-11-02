@@ -469,28 +469,43 @@ Returns an empty list while `storage.keep_stats` is off: this list is assembled 
 
 > PTR lookups run in the background on first sight. A new IP shows `name == ip` immediately and gets a resolved name within seconds.
 
-### `GET /api/clients/:ip/stats` — per-client stats
+### `GET /api/clients/:device/stats` — one device in detail
 
-Returns `404` while `storage.keep_stats` is off — the same surface as the list above, and with statistics off there is no record of the device to serve.
+`:device` is a device token — its MAC, or its IP when no MAC is known. Returns
+`404` while `storage.keep_stats` is off — the same surface as the list above,
+and with statistics off there is no record of the device to serve.
 
 ```
-GET /api/clients/192.168.1.42/stats
+GET /api/clients/aa:bb:cc:dd:ee:ff/stats?hours=24
 ```
 
 ```json
 {
-  "client_ip": "192.168.1.42",
-  "name": "macbook",
+  "device": "aa:bb:cc:dd:ee:ff",
+  "name": "kids-tablet",
+  "ips": ["192.168.1.42"],
   "mac": "aa:bb:cc:dd:ee:ff",
   "total": 4812,
   "blocked": 932,
-  "last_seen": 1745008923
+  "last_seen": 1745008923,
+  "first_seen": 1744000000,
+  "hours": 24,
+  "top_domains": [{ "domain": "www.youtube.com", "total": 310, "blocked": 0 }],
+  "top_blocked": [{ "domain": "ads.example.com", "total": 41, "blocked": 41 }],
+  "services": [{ "id": "youtube", "name": "YouTube", "queries": 655, "blocked": 0 }],
+  "activity": [{ "bucket": 1745008200, "total": 52, "blocked": 7 }]
 }
 ```
 
-- `name` — resolved PTR or alias; `null` if unknown.
-- `mac` — learned MAC address for this IP, or `null` if not available yet.
-- Returns `404` if no queries have been seen from this IP.
+- `total`, `blocked`, `last_seen` cover all retained history; everything below
+  `hours` covers the last `hours` (default 24, at most 168).
+- `name` — alias, PTR or mDNS name; `null` if unknown. `mac` — `null` until one
+  is learned. `first_seen` — when the box first saw it; `null` if unknown.
+- `top_domains` / `top_blocked` — ten each, from the query log (empty while the
+  query log is off). `services` — the catalog services those domains belong to,
+  from its 500 most-asked domains, most used first.
+- `activity` — 10-minute buckets with any queries, oldest first.
+- `404` if no queries have been seen from the device.
 
 ### `GET /api/clients/aliases` — list manual aliases
 

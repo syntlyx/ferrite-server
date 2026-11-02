@@ -487,6 +487,70 @@ async fn ids_resume_after_a_restart_on_both_backends() {
     .await;
 }
 
+#[tokio::test]
+async fn a_devices_domains_and_activity_read_the_same_way() {
+    for_each_backend("conformance-device-domains", |storage| async move {
+        let bucket = align(Utc::now().timestamp()) - 600;
+        let me = "192.168.1.30";
+        storage
+            .write_batch(
+                vec![
+                    entry(bucket + 1, "video.test", me, QueryStatus::Cached),
+                    entry(bucket + 2, "video.test", me, QueryStatus::Upstream),
+                    entry(bucket + 3, "video.test", me, QueryStatus::Cached),
+                    entry(bucket + 4, "ads.test", me, QueryStatus::Blocked),
+                    entry(bucket + 5, "ads.test", me, QueryStatus::Blocked),
+                    entry(bucket + 601, "track.test", me, QueryStatus::Blocked),
+                    // Someone else's, and one of mine from before the window.
+                    entry(
+                        bucket + 6,
+                        "video.test",
+                        "192.168.1.31",
+                        QueryStatus::Cached,
+                    ),
+                    entry(bucket - 1200, "old.test", me, QueryStatus::Cached),
+                ],
+                RecordScope::ALL,
+            )
+            .await
+            .unwrap();
+        let d = |domain: &str, total, blocked| crate::DeviceDomain {
+            domain: domain.into(),
+            total,
+            blocked,
+        };
+
+        let top = storage.device_domains(me, bucket, 10, false).await.unwrap();
+        assert_eq!(
+            top,
+            vec![
+                d("video.test", 3, 0),
+                d("ads.test", 2, 2),
+                d("track.test", 1, 1)
+            ]
+        );
+        let blocked = storage.device_domains(me, bucket, 10, true).await.unwrap();
+        assert_eq!(blocked, vec![d("ads.test", 2, 2), d("track.test", 1, 1)]);
+        assert_eq!(
+            storage
+                .device_domains(me, bucket, 1, false)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let activity = storage.device_activity(me, bucket).await.unwrap();
+        let a = |bucket, total, blocked| crate::DeviceActivity {
+            bucket,
+            total,
+            blocked,
+        };
+        assert_eq!(activity, vec![a(bucket, 5, 2), a(bucket + 600, 1, 1)]);
+    })
+    .await;
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 fn align(ts: i64) -> i64 {
