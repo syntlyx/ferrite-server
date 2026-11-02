@@ -108,7 +108,7 @@ answer:
 ```
 client ──▶ ferrite
             1. custom records   → local A / AAAA / CNAME answer
-            2. blocklist        → blocked for this device? NXDOMAIN
+            2. blocklist        → blocked for this device? NXDOMAIN (or the answer you chose)
                2b. SafeSearch   → CNAME to the engine's safe host
             3. routing rule     → answer with ferrite's own IP (traffic goes through the tunnel)
             4. cache            → fresh? cached answer

@@ -607,3 +607,65 @@ async fn changing_the_password_keeps_the_caller_signed_in_and_no_one_else() {
     drop(state);
     test_support::cleanup_sqlite(&db_path);
 }
+
+#[tokio::test]
+async fn block_response_applies_live_and_custom_ip_needs_an_address() {
+    use ferrite_core::config::BlockResponse;
+    use std::net::Ipv4Addr;
+
+    let (state, db_path, _config_path) =
+        test_support::app_state_with_config_path("settings-block-response").await;
+
+    let err = update_settings(
+        State(state.clone()),
+        axum::http::HeaderMap::new(),
+        Json(SettingsPatch {
+            blocklist_block_response: Some(BlockResponse::CustomIp),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.0.to_string().contains("custom_ip needs"));
+    assert_eq!(
+        state.inner.blocklist.block_answer().response,
+        BlockResponse::Nxdomain
+    );
+
+    let Json(v) = update_settings(
+        State(state.clone()),
+        axum::http::HeaderMap::new(),
+        Json(SettingsPatch {
+            blocklist_block_response: Some(BlockResponse::CustomIp),
+            blocklist_block_ipv4: Some(Some(Ipv4Addr::new(192, 168, 1, 5))),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["restart_required"], false);
+    let live = state.inner.blocklist.block_answer();
+    assert_eq!(live.response, BlockResponse::CustomIp);
+    assert_eq!(live.ipv4, Some(Ipv4Addr::new(192, 168, 1, 5)));
+    assert_eq!(
+        state.live_config.read().blocklist.block_response,
+        BlockResponse::CustomIp
+    );
+
+    // Clearing the only address of custom_ip is refused too.
+    assert!(
+        update_settings(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Json(SettingsPatch {
+                blocklist_block_ipv4: Some(None),
+                ..Default::default()
+            }),
+        )
+        .await
+        .is_err()
+    );
+
+    drop(state);
+    test_support::cleanup_sqlite(&db_path);
+}

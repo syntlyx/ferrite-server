@@ -16,7 +16,7 @@ use crate::profiles::{CompiledProfile, compile_profiles};
 use crate::safesearch::SafeSearch;
 use crate::services::ServiceBlock;
 use crate::subscriptions::Subscriptions;
-use ferrite_core::config::{AllowlistConfig, BlocklistConfig};
+use ferrite_core::config::{AllowlistConfig, BlockAnswer, BlocklistConfig};
 use ferrite_core::error::Result;
 use ferrite_core::net::normalize_client_key;
 
@@ -116,6 +116,8 @@ pub struct Blocklist {
     /// Network-wide SafeSearch / YouTube Restricted Mode, packed for one atomic
     /// load on the DNS path: bit 0 = search, bits 1-2 = the YouTube level.
     safe_search: AtomicU8,
+    /// What a blocked name is answered with — `[blocklist] block_response`.
+    block_answer: ArcSwap<BlockAnswer>,
     /// The box-local minute of the week profile schedules are judged by.
     /// A background tick keeps it current ([`Self::set_clock`]), so the DNS
     /// path never reads the system clock.
@@ -124,6 +126,7 @@ pub struct Blocklist {
 
 impl Blocklist {
     pub fn new(config: BlocklistConfig, allowlist: AllowlistConfig, fst_path: PathBuf) -> Self {
+        let block_answer = config.block_answer();
         let client_bypass: HashSet<String> = normalize_client_keys(&config.client_bypass)
             .into_iter()
             .collect();
@@ -170,6 +173,7 @@ impl Blocklist {
             local_zones: RwLock::new(Vec::new()),
             refresh_lock: tokio::sync::Mutex::new(()),
             profiles_stale: AtomicBool::new(false),
+            block_answer: ArcSwap::from_pointee(block_answer),
             clock: AtomicU32::new(ferrite_core::schedule::local_minute_of_week()),
             safe_search: AtomicU8::new(pack_safe(SafeSearch {
                 search: config.safe_search,
@@ -499,6 +503,16 @@ impl Blocklist {
     }
 
     /// Replace the network-wide SafeSearch / YouTube Restricted Mode setting.
+    /// Change what blocked names are answered with; the next one sees it.
+    pub fn set_block_answer(&self, answer: BlockAnswer) {
+        self.block_answer.store(Arc::new(answer));
+    }
+
+    /// What a blocked name is answered with.
+    pub fn block_answer(&self) -> BlockAnswer {
+        **self.block_answer.load()
+    }
+
     pub fn set_safe_search(&self, safe: SafeSearch) {
         self.safe_search.store(pack_safe(safe), Ordering::Relaxed);
     }

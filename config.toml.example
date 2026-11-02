@@ -287,6 +287,17 @@ services = [
 # safe_search = true
 # youtube_restricted = "moderate"
 
+# What a blocked name is answered with:
+#   "nxdomain"  (default) no such name — apps give up at once
+#   "nodata"    the name exists, without this record type
+#   "null_ip"   0.0.0.0 for A, :: for AAAA
+#   "custom_ip" block_ipv4 / block_ipv6 — a block page on your network
+#   "refused"   the server won't answer
+# Other record types get no records in the address modes.
+# block_response = "null_ip"
+# block_ipv4 = "192.168.1.5"
+# block_ipv6 = "fd00::5"
+
 # Remote blocklist subscriptions (hosts or Adblock format, auto-detected).
 [[blocklist.lists]]
 name    = "StevenBlack"

@@ -1280,6 +1280,8 @@ All fields are optional. Fields not provided are left unchanged.
 | `keep_stats`         | bool             | Privacy switch for the aggregates. `false` stops the 10-minute rollups, the top-N counters, the 24-hour timeseries and the per-egress routed-domain tables, drops what they already hold in memory, and stops every aggregate *read* as well: `/api/stats/top-domains`, `/api/stats/top-blocked`, `/api/stats/top-clients` and `/api/clients` return empty, and `/api/clients/{device}/stats` returns 404, however far back the window reaches. Per-egress byte and connection totals keep counting — they name no host. `/api/stats/summary` keeps serving the process-lifetime counters (`total_queries`, `blocked_queries`, …), which hold no domain or device identity. |
 | `blocklist_enabled`  | bool             | Master switch for DNS blocklist filtering. DNS resolution, custom records, caching, and logging continue to work while filtering is disabled.                                                                    |
 | `blocklist_client_bypass` | `string[]` | Full replacement list of client IP/MAC keys that bypass blocklist filtering. IPs are normalized; MACs use `aa:bb:cc:dd:ee:ff`. No groups yet.                                                                   |
+| `blocklist_block_response` | `string` | What blocked names are answered with: `nxdomain` (default), `nodata`, `null_ip` (`0.0.0.0` / `::`), `custom_ip`, `refused`. Live. |
+| `blocklist_block_ipv4` · `blocklist_block_ipv6` | `string \| null` | The addresses `custom_ip` answers A / AAAA with; a type without one gets no records. `custom_ip` with neither → `400`. |
 
 #### Restart-required — saved to disk, server exits so supervisor can restart it
 

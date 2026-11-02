@@ -283,6 +283,9 @@ fn blocklist() -> Blocklist {
             services: vec![],
             safe_search: false,
             youtube_restricted: Default::default(),
+            block_response: Default::default(),
+            block_ipv4: None,
+            block_ipv6: None,
             whitelist: vec![],
             client_bypass: vec![],
             profiles: vec![],
@@ -321,8 +324,8 @@ fn nxdomain_response_echoes_query_context() {
     // The hand-written answer and the encoded one are the same answer down
     // to the byte: the encoder is the reference, and this is what pins the
     // wire form to it.
-    let wire_built = nxdomain_on_wire(&raw, 60).unwrap();
-    let encoded = nxdomain_encoded(&query, 60);
+    let wire_built = negative_on_wire(&raw, 60, ResponseCode::NXDomain).unwrap();
+    let encoded = negative_encoded(&query, 60, ResponseCode::NXDomain);
     assert_eq!(wire_built, encoded);
     for bytes in [wire_built, encoded] {
         let msg = Message::from_bytes(&bytes).unwrap();
@@ -370,7 +373,10 @@ fn servfail_response_echoes_query_context() {
     let raw = raw_query("upstream.test", RecordType::AAAA);
     let bytes = build_servfail(&LazyQuery::new(&raw));
     // Same pinning as the NXDOMAIN form: hand-written == encoded.
-    assert_eq!(bytes, servfail_encoded(&LazyQuery::new(&raw)));
+    assert_eq!(
+        bytes,
+        error_encoded(&LazyQuery::new(&raw), ResponseCode::ServFail)
+    );
     let msg = Message::from_bytes(&bytes).unwrap();
 
     assert_eq!(msg.metadata.id, 0xCAFE);
@@ -751,6 +757,144 @@ async fn blocked_answer_carries_an_soa_bounding_negative_caching() {
     assert_eq!(soa, (h.client_ttl, h.client_ttl));
 
     cleanup_sqlite(&h.db_path);
+}
+
+/// Each `block_response` mode shapes the answer as documented, the address
+/// forms per record type, and the query log keeps the RCODE that went out.
+#[tokio::test]
+async fn block_response_modes_shape_the_answer() {
+    use ferrite_core::config::{BlockAnswer, BlockResponse};
+    use std::net::Ipv6Addr;
+
+    let mut h = Harness::new("dns-block-modes").await;
+    h.blocklist.add_blacklist("ads.test").unwrap();
+    let ask = |rt: RecordType| query("ads.test", rt).to_bytes().unwrap();
+    let from = SocketAddr::from(([192, 0, 2, 10], 53_000));
+
+    let cases: Vec<(BlockAnswer, RecordType, ResponseCode, Option<RData>, u8)> = vec![
+        (
+            BlockAnswer {
+                response: BlockResponse::Nodata,
+                ..Default::default()
+            },
+            RecordType::A,
+            ResponseCode::NoError,
+            None,
+            0,
+        ),
+        (
+            BlockAnswer {
+                response: BlockResponse::NullIp,
+                ..Default::default()
+            },
+            RecordType::A,
+            ResponseCode::NoError,
+            Some(RData::A(Ipv4Addr::UNSPECIFIED.into())),
+            0,
+        ),
+        (
+            BlockAnswer {
+                response: BlockResponse::NullIp,
+                ..Default::default()
+            },
+            RecordType::AAAA,
+            ResponseCode::NoError,
+            Some(RData::AAAA(Ipv6Addr::UNSPECIFIED.into())),
+            0,
+        ),
+        (
+            // Any other type gets no records, never an address.
+            BlockAnswer {
+                response: BlockResponse::NullIp,
+                ..Default::default()
+            },
+            RecordType::HTTPS,
+            ResponseCode::NoError,
+            None,
+            0,
+        ),
+        (
+            BlockAnswer {
+                response: BlockResponse::CustomIp,
+                ipv4: Some(Ipv4Addr::new(192, 168, 1, 5)),
+                ipv6: None,
+            },
+            RecordType::A,
+            ResponseCode::NoError,
+            Some(RData::A(Ipv4Addr::new(192, 168, 1, 5).into())),
+            0,
+        ),
+        (
+            // No IPv6 set: AAAA is NODATA, not ::.
+            BlockAnswer {
+                response: BlockResponse::CustomIp,
+                ipv4: Some(Ipv4Addr::new(192, 168, 1, 5)),
+                ipv6: None,
+            },
+            RecordType::AAAA,
+            ResponseCode::NoError,
+            None,
+            0,
+        ),
+        (
+            BlockAnswer {
+                response: BlockResponse::Refused,
+                ..Default::default()
+            },
+            RecordType::A,
+            ResponseCode::Refused,
+            None,
+            5,
+        ),
+    ];
+
+    for (answer, rt, rcode, rdata, logged) in cases {
+        h.blocklist.set_block_answer(answer);
+        let response = handle_query(ask(rt), from, Arc::new(h.ctx()))
+            .await
+            .unwrap();
+        let msg = Message::from_bytes(&response).unwrap();
+        let what = format!("{:?} for {rt:?}", answer.response);
+        assert_eq!(msg.metadata.response_code, rcode, "{what}");
+        assert_eq!(
+            msg.answers.first().map(|rr| rr.data.clone()),
+            rdata,
+            "{what}"
+        );
+        if let Some(rr) = msg.answers.first() {
+            assert_eq!(rr.ttl, h.client_ttl, "{what}");
+        }
+        // NODATA keeps the SOA that bounds negative caching.
+        if rcode == ResponseCode::NoError && msg.answers.is_empty() {
+            assert!(
+                msg.authorities
+                    .iter()
+                    .any(|rr| matches!(rr.data, RData::SOA(_))),
+                "{what}"
+            );
+        }
+        let entry = h.rx.try_recv().unwrap();
+        assert_eq!(entry.status, QueryStatus::Blocked, "{what}");
+        assert_eq!(entry.rcode, logged, "{what}");
+    }
+
+    cleanup_sqlite(&h.db_path);
+}
+
+#[test]
+fn address_answer_matches_the_encoded_form() {
+    let raw = raw_query("ads.test", RecordType::AAAA);
+    let ip: std::net::IpAddr = "fd00::5".parse().unwrap();
+    assert_eq!(
+        address_on_wire(&raw, ip, 60).unwrap(),
+        address_encoded(&LazyQuery::new(&raw), ip, 60)
+    );
+    let raw = raw_query("ads.test", RecordType::A);
+    let ip: std::net::IpAddr = "10.0.0.5".parse().unwrap();
+    assert_eq!(
+        address_on_wire(&raw, ip, 60).unwrap(),
+        address_encoded(&LazyQuery::new(&raw), ip, 60)
+    );
 }
 
 /// Every exit path is capped, including the two that used to bypass it: a

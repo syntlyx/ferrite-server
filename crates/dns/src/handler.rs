@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -14,6 +14,7 @@ use crate::ctx::DnsCtx;
 use crate::query::LazyQuery;
 use crate::safesearch;
 use crate::types::DnsResponse;
+use ferrite_core::config::{BlockAnswer, BlockResponse};
 use ferrite_core::error::Result;
 use ferrite_core::net::{ip_to_string, unmap_v4};
 use ferrite_core::types::{QueryEntry, QueryStatus};
@@ -198,6 +199,8 @@ pub fn decide(raw: &[u8], src: SocketAddr, ctx: &DnsCtx) -> Decision {
     // "never block", not "never route").
     if filtering_enabled && ctx.blocklist.should_block_for(&name, profile.as_deref()) {
         tracing::debug!("blocked: {}", name);
+        let (answer, rcode) =
+            build_blocked(&query, qtype, client_ttl, ctx.blocklist.block_answer());
         if !log_ignored {
             emit(ctx, QueryStatus::Blocked, |status| {
                 make_entry(
@@ -207,11 +210,11 @@ pub fn decide(raw: &[u8], src: SocketAddr, ctx: &DnsCtx) -> Decision {
                     status,
                     start.elapsed().as_millis() as u32,
                     None,
-                    3,
+                    rcode,
                 )
             });
         }
-        return Decision::Answer(build_nxdomain(&query, client_ttl));
+        return Decision::Answer(answer);
     }
 
     // ── Step 2b: SafeSearch / YouTube Restricted Mode ─────────────────────
@@ -293,6 +296,8 @@ pub fn decide(raw: &[u8], src: SocketAddr, ctx: &DnsCtx) -> Decision {
                 cname_blocked_target(&cached.bytes, &name, &ctx.blocklist, profile.as_deref())
         {
             tracing::debug!("CNAME-blocked from cache: {} → {}", name, blocked_cname);
+            let (answer, rcode) =
+                build_blocked(&query, qtype, client_ttl, ctx.blocklist.block_answer());
             if !log_ignored {
                 emit(ctx, QueryStatus::Blocked, |status| {
                     make_entry(
@@ -302,11 +307,11 @@ pub fn decide(raw: &[u8], src: SocketAddr, ctx: &DnsCtx) -> Decision {
                         status,
                         start.elapsed().as_millis() as u32,
                         Some(format!("cname:{}", blocked_cname)),
-                        3,
+                        rcode,
                     )
                 });
             }
-            return Decision::Answer(build_nxdomain(&query, client_ttl));
+            return Decision::Answer(answer);
         }
 
         if !log_ignored {
@@ -413,6 +418,8 @@ pub async fn resolve_upstream(raw: &[u8], pending: Pending, ctx: &DnsCtx) -> Vec
             cname_blocked_target(&response_bytes, &name, &ctx.blocklist, profile.as_deref())
     {
         tracing::debug!("CNAME-blocked: {} → {}", name, blocked_cname);
+        let (answer, rcode) =
+            build_blocked(&query, qtype, client_ttl, ctx.blocklist.block_answer());
         if !log_ignored {
             emit(ctx, QueryStatus::Blocked, |status| {
                 make_entry(
@@ -422,11 +429,11 @@ pub async fn resolve_upstream(raw: &[u8], pending: Pending, ctx: &DnsCtx) -> Vec
                     status,
                     start.elapsed().as_millis() as u32,
                     Some(format!("cname:{}", blocked_cname)),
-                    3,
+                    rcode,
                 )
             });
         }
-        return build_nxdomain(&query, client_ttl);
+        return answer;
     }
 
     // ── Step 7: Cache NOERROR responses ───────────────────────────────────
@@ -637,21 +644,60 @@ const SOA_ADMIN_NAME: &[u8] = b"\x07ferrite\x07invalid\x00";
 /// an unpredictable while. The SOA's own TTL and its MINIMUM field are both set
 /// to `ttl`, since the negative-cache lifetime is the smaller of the two.
 fn build_nxdomain(query: &LazyQuery, ttl: u32) -> Vec<u8> {
-    match nxdomain_on_wire(query.raw(), ttl) {
+    build_negative(query, ttl, ResponseCode::NXDomain)
+}
+
+/// The answer for a blocked name, shaped as `[blocklist] block_response` says,
+/// with the RCODE it carries for the query log.
+///
+/// Every shape keeps the client's caching bounded by `ttl`: the NXDOMAIN and
+/// NODATA forms carry the same SOA, an address carries `ttl` itself, and
+/// REFUSED is never cached at all.
+fn build_blocked(query: &LazyQuery, qtype: u16, ttl: u32, answer: BlockAnswer) -> (Vec<u8>, u8) {
+    const A: u16 = 1;
+    const AAAA: u16 = 28;
+    let address: Option<IpAddr> = match answer.response {
+        BlockResponse::Nxdomain => return (build_nxdomain(query, ttl), 3),
+        BlockResponse::Refused => return (build_error(query, ResponseCode::Refused), 5),
+        BlockResponse::Nodata => None,
+        BlockResponse::NullIp => match qtype {
+            A => Some(Ipv4Addr::UNSPECIFIED.into()),
+            AAAA => Some(Ipv6Addr::UNSPECIFIED.into()),
+            _ => None,
+        },
+        BlockResponse::CustomIp => match qtype {
+            A => answer.ipv4.map(IpAddr::V4),
+            AAAA => answer.ipv6.map(IpAddr::V6),
+            _ => None,
+        },
+    };
+    let bytes = match address {
+        Some(ip) => build_address(query, ip, ttl),
+        // A type the mode has no address for gets NODATA: the name exists,
+        // just not with this record — never a made-up record of another type.
+        None => build_negative(query, ttl, ResponseCode::NoError),
+    };
+    (bytes, 0)
+}
+
+/// A negative answer — NXDOMAIN, or NODATA when `rcode` is NOERROR — with the
+/// SOA that bounds the client's negative caching (see [`build_nxdomain`]).
+fn build_negative(query: &LazyQuery, ttl: u32, rcode: ResponseCode) -> Vec<u8> {
+    match negative_on_wire(query.raw(), ttl, rcode) {
         Some(bytes) => bytes,
-        None => nxdomain_encoded(query, ttl),
+        None => negative_encoded(query, ttl, rcode),
     }
 }
 
-/// [`build_nxdomain`] written straight onto the wire, or `None` for a query
+/// [`build_negative`] written straight onto the wire, or `None` for a query
 /// shape it doesn't cover (no readable question, or more than one).
 ///
 /// A block is the one answer ferrite invents on its own, and on a filtered
-/// network it invents a great many of them. [`nxdomain_encoded`] would re-parse
+/// network it invents a great many of them. [`negative_encoded`] would re-parse
 /// `ferrite.invalid.` into labels, clone the question's name and re-encode the
 /// whole message for each — this produces the same bytes without decoding
 /// anything, which is what `nxdomain_matches_the_encoded_form` pins down.
-fn nxdomain_on_wire(raw: &[u8], ttl: u32) -> Option<Vec<u8>> {
+fn negative_on_wire(raw: &[u8], ttl: u32, rcode: ResponseCode) -> Option<Vec<u8>> {
     let q_end = wire::question_end(raw)?;
     if u16::from_be_bytes([raw[4], raw[5]]) != 1 {
         return None;
@@ -662,8 +708,8 @@ fn nxdomain_on_wire(raw: &[u8], ttl: u32) -> Option<Vec<u8>> {
     out.extend_from_slice(&raw[..q_end]); // header + question, ID included
     // QR=1, opcode QUERY, AA=1, TC=0, RD echoed (RFC 1035 §4.1.1).
     out[2] = 0b1000_0100 | (raw[2] & 0x01);
-    // RA=1 — we do recurse — and RCODE=NXDOMAIN.
-    out[3] = 0b1000_0000 | ResponseCode::NXDomain.low();
+    // RA=1 — we do recurse — and the RCODE.
+    out[3] = 0b1000_0000 | rcode.low();
     // ANCOUNT=0, NSCOUNT=1 (the SOA below), ARCOUNT=0.
     out[6..12].copy_from_slice(&[0, 0, 0, 1, 0, 0]);
     // Authority SOA, owner = the queried name as a pointer to the question.
@@ -686,10 +732,10 @@ fn nxdomain_on_wire(raw: &[u8], ttl: u32) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// The reference form of [`build_nxdomain`], through the message encoder. Used
-/// for the query shapes [`nxdomain_on_wire`] declines; empty when the bytes
+/// The reference form of [`build_negative`], through the message encoder. Used
+/// for the query shapes [`negative_on_wire`] declines; empty when the bytes
 /// don't decode either, since there is then no question to echo.
-fn nxdomain_encoded(query: &LazyQuery, ttl: u32) -> Vec<u8> {
+fn negative_encoded(query: &LazyQuery, ttl: u32, rcode: ResponseCode) -> Vec<u8> {
     let Some(decoded) = query.message() else {
         return Vec::new();
     };
@@ -698,7 +744,7 @@ fn nxdomain_encoded(query: &LazyQuery, ttl: u32) -> Vec<u8> {
     // RFC 1035 §4.1.1: RD must be echoed; RA indicates we support recursion.
     resp.metadata.recursion_desired = decoded.metadata.recursion_desired;
     resp.metadata.recursion_available = true;
-    resp.metadata.response_code = ResponseCode::NXDomain;
+    resp.metadata.response_code = rcode;
     resp.add_queries(decoded.queries.iter().cloned());
     if let Some(q) = decoded.queries.first() {
         // The SOA is synthetic: only its TTL and MINIMUM carry meaning for a
@@ -734,13 +780,19 @@ fn nxdomain_encoded(query: &LazyQuery, ttl: u32) -> Vec<u8> {
 /// answers an UPDATE or a NOTIFY with "this server failed", not with a reply
 /// pretending to be of that kind.
 fn build_servfail(query: &LazyQuery) -> Vec<u8> {
-    match servfail_on_wire(query.raw()) {
+    build_error(query, ResponseCode::ServFail)
+}
+
+/// An answer that is only an RCODE — SERVFAIL, REFUSED — echoing the query's
+/// header and question.
+fn build_error(query: &LazyQuery, rcode: ResponseCode) -> Vec<u8> {
+    match error_on_wire(query.raw(), rcode) {
         Some(bytes) => bytes,
-        None => servfail_encoded(query),
+        None => error_encoded(query, rcode),
     }
 }
 
-fn servfail_on_wire(raw: &[u8]) -> Option<Vec<u8>> {
+fn error_on_wire(raw: &[u8], rcode: ResponseCode) -> Option<Vec<u8>> {
     let q_end = wire::question_end(raw)?;
     if u16::from_be_bytes([raw[4], raw[5]]) != 1 {
         return None;
@@ -748,24 +800,83 @@ fn servfail_on_wire(raw: &[u8]) -> Option<Vec<u8>> {
     let mut out = raw[..q_end].to_vec();
     // QR=1, opcode QUERY, AA=0, TC=0, RD echoed.
     out[2] = 0b1000_0000 | (raw[2] & 0x01);
-    out[3] = 0b1000_0000 | ResponseCode::ServFail.low();
+    out[3] = 0b1000_0000 | rcode.low();
     // Nothing in any section but the question already copied above.
     out[6..12].copy_from_slice(&[0; 6]);
     Some(out)
 }
 
-/// The reference form of [`build_servfail`]; empty when the bytes are neither
+/// The reference form of [`build_error`]; empty when the bytes are neither
 /// readable nor decodable — there is then no question to echo and no id worth
 /// trusting, so there is nothing to send.
-fn servfail_encoded(query: &LazyQuery) -> Vec<u8> {
+fn error_encoded(query: &LazyQuery, rcode: ResponseCode) -> Vec<u8> {
     let Some(decoded) = query.message() else {
         return Vec::new();
     };
     let mut resp = Message::response(decoded.metadata.id, OpCode::Query);
     resp.metadata.recursion_desired = decoded.metadata.recursion_desired;
     resp.metadata.recursion_available = true;
-    resp.metadata.response_code = ResponseCode::ServFail;
+    resp.metadata.response_code = rcode;
     resp.add_queries(decoded.queries.iter().cloned());
+    resp.to_bytes().unwrap_or_default()
+}
+
+/// One address record for a blocked name (`null_ip` / `custom_ip`): the
+/// question echoed, an A or AAAA for its name with `ttl`, authoritative.
+fn build_address(query: &LazyQuery, ip: IpAddr, ttl: u32) -> Vec<u8> {
+    match address_on_wire(query.raw(), ip, ttl) {
+        Some(bytes) => bytes,
+        None => address_encoded(query, ip, ttl),
+    }
+}
+
+fn address_on_wire(raw: &[u8], ip: IpAddr, ttl: u32) -> Option<Vec<u8>> {
+    let q_end = wire::question_end(raw)?;
+    if u16::from_be_bytes([raw[4], raw[5]]) != 1 {
+        return None;
+    }
+    let (rtype, rdata): (RecordType, Vec<u8>) = match ip {
+        IpAddr::V4(v4) => (RecordType::A, v4.octets().to_vec()),
+        IpAddr::V6(v6) => (RecordType::AAAA, v6.octets().to_vec()),
+    };
+    let mut out = Vec::with_capacity(q_end + 12 + rdata.len());
+    out.extend_from_slice(&raw[..q_end]);
+    // QR=1, opcode QUERY, AA=1, RD echoed; RA=1, RCODE=NOERROR.
+    out[2] = 0b1000_0100 | (raw[2] & 0x01);
+    out[3] = 0b1000_0000;
+    // ANCOUNT=1, NSCOUNT=0, ARCOUNT=0.
+    out[6..12].copy_from_slice(&[0, 1, 0, 0, 0, 0]);
+    // Owner = the question's name, as a pointer to it.
+    out.extend_from_slice(&[0xC0, wire::HEADER_LEN as u8]);
+    out.extend_from_slice(&u16::from(rtype).to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes()); // CLASS = IN
+    out.extend_from_slice(&ttl.to_be_bytes());
+    out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+    out.extend_from_slice(&rdata);
+    Some(out)
+}
+
+/// The reference form of [`build_address`]; empty when the query doesn't decode.
+fn address_encoded(query: &LazyQuery, ip: IpAddr, ttl: u32) -> Vec<u8> {
+    let Some(decoded) = query.message() else {
+        return Vec::new();
+    };
+    let mut resp = Message::response(decoded.metadata.id, OpCode::Query);
+    resp.metadata.authoritative = true;
+    resp.metadata.recursion_desired = decoded.metadata.recursion_desired;
+    resp.metadata.recursion_available = true;
+    resp.add_queries(decoded.queries.iter().cloned());
+    if let Some(q) = decoded.queries.first() {
+        let rdata = match ip {
+            IpAddr::V4(v4) => RData::A(v4.into()),
+            IpAddr::V6(v6) => RData::AAAA(v6.into()),
+        };
+        resp.add_answer(hickory_proto::rr::Record::from_rdata(
+            q.name().clone(),
+            ttl,
+            rdata,
+        ));
+    }
     resp.to_bytes().unwrap_or_default()
 }
 

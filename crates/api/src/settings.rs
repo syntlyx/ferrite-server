@@ -1,5 +1,5 @@
 use std::{
-    net::Ipv4Addr,
+    net::{Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
 };
 
@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use crate::ApiError;
 use crate::auth::hash_password;
 use ferrite_app::AppState;
-use ferrite_core::config::{UpstreamConfig, ZoneConfig};
+use ferrite_core::config::{BlockAnswer, BlockResponse, UpstreamConfig, ZoneConfig};
 use ferrite_core::error::FeriteError;
 use ferrite_core::fsinfo;
 use ferrite_core::net::normalize_client_key;
@@ -74,7 +74,8 @@ mod nullable {
 ///                             `log_max_mb`,
 ///                             `log_queries`, `keep_stats`,
 ///                             `blocklist_enabled`, `blocklist_client_bypass`,
-///                             `debug_logging`.
+///                             `blocklist_block_response`, `blocklist_block_ipv4`,
+///                             `blocklist_block_ipv6`, `debug_logging`.
 /// Restart-required:           `storage_backend`, `storage_path`,
 ///                             `blocklist_cache_dir`,
 ///                             `dns_bind_addr`, `dns_cache_size`, `dns_cache_max_mb`,
@@ -107,6 +108,13 @@ pub struct SettingsPatch {
     pub keep_stats: Option<bool>,
     pub blocklist_enabled: Option<bool>,
     pub blocklist_client_bypass: Option<Vec<String>>,
+    /// What blocked names are answered with — see `BlockResponse`.
+    pub blocklist_block_response: Option<BlockResponse>,
+    /// The addresses `custom_ip` answers with; `null` clears one.
+    #[serde(default, deserialize_with = "nullable::deserialize")]
+    pub blocklist_block_ipv4: Option<Option<Ipv4Addr>>,
+    #[serde(default, deserialize_with = "nullable::deserialize")]
+    pub blocklist_block_ipv6: Option<Option<Ipv6Addr>>,
     pub debug_logging: Option<bool>,
 
     // ── Restart-required ─────────────────────────────────────────────────────
@@ -176,9 +184,37 @@ pub async fn update_settings(
     let mut debug_logging_to_apply: Option<bool> = None;
     let mut log_queries_to_apply: Option<bool> = None;
     let mut keep_stats_to_apply: Option<bool> = None;
+    let mut block_answer_to_apply: Option<BlockAnswer> = None;
 
     {
         let mut cfg = state.live_config.write();
+
+        // Checked before anything is written: `custom_ip` with no address
+        // would answer every blocked A and AAAA with nothing at all, which is
+        // `nodata` under another name — say so instead.
+        let block_answer = (patch.blocklist_block_response.is_some()
+            || patch.blocklist_block_ipv4.is_some()
+            || patch.blocklist_block_ipv6.is_some())
+        .then(|| BlockAnswer {
+            response: patch
+                .blocklist_block_response
+                .unwrap_or(cfg.blocklist.block_response),
+            ipv4: patch
+                .blocklist_block_ipv4
+                .unwrap_or(cfg.blocklist.block_ipv4),
+            ipv6: patch
+                .blocklist_block_ipv6
+                .unwrap_or(cfg.blocklist.block_ipv6),
+        });
+        if let Some(answer) = block_answer
+            && answer.response == BlockResponse::CustomIp
+            && answer.ipv4.is_none()
+            && answer.ipv6.is_none()
+        {
+            return Err(ApiError(FeriteError::Config(
+                "custom_ip needs blocklist_block_ipv4 or blocklist_block_ipv6".into(),
+            )));
+        }
 
         // ── Hot-patchable ────────────────────────────────────────────────────
 
@@ -306,6 +342,14 @@ pub async fn update_settings(
             cfg.blocklist.client_bypass = normalized.clone();
             blocklist_client_bypass_to_apply = Some(normalized);
             hot_changed.push("blocklist_client_bypass");
+        }
+
+        if let Some(answer) = block_answer {
+            cfg.blocklist.block_response = answer.response;
+            cfg.blocklist.block_ipv4 = answer.ipv4;
+            cfg.blocklist.block_ipv6 = answer.ipv6;
+            block_answer_to_apply = Some(answer);
+            hot_changed.push("blocklist_block_response");
         }
 
         if let Some(debug) = patch.debug_logging {
@@ -521,6 +565,10 @@ pub async fn update_settings(
 
     if let Some(entries) = blocklist_client_bypass_to_apply {
         state.inner.blocklist.set_client_bypass(&entries);
+    }
+
+    if let Some(answer) = block_answer_to_apply {
+        state.inner.blocklist.set_block_answer(answer);
     }
 
     // RUST_LOG, when set, owns the filter — don't let the toggle fight it.

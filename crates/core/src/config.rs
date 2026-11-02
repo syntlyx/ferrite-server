@@ -372,6 +372,16 @@ pub struct BlocklistConfig {
     /// stricter for its devices, never looser.
     #[serde(default)]
     pub youtube_restricted: YoutubeRestrict,
+    /// What a blocked name is answered with. NXDOMAIN by default.
+    #[serde(skip_serializing_if = "BlockResponse::is_default")]
+    pub block_response: BlockResponse,
+    /// The A answer for a blocked name with `block_response = "custom_ip"` —
+    /// say, a block page on your network.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_ipv4: Option<Ipv4Addr>,
+    /// The AAAA answer with `block_response = "custom_ip"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_ipv6: Option<Ipv6Addr>,
     /// DEPRECATED: superseded by `domains`, which holds exact entries too.
     /// Still accepted on load — `Config::normalize` migrates entries into
     /// `domains` — and no longer serialized, so the next save uses the new shape.
@@ -389,6 +399,54 @@ pub struct BlocklistConfig {
     /// `wildcard_block` are global and apply to every profile.
     #[serde(default)]
     pub profiles: Vec<BlocklistProfileConfig>,
+}
+
+/// What a blocked name is answered with.
+///
+/// NXDOMAIN tells an app the name doesn't exist, so it gives up at once — the
+/// right default. Some apps retry an NXDOMAIN hard, or treat it as "offline";
+/// an address that leads nowhere (`null_ip`) or a page of your own
+/// (`custom_ip`) settles them.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockResponse {
+    /// NXDOMAIN — no such name.
+    #[default]
+    Nxdomain,
+    /// NOERROR with no records — the name exists, without this type.
+    Nodata,
+    /// `0.0.0.0` for A, `::` for AAAA, no records for any other type.
+    NullIp,
+    /// `block_ipv4` for A, `block_ipv6` for AAAA; no records for a type
+    /// without an address, or any other type.
+    CustomIp,
+    /// REFUSED — the server won't answer this.
+    Refused,
+}
+
+impl BlockResponse {
+    pub fn is_default(&self) -> bool {
+        *self == BlockResponse::Nxdomain
+    }
+}
+
+/// [`BlockResponse`] with the addresses it may need — what the DNS path reads
+/// for every blocked name.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BlockAnswer {
+    pub response: BlockResponse,
+    pub ipv4: Option<Ipv4Addr>,
+    pub ipv6: Option<Ipv6Addr>,
+}
+
+impl BlocklistConfig {
+    pub fn block_answer(&self) -> BlockAnswer {
+        BlockAnswer {
+            response: self.block_response,
+            ipv4: self.block_ipv4,
+            ipv6: self.block_ipv6,
+        }
+    }
 }
 
 /// YouTube Restricted Mode, enforced in DNS: YouTube's hosts resolve to the
@@ -812,6 +870,9 @@ impl Default for BlocklistConfig {
             domains: vec![],
             wildcard_block: vec![],
             services: vec![],
+            block_response: BlockResponse::default(),
+            block_ipv4: None,
+            block_ipv6: None,
             safe_search: false,
             youtube_restricted: Default::default(),
             whitelist: vec![],
@@ -1117,6 +1178,17 @@ impl PanelConfig {
 
 impl BlocklistConfig {
     pub fn normalize(&mut self) {
+        // The API refuses this; a hand-edited file gets a warning, and blocked
+        // A / AAAA questions get no records until an address is set.
+        if self.block_response == BlockResponse::CustomIp
+            && self.block_ipv4.is_none()
+            && self.block_ipv6.is_none()
+        {
+            tracing::warn!(
+                "blocklist.block_response = \"custom_ip\" without block_ipv4 or block_ipv6 — \
+                 blocked names get empty answers until one is set"
+            );
+        }
         let normalized: BTreeSet<String> = self
             .client_bypass
             .iter()
