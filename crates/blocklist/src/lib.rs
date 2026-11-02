@@ -2,12 +2,16 @@ pub mod cache;
 pub mod domains;
 pub mod engine;
 pub mod loader;
+mod names;
 pub mod parser;
+mod profiles;
 mod refresh;
 
 pub use domains::DomainSet;
-pub use engine::{Blocklist, CompiledProfile, normalise_domain};
+pub use engine::Blocklist;
+pub use names::{normalise_domain, wildcard_to_regex};
 pub use parser::AdblockStats;
+pub use profiles::CompiledProfile;
 
 /// Which decision set a subscription list populates. Blocklists and allowlists
 /// share one fetch/parse/FST pipeline; polarity only changes how Adblock-format

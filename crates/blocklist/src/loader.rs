@@ -505,6 +505,12 @@ pub fn ram_fst(bytes: Vec<u8>) -> Result<FstMap> {
 /// writer of ferrite FST files must therefore replace them atomically (write a
 /// tmp path, then rename) — never write in place. Rename keeps the old inode
 /// alive for existing mappings.
+/// An FST with no keys — what a set serves before its first build.
+pub(crate) fn empty_fst() -> FstMap {
+    let bytes = MapBuilder::memory().into_inner().expect("empty FST build");
+    ram_fst(bytes).expect("empty FST map")
+}
+
 pub fn mmap_fst(path: &Path) -> Result<FstMap> {
     let file = std::fs::File::open(path)
         .map_err(|e| FeriteError::Fst(format!("open {}: {e}", path.display())))?;
