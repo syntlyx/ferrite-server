@@ -759,6 +759,50 @@ async fn blocked_answer_carries_an_soa_bounding_negative_caching() {
     cleanup_sqlite(&h.db_path);
 }
 
+/// With the optimistic cache on, an expired entry still answers — briefly,
+/// logged as a stale cache hit — instead of sending the client upstream.
+#[tokio::test]
+async fn an_expired_entry_answers_stale_while_the_window_is_open() {
+    let mut h = Harness::new("dns-serve-stale").await;
+    h.dns_cache.insert(
+        "stale.test",
+        1,
+        false,
+        DnsResponse {
+            bytes: bytes::Bytes::from(a_response(
+                0x3333,
+                "stale.test",
+                Ipv4Addr::new(192, 0, 2, 7),
+                0,
+            )),
+            ttl: 0,
+        },
+    );
+    let client = SocketAddr::from(([192, 0, 2, 10], 53_000));
+    let ctx = Arc::new(h.ctx());
+
+    // Off: expired means upstream.
+    let raw = query("stale.test", RecordType::A).to_bytes().unwrap();
+    assert!(matches!(decide(&raw, client, &ctx), Decision::Upstream(_)));
+
+    h.dns_cache.set_stale_window(3600);
+    let Decision::Answer(bytes) = decide(&raw, client, &ctx) else {
+        panic!("a stale entry inside the window answers");
+    };
+    let msg = Message::from_bytes(&bytes).unwrap();
+    assert_eq!(
+        msg.answers[0].data,
+        RData::A(Ipv4Addr::new(192, 0, 2, 7).into())
+    );
+    // 30 s at most — and never past the client ceiling.
+    assert_eq!(msg.answers[0].ttl, STALE_ANSWER_TTL.min(h.client_ttl));
+    let entry = h.rx.try_recv().unwrap();
+    assert_eq!(entry.status, QueryStatus::Cached);
+    assert_eq!(entry.upstream.as_deref(), Some("stale"));
+
+    cleanup_sqlite(&h.db_path);
+}
+
 /// Each `block_response` mode shapes the answer as documented, the address
 /// forms per record type, and the query log keeps the RCODE that went out.
 #[tokio::test]
@@ -1237,7 +1281,7 @@ async fn safe_search_answers_with_a_cname_to_the_safe_host() {
     let decision = decide(
         &raw_query("www.google.com", RecordType::A),
         client,
-        &h.ctx(),
+        &Arc::new(h.ctx()),
     );
     assert!(matches!(decision, Decision::Upstream(ref p) if p.rewrite.is_none()));
 
@@ -1292,7 +1336,7 @@ async fn safe_search_answers_with_a_cname_to_the_safe_host() {
     let decision = decide(
         &raw_query("www.youtube.com", RecordType::AAAA),
         client,
-        &h.ctx(),
+        &Arc::new(h.ctx()),
     );
     assert!(matches!(
         decision,
@@ -1304,7 +1348,7 @@ async fn safe_search_answers_with_a_cname_to_the_safe_host() {
     let decision = decide(
         &raw_query("www.youtube.com", RecordType::A),
         client,
-        &h.ctx(),
+        &Arc::new(h.ctx()),
     );
     assert!(matches!(decision, Decision::Answer(_)));
     let blocked = Message::from_bytes(&match decision {

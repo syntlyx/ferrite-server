@@ -28,6 +28,13 @@ cache_size = 10000
 min_ttl = 60
 max_ttl = 3600
 
+# Optimistic cache: answer from an expired entry at once (with a 30 s TTL) and
+# refresh it in the background, so a name a device asked for before never waits
+# on the upstream — and keeps resolving while the upstream is down, for up to
+# stale_max_age seconds. Off by default.
+# serve_stale = true
+# stale_max_age = 43200
+
 # Domains to suppress from the query log entirely (still resolved normally).
 # Exact names or wildcard suffixes. Useful for noisy local/private zones.
 # `fe.te` is ferrite's built-in panel domain and is ignored by default.

@@ -15,7 +15,7 @@ use ferrite_core::config::{BlockAnswer, BlockResponse, UpstreamConfig, ZoneConfi
 use ferrite_core::error::FeriteError;
 use ferrite_core::fsinfo;
 use ferrite_core::net::normalize_client_key;
-use ferrite_dns::cache::{MAX_TTL, MIN_TTL};
+use ferrite_dns::cache::{MAX_STALE_AGE, MAX_TTL, MIN_TTL};
 
 /// GET /api/settings — return the current live configuration.
 /// `api_key` and `password_hash`: `"***"` if non-empty, `null` if not — always present.
@@ -69,7 +69,8 @@ mod nullable {
 /// All fields that can be changed via PATCH /api/settings.
 ///
 /// Hot-patchable (no restart): `api_key`, `password`, `dns_min_ttl`, `dns_max_ttl`,
-///                             `dns_client_ttl`,
+///                             `dns_client_ttl`, `dns_serve_stale`,
+///                             `dns_stale_max_age`,
 ///                             `dns_log_ignore`, `web_dir`, `log_retention_days`,
 ///                             `log_max_mb`,
 ///                             `log_queries`, `keep_stats`,
@@ -92,6 +93,10 @@ pub struct SettingsPatch {
     pub dns_min_ttl: Option<u64>,
     pub dns_max_ttl: Option<u64>,
     pub dns_client_ttl: Option<u32>,
+    /// Optimistic cache on or off; see `DnsConfig::serve_stale`.
+    pub dns_serve_stale: Option<bool>,
+    /// Seconds an expired entry may still be served (60 … a week).
+    pub dns_stale_max_age: Option<u64>,
     pub dns_log_ignore: Option<Vec<String>>,
     #[serde(default, deserialize_with = "nullable::deserialize")]
     pub web_dir: Option<Option<PathBuf>>,
@@ -185,6 +190,7 @@ pub async fn update_settings(
     let mut log_queries_to_apply: Option<bool> = None;
     let mut keep_stats_to_apply: Option<bool> = None;
     let mut block_answer_to_apply: Option<BlockAnswer> = None;
+    let mut stale_window_to_apply: Option<u64> = None;
 
     {
         let mut cfg = state.live_config.write();
@@ -206,6 +212,13 @@ pub async fn update_settings(
                 .blocklist_block_ipv6
                 .unwrap_or(cfg.blocklist.block_ipv6),
         });
+        if let Some(age) = patch.dns_stale_max_age
+            && !(60..=MAX_STALE_AGE).contains(&age)
+        {
+            return Err(ApiError(FeriteError::Config(format!(
+                "dns_stale_max_age must be between 60 and {MAX_STALE_AGE} seconds"
+            ))));
+        }
         if let Some(answer) = block_answer
             && answer.response == BlockResponse::CustomIp
             && answer.ipv4.is_none()
@@ -342,6 +355,17 @@ pub async fn update_settings(
             cfg.blocklist.client_bypass = normalized.clone();
             blocklist_client_bypass_to_apply = Some(normalized);
             hot_changed.push("blocklist_client_bypass");
+        }
+
+        if patch.dns_serve_stale.is_some() || patch.dns_stale_max_age.is_some() {
+            if let Some(age) = patch.dns_stale_max_age {
+                cfg.dns.stale_max_age = age;
+            }
+            if let Some(on) = patch.dns_serve_stale {
+                cfg.dns.serve_stale = on;
+            }
+            stale_window_to_apply = Some(cfg.dns.stale_window());
+            hot_changed.push("dns_serve_stale");
         }
 
         if let Some(answer) = block_answer {
@@ -569,6 +593,10 @@ pub async fn update_settings(
 
     if let Some(answer) = block_answer_to_apply {
         state.inner.blocklist.set_block_answer(answer);
+    }
+
+    if let Some(window) = stale_window_to_apply {
+        state.inner.dns_cache.set_stale_window(window);
     }
 
     // RUST_LOG, when set, owns the filter — don't let the toggle fight it.

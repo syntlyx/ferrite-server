@@ -274,6 +274,7 @@ impl AppState {
             config.dns.min_ttl,
             config.dns.max_ttl,
         ));
+        dns_cache.set_stale_window(config.dns.stale_window());
 
         // Blocklist engine
         let fst_path = config.storage.blocklist_fst_path();

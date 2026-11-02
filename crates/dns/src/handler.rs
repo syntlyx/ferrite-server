@@ -10,6 +10,7 @@ use hickory_proto::rr::{RData, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use tokio::sync::mpsc;
 
+use crate::cache::{DnsCache, STALE_ANSWER_TTL};
 use crate::ctx::DnsCtx;
 use crate::query::LazyQuery;
 use crate::safesearch;
@@ -92,7 +93,7 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
 
 /// Steps 1-4 of the pipeline (see [`handle_query`]): everything that can be
 /// settled from memory. Runs on whichever thread received the datagram.
-pub fn decide(raw: &[u8], src: SocketAddr, ctx: &DnsCtx) -> Decision {
+pub fn decide(raw: &[u8], src: SocketAddr, ctx: &Arc<DnsCtx>) -> Decision {
     let start = Instant::now();
 
     // The query is read off the wire and decoded only if a step has to build an
@@ -288,9 +289,23 @@ pub fn decide(raw: &[u8], src: SocketAddr, ctx: &DnsCtx) -> Decision {
     }
 
     // ── Step 4: DNS response cache ────────────────────────────────────────
-    if let Some((cached, remaining_ttl)) =
-        ctx.dns_cache.get_with_remaining(&name, qtype, want_dnssec)
-    {
+    // A fresh entry answers with its remaining lifetime. With the optimistic
+    // cache on, an expired one inside the stale window answers too — briefly,
+    // with STALE_ANSWER_TTL — while a background query fetches a fresh one, so
+    // the client never waits on the upstream for a name it has asked before.
+    let hit = ctx
+        .dns_cache
+        .get_with_remaining(&name, qtype, want_dnssec)
+        .map(|(cached, remaining)| (cached, remaining, false))
+        .or_else(|| {
+            ctx.dns_cache
+                .get_stale(&name, qtype, want_dnssec)
+                .map(|cached| (cached, STALE_ANSWER_TTL, true))
+        });
+    if let Some((cached, remaining_ttl, stale)) = hit {
+        if stale {
+            refresh_stale(ctx, raw, &name, qtype, want_dnssec);
+        }
         if filtering_enabled
             && let Some(blocked_cname) =
                 cname_blocked_target(&cached.bytes, &name, &ctx.blocklist, profile.as_deref())
@@ -322,7 +337,7 @@ pub fn decide(raw: &[u8], src: SocketAddr, ctx: &DnsCtx) -> Decision {
                     client_text.unwrap_or_else(|| ip_to_string(client_addr)),
                     status,
                     start.elapsed().as_millis() as u32,
-                    None,
+                    stale.then(|| "stale".to_string()),
                     0,
                 )
             });
@@ -633,6 +648,45 @@ fn make_entry(
 /// carry meaning for a resolver; the names are cosmetic, and `.invalid`
 /// (RFC 2606) can never collide with a real zone.
 const SOA_ADMIN_NAME: &[u8] = b"\x07ferrite\x07invalid\x00";
+
+/// Fetch a fresh answer for a stale cache entry in the background and cache
+/// it. The client was answered from the stale entry already, so nothing is
+/// logged; a failed fetch leaves the stale entry to answer — and retry — until
+/// the stale window closes. One refresh per entry at a time, and none when the
+/// box is already at its in-flight query limit.
+fn refresh_stale(ctx: &Arc<DnsCtx>, raw: &[u8], name: &str, qtype: u16, want_dnssec: bool) {
+    let key = DnsCache::cache_key(name, qtype, want_dnssec);
+    let Ok(permit) = ctx.query_semaphore.clone().try_acquire_owned() else {
+        return;
+    };
+    if !ctx.dns_cache.begin_refresh(&key) {
+        return;
+    }
+    let upstream_query = sanitize_query(raw, ctx.dns_config.strip_ecs, want_dnssec);
+    let ctx = Arc::clone(ctx);
+    let name = name.to_string();
+    tokio::spawn(async move {
+        let _permit = permit;
+        match ctx.upstream_pool.resolve_raw(upstream_query).await {
+            Ok((bytes, _)) if wire::rcode(&bytes) == Some(0) => {
+                if let Some(ttl) = wire::cache_ttl(&bytes) {
+                    ctx.dns_cache.insert(
+                        &name,
+                        qtype,
+                        want_dnssec,
+                        DnsResponse {
+                            bytes: bytes::Bytes::copy_from_slice(&bytes),
+                            ttl,
+                        },
+                    );
+                }
+            }
+            Ok(_) => tracing::debug!("stale refresh of {name}: upstream answered an error"),
+            Err(e) => tracing::debug!("stale refresh of {name}: {e}"),
+        }
+        ctx.dns_cache.end_refresh(&key);
+    });
+}
 
 /// NXDOMAIN for a blocked name, carrying an SOA in the authority section so the
 /// client's *negative* caching is bounded by `ttl` too.

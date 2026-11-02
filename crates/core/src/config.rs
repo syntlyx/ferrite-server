@@ -170,6 +170,31 @@ pub struct DnsConfig {
     /// channel (DoT/DoH/tunnel) — ferrite does not validate locally yet. On by default.
     #[serde(default = "default_true")]
     pub dnssec: bool,
+    /// Optimistic cache: answer from an entry that has expired — with a
+    /// 30-second TTL — and refresh it in the background, instead of making the
+    /// client wait on the upstream. A name keeps resolving while the upstream
+    /// is down, for up to `stale_max_age`. Off by default: an answer can then
+    /// be up to that much out of date for one round.
+    pub serve_stale: bool,
+    /// How long past its expiry an entry may still be served, in seconds.
+    #[serde(default = "default_stale_max_age")]
+    pub stale_max_age: u64,
+}
+
+/// Twelve hours: a night of a dead upstream, without answers growing old.
+fn default_stale_max_age() -> u64 {
+    12 * 3600
+}
+
+impl DnsConfig {
+    /// The cache's stale window: `stale_max_age` when serving stale, else 0.
+    pub fn stale_window(&self) -> u64 {
+        if self.serve_stale {
+            self.stale_max_age
+        } else {
+            0
+        }
+    }
 }
 
 /// Route a DNS zone to a specific upstream server instead of the default pool.
@@ -818,6 +843,8 @@ impl Default for DnsConfig {
             ],
             strip_ecs: true,
             dnssec: true,
+            serve_stale: false,
+            stale_max_age: default_stale_max_age(),
         }
     }
 }

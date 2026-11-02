@@ -1,7 +1,9 @@
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use lru::LruCache;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::num::NonZeroUsize;
 
 use crate::types::DnsResponse;
@@ -17,6 +19,14 @@ use crate::types::DnsResponse;
 /// (`dns.client_ttl`).
 pub const MIN_TTL: u64 = 0;
 pub const MAX_TTL: u64 = 3600;
+
+/// The TTL a stale answer goes out with (RFC 8767 §4 suggests 30 seconds):
+/// long enough to spare the client an immediate retry, short enough that the
+/// refreshed answer reaches it soon after.
+pub const STALE_ANSWER_TTL: u32 = 30;
+
+/// The longest an entry may be served past its expiry, in seconds — a week.
+pub const MAX_STALE_AGE: u64 = 7 * 24 * 3600;
 
 #[derive(Debug, Clone, Copy)]
 struct TtlBounds {
@@ -89,6 +99,12 @@ pub struct DnsCache {
     /// Byte budget across all entries; `usize::MAX` = unbounded.
     max_bytes: usize,
     ttl_bounds: RwLock<TtlBounds>,
+    /// How long past expiry an entry is still kept and served (seconds);
+    /// `0` turns the optimistic cache off. Hot-patchable.
+    stale_window: AtomicU64,
+    /// Keys being refreshed in the background, so a burst of stale hits on
+    /// one name sends one upstream query, not one per hit.
+    refreshing: Mutex<HashSet<String>>,
 }
 
 impl DnsCache {
@@ -106,7 +122,48 @@ impl DnsCache {
                 max_bytes
             },
             ttl_bounds: RwLock::new(normalize_ttl_bounds(min_ttl, max_ttl)),
+            stale_window: AtomicU64::new(0),
+            refreshing: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Serve entries up to `secs` past their expiry (`0` = never). Entries
+    /// already dropped stay dropped; from now on expired ones are kept.
+    pub fn set_stale_window(&self, secs: u64) {
+        self.stale_window
+            .store(secs.min(MAX_STALE_AGE), Ordering::Relaxed);
+    }
+
+    pub fn stale_window_secs(&self) -> u64 {
+        self.stale_window.load(Ordering::Relaxed)
+    }
+
+    /// An entry that has expired but is still inside the stale window — for the
+    /// optimistic cache to answer with while it fetches a fresh one. `None`
+    /// when the window is off, the entry is fresh (use
+    /// [`Self::get_with_remaining`]) or too old.
+    pub fn get_stale(&self, name: &str, qtype: u16, dnssec: bool) -> Option<DnsResponse> {
+        let window = self.stale_window.load(Ordering::Relaxed);
+        if window == 0 {
+            return None;
+        }
+        Self::with_key(name, qtype, dnssec, |key| {
+            let guard = self.inner.read();
+            let entry = guard.lru.peek(key)?;
+            let now = Instant::now();
+            (now >= entry.expires_at && now < entry.expires_at + Duration::from_secs(window))
+                .then(|| entry.response.clone())
+        })
+    }
+
+    /// Claim the background refresh of `key`. `false` when one is already
+    /// running; whoever gets `true` must call [`Self::end_refresh`].
+    pub fn begin_refresh(&self, key: &str) -> bool {
+        self.refreshing.lock().insert(key.to_string())
+    }
+
+    pub fn end_refresh(&self, key: &str) {
+        self.refreshing.lock().remove(key);
     }
 
     /// Build a cache key from (name, qtype, dnssec). DNSSEC-OK responses carry
@@ -280,15 +337,17 @@ impl DnsCache {
         }
     }
 
-    /// Remove all expired entries. Called by the janitor task.
+    /// Remove all expired entries — past the stale window, when the optimistic
+    /// cache is on. Called by the janitor task.
     pub fn evict_expired(&self) {
         let now = Instant::now();
+        let window = Duration::from_secs(self.stale_window.load(Ordering::Relaxed));
         let mut guard = self.inner.write();
         // LruCache doesn't expose drain_filter, so collect expired keys first.
         let expired: Vec<String> = guard
             .lru
             .iter()
-            .filter(|(_, v)| now >= v.expires_at)
+            .filter(|(_, v)| now >= v.expires_at + window)
             .map(|(k, _)| k.clone())
             .collect();
         for k in expired {
@@ -385,6 +444,63 @@ pub async fn janitor(cache: std::sync::Arc<DnsCache>) {
 
 #[cfg(test)]
 mod tests {
+
+    fn expired_now(cache: &DnsCache, name: &str) {
+        // TTL 0 with no floor: expires the instant it is stored.
+        cache.insert(
+            name,
+            1,
+            false,
+            DnsResponse {
+                bytes: bytes::Bytes::from_static(b"x"),
+                ttl: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn an_expired_entry_is_served_stale_only_inside_the_window() {
+        let cache = DnsCache::new(8, 0, 0, 3600);
+        expired_now(&cache, "old.test");
+        assert!(cache.get_with_remaining("old.test", 1, false).is_none());
+        // Off: an expired entry is gone for the query path, and for the janitor.
+        assert!(cache.get_stale("old.test", 1, false).is_none());
+
+        cache.set_stale_window(600);
+        assert!(cache.get_stale("old.test", 1, false).is_some());
+        // A fresh entry is not "stale".
+        cache.insert(
+            "new.test",
+            1,
+            false,
+            DnsResponse {
+                bytes: bytes::Bytes::from_static(b"y"),
+                ttl: 300,
+            },
+        );
+        assert!(cache.get_stale("new.test", 1, false).is_none());
+
+        // The janitor keeps what the window still covers…
+        cache.evict_expired();
+        assert_eq!(cache.len(), 2);
+        // …and drops it once the window is off.
+        cache.set_stale_window(0);
+        cache.evict_expired();
+        assert_eq!(cache.len(), 1);
+        // A window can't be longer than a week.
+        cache.set_stale_window(u64::MAX);
+        assert_eq!(cache.stale_window_secs(), MAX_STALE_AGE);
+    }
+
+    #[test]
+    fn one_refresh_per_key_at_a_time() {
+        let cache = DnsCache::new(8, 0, 0, 3600);
+        assert!(cache.begin_refresh("a/1"));
+        assert!(!cache.begin_refresh("a/1"));
+        assert!(cache.begin_refresh("b/1"));
+        cache.end_refresh("a/1");
+        assert!(cache.begin_refresh("a/1"));
+    }
 
     /// The two key builders must agree exactly: a lookup uses the stack form,
     /// the insert that stored the entry used the owned one.
