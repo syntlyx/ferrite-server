@@ -578,6 +578,15 @@ GET /api/blocklist/check/ads.example.com
 { "domain": "ads.example.com", "blocked": true, "whitelisted": false }
 ```
 
+With `?client=<ip|mac>` the answer also carries that device's own decision —
+the profile on for it now, a pause or bypass, and the SafeSearch host it gets
+instead:
+
+```json
+"for_client": { "client": "192.168.1.42", "mac": "aa:bb:cc:dd:ee:ff", "profile": "kids",
+                "filtering_off": false, "blocked": true, "safe_search_answer": null }
+```
+
 When the exemption comes from a subscribed allowlist, `whitelist_match` names it:
 
 ```json
