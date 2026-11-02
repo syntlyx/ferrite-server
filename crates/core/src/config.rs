@@ -765,8 +765,7 @@ impl Config {
                 tracing::info!("loading config from {}", path.display());
                 let raw = std::fs::read_to_string(path)
                     .map_err(|e| FeriteError::Config(format!("read {}: {}", path.display(), e)))?;
-                let config: Config = toml::from_str(&raw)?;
-                return Ok(config.normalized());
+                return Self::from_toml(&raw);
             }
         }
 
@@ -779,6 +778,17 @@ impl Config {
                 .join(", ")
         );
         Ok(Config::default())
+    }
+
+    /// Parse a config file's text the way startup does: TOML, then normalised.
+    pub fn from_toml(raw: &str) -> Result<Self> {
+        let config: Config = toml::from_str(raw)?;
+        Ok(config.normalized())
+    }
+
+    /// The text [`Self::save`] writes — also what a backup download carries.
+    pub fn to_toml(&self) -> Result<String> {
+        Ok(toml::to_string_pretty(&self.clone().normalized())?)
     }
 
     pub fn normalized(mut self) -> Self {
@@ -855,7 +865,7 @@ impl Config {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let raw = toml::to_string_pretty(&self.clone().normalized())?;
+        let raw = self.to_toml()?;
         // Write to a temp file then atomically rename to avoid corrupting config on crash.
         let tmp = path.with_extension("toml.tmp");
         std::fs::write(&tmp, &raw)?;

@@ -617,6 +617,63 @@ hostnames, `.lan`/`.local`/`.home`/`.internal`/`.localdomain`, and configured
 
 ---
 
+## Pausing Filtering
+
+A pause lifts filtering for a while — for the whole box or for single devices —
+and lapses on its own. It is never written to `config.toml`: a restart resumes
+filtering. Times are unix seconds.
+
+### `GET /api/blocking/pause` — what is paused
+
+```json
+{
+  "now": 1793620000,
+  "global_until": 1793620300,            // null when the box is not paused
+  "clients": [{ "key": "aa:bb:cc:dd:ee:ff", "until": 1793621800 }]
+}
+```
+
+### `POST /api/blocking/pause` — pause filtering
+
+```json
+{ "minutes": 5 }                                   // the whole box
+{ "minutes": 30, "clients": ["192.168.1.10"] }     // just these devices (IPs and/or MACs)
+```
+
+`minutes` is 1–1440. Pausing again replaces the deadline. Responds with the
+same shape as `GET`.
+
+### `POST /api/blocking/resume` — end a pause early
+
+```json
+{}                                   // the box-wide pause
+{ "clients": ["192.168.1.10"] }      // these devices
+```
+
+---
+
+## Backup & Restore
+
+### `GET /api/config/export` — download `config.toml`
+
+The whole configuration as ferrite writes it (`application/toml`, served as an
+attachment). It includes secrets — the API key, the password hash, WireGuard
+private keys — so keep the file somewhere safe.
+
+### `POST /api/config/import` — restore a `config.toml`
+
+Body: the TOML text of a config file. It is parsed and checked the way startup
+would (listener addresses, storage and blocklist-cache paths); a file that
+fails is refused with `400` and nothing is written. Otherwise the current file
+is kept as `config.toml.bak`, the upload replaces it, and the service restarts
+so every section applies.
+
+```json
+{ "saved_to": "/etc/ferrite/config.toml", "backup": "/etc/ferrite/config.toml.bak", "restart": true }
+```
+
+---
+
 ## Subscription Lists
 
 Remote blocklists that ferrite downloads and compiles into an FST. Per-list downloads are cached on disk for 12 hours; only expired or new lists hit the network on refresh.

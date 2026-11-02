@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod backup;
 pub mod blocklist;
 pub mod clients;
 pub mod custom_records;
@@ -8,6 +9,7 @@ pub mod lists;
 pub mod logs;
 pub mod metrics;
 pub mod middleware;
+pub mod pause;
 pub mod profiles;
 pub mod proxy;
 pub mod queries;
@@ -84,6 +86,13 @@ pub fn build_router(state: AppState) -> Router {
             "/custom-records/{domain}",
             delete(custom_records::delete_record),
         )
+        // Temporary pauses of filtering (box-wide or per device; not persisted)
+        .route("/blocking/pause", get(pause::get_pause))
+        .route("/blocking/pause", post(pause::pause))
+        .route("/blocking/resume", post(pause::resume))
+        // Whole-config backup and restore
+        .route("/config/export", get(backup::export_config))
+        .route("/config/import", post(backup::import_config))
         // Settings
         .route("/settings", get(settings::get_settings))
         .route("/settings", patch(settings::update_settings))

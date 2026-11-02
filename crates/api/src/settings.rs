@@ -561,7 +561,7 @@ pub async fn update_settings(
 /// Delayed so this request's response gets out first — the caller is told a
 /// restart is coming, then it happens.
 #[cfg(not(test))]
-fn schedule_restart(state: &AppState) {
+pub(crate) fn schedule_restart(state: &AppState) {
     tracing::info!("restart-required settings changed, saving snapshot and exiting");
     let snap_state = state.clone();
     tokio::spawn(async move {
@@ -583,7 +583,7 @@ fn schedule_restart(state: &AppState) {
 /// had not run yet. A false green is the one test failure worth engineering
 /// against, so the exit is not reachable from a test at all.
 #[cfg(test)]
-fn schedule_restart(_state: &AppState) {}
+pub(crate) fn schedule_restart(_state: &AppState) {}
 
 /// Check a proposed `storage.path` before it reaches the config file.
 ///
@@ -591,7 +591,7 @@ fn schedule_restart(_state: &AppState) {}
 /// written to disk, and the box then refuses to come back up after the restart
 /// the change itself triggered — with the panel gone, so the only way out is a
 /// text editor on the device.
-fn validate_storage_path(path: &Path) -> Result<PathBuf, ApiError> {
+pub(crate) fn validate_storage_path(path: &Path) -> Result<PathBuf, ApiError> {
     let path = absolute_path("storage_path", path)?;
 
     if path.is_dir() {
@@ -615,7 +615,7 @@ fn validate_storage_path(path: &Path) -> Result<PathBuf, ApiError> {
 /// engine falls back to a RAM FST — but every refresh would then fail to write
 /// and the lists would be downloaded again on each start, which is a worse
 /// failure to discover than a refused request.
-fn validate_blocklist_cache_dir(dir: &Path) -> Result<PathBuf, ApiError> {
+pub(crate) fn validate_blocklist_cache_dir(dir: &Path) -> Result<PathBuf, ApiError> {
     let dir = absolute_path("blocklist_cache_dir", dir)?;
     if dir.exists() && !dir.is_dir() {
         return Err(config_error(format!(
