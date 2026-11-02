@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
@@ -112,6 +112,10 @@ pub struct Blocklist {
     /// would not hold DNS back for a merge. The next refresh recompiles them
     /// even if no list moved.
     profiles_stale: AtomicBool,
+    /// The box-local minute of the week profile schedules are judged by.
+    /// A background tick keeps it current ([`Self::set_clock`]), so the DNS
+    /// path never reads the system clock.
+    clock: AtomicU32,
 }
 
 impl Blocklist {
@@ -162,6 +166,7 @@ impl Blocklist {
             local_zones: RwLock::new(Vec::new()),
             refresh_lock: tokio::sync::Mutex::new(()),
             profiles_stale: AtomicBool::new(false),
+            clock: AtomicU32::new(ferrite_core::schedule::local_minute_of_week()),
         }
     }
 
@@ -457,16 +462,42 @@ impl Blocklist {
     }
 
     /// The profile that applies to this client, if any. Assumes `client_ip`/`mac`
-    /// are already normalised (DNS hot path). First match wins (config order).
+    /// are already normalised (DNS hot path). The first profile in config order
+    /// that lists the client and is on by its schedule wins, so a scheduled
+    /// profile placed above an always-on one overrides it during its hours.
     pub fn profile_for(&self, client_ip: &str, mac: Option<&str>) -> Option<Arc<CompiledProfile>> {
         if !self.has_profiles() {
             return None;
         }
+        let minute = self.clock.load(Ordering::Relaxed);
         self.profiles
             .load()
             .iter()
-            .find(|p| p.matches_client(client_ip, mac))
+            .find(|p| p.matches_client(client_ip, mac) && p.active_at(minute))
             .cloned()
+    }
+
+    /// Set the minute of the week (box-local, Monday 00:00 = 0) that profile
+    /// schedules are judged by. Called by the clock tick; tests set it directly.
+    pub fn set_clock(&self, minute_of_week: u32) {
+        self.clock.store(
+            minute_of_week % ferrite_core::schedule::MINUTES_PER_WEEK,
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn clock(&self) -> u32 {
+        self.clock.load(Ordering::Relaxed)
+    }
+
+    /// Each compiled profile's id and whether its schedule has it on now.
+    pub fn profile_activity(&self) -> Vec<(String, bool)> {
+        let minute = self.clock();
+        self.profiles
+            .load()
+            .iter()
+            .map(|p| (p.id.clone(), p.active_at(minute)))
+            .collect()
     }
 
     /// Replace the profile set and rebuild their FSTs from the on-disk per-list

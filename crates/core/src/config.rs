@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use crate::error::{FeriteError, Result};
 use crate::net::normalize_client_key;
 use crate::recording::RecordScope;
+use crate::schedule::ScheduleWindow;
 
 /// XDG-style config dir: always `~/.config/ferrite` on every platform.
 pub fn config_dir() -> PathBuf {
@@ -413,6 +414,11 @@ pub struct BlocklistProfileConfig {
     /// `[[zones]]` suffixes — are exempt so LAN plumbing keeps working.
     #[serde(default)]
     pub default_deny: bool,
+    /// Weekly windows in which this profile applies, in the box's local time.
+    /// Empty = always. Outside them its devices fall through to the next
+    /// profile that lists them (config order), or to the network-wide rules.
+    #[serde(default)]
+    pub schedule: Vec<ScheduleWindow>,
 }
 
 fn default_blocklist_decision_cache_size() -> usize {
@@ -975,6 +981,12 @@ impl BlocklistConfig {
         for p in &mut self.profiles {
             let owner = format!("profile '{}'", p.id);
             p.services = known_services(&p.services, &owner);
+            // Cleaned up but never dropped: a window that doesn't compile
+            // leaves the profile off (see `Schedule::never`) until it is fixed,
+            // rather than silently turning a bedtime rule on around the clock.
+            for w in &mut p.schedule {
+                w.normalize();
+            }
         }
     }
 }
@@ -1232,6 +1244,36 @@ mod tests {
         assert!(!saved.contains("pattern = \"\""), "{saved}");
         let reloaded = Config::from_toml(&saved).unwrap();
         assert_eq!(reloaded.proxy.rules[0].hit_key(), "service:youtube");
+    }
+
+    #[test]
+    fn profile_schedules_round_trip_toml() {
+        let cfg = Config::from_toml(
+            r#"
+            [[blocklist.profiles]]
+            id = "bedtime"
+            name = "Bedtime"
+            default_deny = true
+
+            [[blocklist.profiles.schedule]]
+            days = ["Sun", "mon"]
+            from = " 21:00"
+            to = "07:00"
+
+            [[blocklist.profiles.schedule]]
+            from = "13:00"
+            to = "15:00"
+            "#,
+        )
+        .unwrap();
+        let schedule = &cfg.blocklist.profiles[0].schedule;
+        assert_eq!(schedule.len(), 2);
+        assert_eq!(schedule[0].days, vec!["mon", "sun"]);
+        assert_eq!(schedule[0].from, "21:00");
+        assert!(schedule[1].days.is_empty());
+
+        let reloaded = Config::from_toml(&cfg.to_toml().unwrap()).unwrap();
+        assert_eq!(&reloaded.blocklist.profiles[0].schedule, schedule);
     }
 
     #[test]

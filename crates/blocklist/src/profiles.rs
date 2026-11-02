@@ -13,6 +13,7 @@ use crate::loader::{self, FstMap, empty_fst};
 use crate::names::{domain_in_set, normalise, wildcard_to_regex};
 use crate::refresh;
 use crate::subscriptions::{FstInputs, MergedSet, meta_path};
+use ferrite_core::schedule::Schedule;
 use ferrite_core::services;
 
 /// Decision-cache size for a per-device profile. Smaller than the global cache
@@ -25,6 +26,10 @@ const PROFILE_DECISION_CACHE: usize = 8_192;
 /// and `wildcard_block` are shared from the parent [`Blocklist`](crate::Blocklist), so a profile
 /// only changes *which subscription lists* apply to its clients.
 pub struct CompiledProfile {
+    /// The profile's id, for reporting which profiles are on right now.
+    pub(crate) id: String,
+    /// When the profile applies; always, without windows.
+    pub(crate) schedule: Schedule,
     /// Normalised client keys (IP/MAC) this profile applies to.
     pub(crate) clients: HashSet<String>,
     pub(crate) fst: FstMap,
@@ -50,6 +55,11 @@ impl CompiledProfile {
     /// are already normalised (the DNS hot path).
     pub(crate) fn matches_client(&self, client_ip: &str, mac: Option<&str>) -> bool {
         self.clients.contains(client_ip) || mac.is_some_and(|m| self.clients.contains(m))
+    }
+
+    /// Is the profile on at `minute` of the week (box-local)?
+    pub(crate) fn active_at(&self, minute: u32) -> bool {
+        self.schedule.is_active(minute)
     }
 
     /// Is `domain` explicitly allowed for this profile (exact/hierarchy or
@@ -134,7 +144,17 @@ pub(crate) fn compile_profiles(
         let (mut block_exact, block_wild) = split_patterns(&cfg.block);
         // Catalog services are this profile's block entries spelled by name.
         block_exact.extend(services::domains_of(&cfg.services).map(str::to_string));
+        let schedule = Schedule::compile(&cfg.schedule).unwrap_or_else(|e| {
+            tracing::error!(
+                "profile '{}': {}; the profile stays off until its schedule is fixed",
+                cfg.id,
+                e
+            );
+            Schedule::never()
+        });
         compiled.push(Arc::new(CompiledProfile {
+            id: cfg.id.clone(),
+            schedule,
             clients,
             fst,
             cache: BlocklistCache::new(PROFILE_DECISION_CACHE),

@@ -166,6 +166,7 @@ fn per_device_profile_applies_a_list_subset_to_matched_clients() {
                 allow: Vec::new(),
                 allowlists: Vec::new(),
                 default_deny: false,
+                schedule: vec![],
             }],
         },
         AllowlistConfig::default(),
@@ -193,6 +194,7 @@ fn per_device_profile_applies_a_list_subset_to_matched_clients() {
         allow: Vec::new(),
         allowlists: Vec::new(),
         default_deny: false,
+        schedule: vec![],
     }]);
     let lite = blocklist.profile_for("10.0.0.9", Some("aa:bb:cc:dd:ee:ff"));
     assert!(lite.is_some(), "profile must match by MAC");
@@ -251,6 +253,7 @@ fn per_profile_manual_rules_override_global() {
                     allow: vec!["social.example".into()],
                     allowlists: Vec::new(),
                     default_deny: false,
+                    schedule: vec![],
                 },
                 // "kids": block news.example (override the global whitelist) + games.
                 BlocklistProfileConfig {
@@ -263,6 +266,7 @@ fn per_profile_manual_rules_override_global() {
                     allow: vec![],
                     allowlists: Vec::new(),
                     default_deny: false,
+                    schedule: vec![],
                 },
             ],
         },
@@ -617,6 +621,7 @@ async fn profile_block_overrides_subscribed_allowlist() {
                 allow: vec![],
                 allowlists: Vec::new(),
                 default_deny: false,
+                schedule: vec![],
             }],
         },
         AllowlistConfig {
@@ -810,6 +815,7 @@ async fn default_deny_blocks_everything_except_allow_tiers() {
                 allow: vec!["app.example".into()],
                 allowlists: vec![],
                 default_deny: true,
+                schedule: vec![],
             }],
         },
         AllowlistConfig {
@@ -865,6 +871,7 @@ async fn default_deny_exempts_local_infra_but_not_from_blacklist() {
                 allow: vec![],
                 allowlists: vec![],
                 default_deny: true,
+                schedule: vec![],
             }],
         },
         AllowlistConfig::default(),
@@ -935,6 +942,7 @@ async fn profile_allowlist_subset_overrides_the_global_allow_set() {
                 allow: vec![],
                 allowlists: vec!["KidSafe".into()],
                 default_deny: true,
+                schedule: vec![],
             }],
         },
         AllowlistConfig {
@@ -1097,6 +1105,7 @@ async fn a_profile_recompiles_only_when_its_own_lists_move() {
                 allow: vec![],
                 allowlists: vec![],
                 default_deny: false,
+                schedule: vec![],
             }],
         },
         AllowlistConfig::default(),
@@ -1249,6 +1258,7 @@ async fn profile_covering_every_list_serves_the_merged_fst() {
                     allow: vec![],
                     allowlists: vec![],
                     default_deny: false,
+                    schedule: vec![],
                 },
                 BlocklistProfileConfig {
                     id: "some".into(),
@@ -1260,6 +1270,7 @@ async fn profile_covering_every_list_serves_the_merged_fst() {
                     allow: vec![],
                     allowlists: vec![],
                     default_deny: false,
+                    schedule: vec![],
                 },
             ],
         },
@@ -1397,6 +1408,7 @@ async fn startup_after_an_upgrade_serves_last_runs_profile_map_until_a_refresh()
             allow: vec![],
             allowlists: vec![],
             default_deny: false,
+            schedule: vec![],
         }],
     };
 
@@ -1484,6 +1496,7 @@ fn network_wide_services_block_everyone_below_the_allow_tiers() {
                 allow: vec!["tiktok.com".into()],
                 allowlists: Vec::new(),
                 default_deny: false,
+                schedule: vec![],
             }],
         ),
         AllowlistConfig {
@@ -1540,6 +1553,7 @@ fn profile_services_block_like_profile_block_entries() {
                 allow: vec!["youtubekids.com".into()],
                 allowlists: Vec::new(),
                 default_deny: false,
+                schedule: vec![],
             }],
         ),
         AllowlistConfig {
@@ -1560,4 +1574,113 @@ fn profile_services_block_like_profile_block_entries() {
     // Other devices are untouched.
     assert!(!blocklist.should_block_for("rr1.googlevideo.com", None));
     assert!(!blocklist.should_block_for("www.youtube.com", None));
+}
+
+#[test]
+fn a_scheduled_profile_overrides_the_next_one_only_in_its_hours() {
+    use ferrite_core::schedule::{MINUTES_PER_DAY, ScheduleWindow};
+
+    let profile =
+        |id: &str, services: &[&str], schedule: Vec<ScheduleWindow>| BlocklistProfileConfig {
+            id: id.into(),
+            name: id.into(),
+            lists: vec![],
+            clients: vec!["10.0.0.2".into()],
+            block: vec![],
+            services: services.iter().map(|s| s.to_string()).collect(),
+            allow: vec!["example.com".into()],
+            allowlists: Vec::new(),
+            default_deny: id == "bedtime",
+            schedule,
+        };
+    let blocklist = Blocklist::new(
+        services_config(
+            vec![],
+            vec![
+                // Listed first, so it wins whenever it is on.
+                profile(
+                    "bedtime",
+                    &[],
+                    vec![ScheduleWindow {
+                        days: vec!["mon".into()],
+                        from: "21:00".into(),
+                        to: "07:00".into(),
+                    }],
+                ),
+                profile("kids", &["tiktok"], vec![]),
+            ],
+        ),
+        AllowlistConfig::default(),
+        temp_fst_path("ferrite-profile-schedule"),
+    );
+    blocklist.rebuild_profiles();
+    let id_at = |minute: u32| {
+        blocklist.set_clock(minute);
+        blocklist
+            .profile_for("10.0.0.2", None)
+            .map(|p| p.id.clone())
+    };
+
+    // Monday noon: bedtime is off, the always-on profile applies.
+    assert_eq!(id_at(12 * 60).as_deref(), Some("kids"));
+    blocklist.set_clock(12 * 60);
+    let p = blocklist.profile_for("10.0.0.2", None);
+    assert!(blocklist.should_block_for("www.tiktok.com", p.as_deref()));
+    assert!(!blocklist.should_block_for("news.example.org", p.as_deref()));
+
+    // Monday 22:00 and Tuesday 06:30: bedtime's default-deny takes over.
+    assert_eq!(id_at(22 * 60).as_deref(), Some("bedtime"));
+    let p = blocklist.profile_for("10.0.0.2", None);
+    assert!(blocklist.should_block_for("news.example.org", p.as_deref()));
+    assert!(!blocklist.should_block_for("example.com", p.as_deref()));
+    assert_eq!(
+        id_at(MINUTES_PER_DAY + 6 * 60 + 30).as_deref(),
+        Some("bedtime")
+    );
+    // Tuesday 07:00: back to the always-on profile.
+    assert_eq!(id_at(MINUTES_PER_DAY + 7 * 60).as_deref(), Some("kids"));
+
+    // Other devices never see either profile.
+    assert!(blocklist.profile_for("10.0.0.3", None).is_none());
+
+    let activity = {
+        blocklist.set_clock(22 * 60);
+        blocklist.profile_activity()
+    };
+    assert_eq!(
+        activity,
+        vec![("bedtime".to_string(), true), ("kids".to_string(), true)]
+    );
+}
+
+#[test]
+fn a_profile_whose_schedule_does_not_compile_stays_off() {
+    let blocklist = Blocklist::new(
+        services_config(
+            vec![],
+            vec![BlocklistProfileConfig {
+                id: "broken".into(),
+                name: "Broken".into(),
+                lists: vec![],
+                clients: vec!["10.0.0.2".into()],
+                block: vec![],
+                services: vec![],
+                allow: vec![],
+                allowlists: Vec::new(),
+                default_deny: true,
+                schedule: vec![ferrite_core::schedule::ScheduleWindow {
+                    days: vec!["someday".into()],
+                    from: "21:00".into(),
+                    to: "07:00".into(),
+                }],
+            }],
+        ),
+        AllowlistConfig::default(),
+        temp_fst_path("ferrite-profile-schedule-broken"),
+    );
+    blocklist.rebuild_profiles();
+    for minute in [0, 22 * 60, 5000] {
+        blocklist.set_clock(minute);
+        assert!(blocklist.profile_for("10.0.0.2", None).is_none());
+    }
 }

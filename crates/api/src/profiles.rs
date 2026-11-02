@@ -17,6 +17,7 @@ use ferrite_app::AppState;
 use ferrite_blocklist::ListPolarity;
 use ferrite_core::config::BlocklistProfileConfig;
 use ferrite_core::error::FeriteError;
+use ferrite_core::schedule::{self, Schedule};
 
 /// GET /api/blocklist/profiles — the configured profiles plus the blocklist and
 /// allowlist names available to build them from (so the UI can offer checkboxes).
@@ -38,10 +39,24 @@ pub async fn get_profiles(State(state): State<AppState>) -> Json<Value> {
         .into_iter()
         .map(|l| l.name)
         .collect();
+    let active: serde_json::Map<String, Value> = state
+        .inner
+        .blocklist
+        .profile_activity()
+        .into_iter()
+        .map(|(id, on)| (id, Value::Bool(on)))
+        .collect();
     Json(json!({
         "profiles": profiles,
         "available_lists": available_lists,
         "available_allowlists": available_allowlists,
+        // Which saved profiles their schedules have on right now, and the
+        // box-local clock schedules are judged by — the panel shows both.
+        "active": active,
+        "clock": {
+            "minute_of_week": state.inner.blocklist.clock(),
+            "utc_offset": schedule::local_utc_offset(),
+        },
     }))
 }
 
@@ -94,9 +109,10 @@ pub async fn put_profiles(
 }
 
 /// Normalise and reject broken profiles with a 400: each needs a slug id and a
-/// name, ids must be unique, and every referenced list must exist (a typo would
-/// otherwise silently apply an empty subset — i.e. block nothing, or for a
-/// default-deny profile's allowlists, allow nothing).
+/// name, ids must be unique, every referenced list and service must exist (a
+/// typo would otherwise silently apply an empty subset — i.e. block nothing, or
+/// for a default-deny profile's allowlists, allow nothing), and every schedule
+/// window must be a real time span.
 fn validate(
     mut profiles: Vec<BlocklistProfileConfig>,
     known_lists: &HashSet<String>,
@@ -133,6 +149,10 @@ fn validate(
             }
         }
         p.services = crate::services::known_ids(&p.services, &format!("profile '{}'", p.id))?;
+        for w in &mut p.schedule {
+            w.normalize();
+        }
+        Schedule::compile(&p.schedule).map_err(|e| bad(&format!("profile '{}': {e}", p.id)))?;
     }
     Ok(profiles)
 }
@@ -196,6 +216,7 @@ mod tests {
             allow: Vec::new(),
             allowlists,
             default_deny: true,
+            schedule: vec![],
         };
 
         // Unknown allowlist name → 400 (a typo would silently allow nothing).
@@ -217,6 +238,51 @@ mod tests {
         let saved = state.live_config.read().blocklist.profiles.clone();
         assert_eq!(saved[0].allowlists, vec!["KidSafe"]);
         assert!(saved[0].default_deny);
+
+        drop(state);
+        test_support::cleanup_sqlite(&db);
+    }
+
+    #[tokio::test]
+    async fn put_checks_schedules_and_get_reports_what_is_on_now() {
+        use ferrite_core::schedule::ScheduleWindow;
+
+        let (state, db) = test_support::app_state("profiles-api-schedule").await;
+        let profile = |from: &str| BlocklistProfileConfig {
+            id: "bedtime".into(),
+            name: "Bedtime".into(),
+            lists: Vec::new(),
+            clients: vec!["10.0.0.2".into()],
+            block: Vec::new(),
+            services: vec![],
+            allow: Vec::new(),
+            allowlists: Vec::new(),
+            default_deny: true,
+            schedule: vec![ScheduleWindow {
+                days: vec![" MON ".into()],
+                from: from.into(),
+                to: "07:00".into(),
+            }],
+        };
+
+        let err = put_profiles(State(state.clone()), Json(vec![profile("25:00")]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err.0, FeriteError::Config(ref m) if m.contains("25:00")));
+
+        let Json(_) = put_profiles(State(state.clone()), Json(vec![profile("21:00")]))
+            .await
+            .unwrap();
+        let saved = state.live_config.read().blocklist.profiles.clone();
+        assert_eq!(saved[0].schedule[0].days, vec!["mon"]);
+
+        state.inner.blocklist.set_clock(22 * 60); // Monday 22:00
+        let Json(v) = get_profiles(State(state.clone())).await;
+        assert_eq!(v["active"]["bedtime"], json!(true));
+        assert_eq!(v["clock"]["minute_of_week"], json!(22 * 60));
+        state.inner.blocklist.set_clock(12 * 60); // Monday noon
+        let Json(v) = get_profiles(State(state.clone())).await;
+        assert_eq!(v["active"]["bedtime"], json!(false));
 
         drop(state);
         test_support::cleanup_sqlite(&db);
@@ -261,6 +327,7 @@ mod tests {
                 allow: Vec::new(),
                 allowlists: Vec::new(),
                 default_deny: false,
+                schedule: vec![],
             }]),
         )
         .await;
@@ -279,6 +346,7 @@ mod tests {
                 allow: Vec::new(),
                 allowlists: Vec::new(),
                 default_deny: false,
+                schedule: vec![],
             }]),
         )
         .await

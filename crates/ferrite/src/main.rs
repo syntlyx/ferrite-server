@@ -237,6 +237,10 @@ async fn run() -> anyhow::Result<()> {
     // A pause from the panel ("let me through for five minutes") lapses here.
     tokio::spawn(pause_expiry_loop(state.clone()));
 
+    // ── Profile schedules ────────────────────────────────────────────────────
+    // Schedules read a stored minute of the week; this keeps it current.
+    tokio::spawn(schedule_clock_loop(state.clone()));
+
     // ── Selective routing / proxy ─────────────────────────────────────────────
     // Detached (not in the try_join! below) so a listener bind failure — :80/:443
     // already in use, or no privilege to bind them — degrades gracefully instead
@@ -480,6 +484,22 @@ async fn pause_expiry_loop(state: ferrite_app::AppState) {
         if pauses.expire(ferrite_blocklist::pause::unix_now()) {
             tracing::info!("blocking pause ended");
         }
+    }
+}
+
+/// Keep the minute of the week that profile schedules are judged by current.
+/// Ticking every few seconds puts a schedule's edge at most that late, and the
+/// local zone is re-read each tick, so a DST change or a new `/etc/localtime`
+/// is followed without a restart.
+async fn schedule_clock_loop(state: ferrite_app::AppState) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        state
+            .inner
+            .blocklist
+            .set_clock(ferrite_core::schedule::local_minute_of_week());
     }
 }
 

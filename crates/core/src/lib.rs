@@ -11,6 +11,7 @@ pub mod logbuf;
 pub mod memstats;
 pub mod net;
 pub mod recording;
+pub mod schedule;
 pub mod services;
 pub mod types;
 pub mod wire;
