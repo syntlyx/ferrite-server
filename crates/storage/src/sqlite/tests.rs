@@ -1,3 +1,4 @@
+use super::migrations::SCHEMA_VERSION;
 use super::*;
 
 fn temp_db_path(name: &str) -> std::path::PathBuf {
