@@ -7,6 +7,7 @@ use serde_json::Value;
 use crate::ApiError;
 use ferrite_app::AppState;
 use ferrite_core::error::FeriteError;
+use ferrite_core::memstats::proc_kb_field;
 
 /// Cache TTL for system stats — sysinfo is expensive (200ms sleep + hwmon reads).
 const SYSTEM_STATS_TTL: Duration = Duration::from_secs(3);
@@ -191,16 +192,7 @@ fn meminfo_cache_bytes() -> Option<u64> {
 }
 
 fn parse_meminfo_cache(text: &str) -> Option<u64> {
-    let field = |name: &str| -> Option<u64> {
-        let kb: u64 = text
-            .lines()
-            .find(|l| l.starts_with(name))?
-            .split_whitespace()
-            .nth(1)?
-            .parse()
-            .ok()?;
-        Some(kb * 1024)
-    };
+    let field = |name: &str| proc_kb_field(text, name);
     // `Cached` already includes Shmem, exactly as `free` counts it;
     // `SReclaimable` is missing on kernels older than 2.6.19.
     Some(field("Buffers:")? + field("Cached:")? + field("SReclaimable:").unwrap_or(0))

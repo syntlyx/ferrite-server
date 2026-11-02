@@ -4,7 +4,7 @@ use ferrite_core::error::{FeriteError, Result};
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
-    to_lower_hex(digest.as_ref())
+    hex::encode(digest)
 }
 
 pub fn normalize_sha256(input: &str) -> Option<String> {
@@ -54,16 +54,6 @@ pub async fn remove_file_if_exists(path: &Path) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
     }
-}
-
-fn to_lower_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }
 
 #[cfg(test)]

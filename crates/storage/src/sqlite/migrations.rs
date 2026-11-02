@@ -1,6 +1,7 @@
 //! The versioned migration ladder on top of the baseline `SCHEMA`.
 
-use super::{ROLLUP_BUCKET_SECS, table_exists};
+use super::table_exists;
+use crate::ROLLUP_BUCKET_SECS;
 
 /// Latest schema version. Bump when adding a migration step below.
 pub(super) const SCHEMA_VERSION: i64 = 9;

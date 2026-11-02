@@ -101,6 +101,7 @@ anyhow = "1"      # app-level error context
 
 # ── Crypto / auth ─────────────────────────────────────────────────────────────
 ring = "0.17"     # secure RNG (DNS query IDs) + SHA checksums (updater) + auth tokens
+hex = "0.4"       # lowercase hex for session tokens and checksums (already in the tree via boringtun)
 argon2 = "0.5"    # web UI password hashing (Argon2id)
 subtle = "2"      # constant-time comparison (API key check)
 

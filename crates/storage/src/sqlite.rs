@@ -7,14 +7,14 @@ use rusqlite::OptionalExtension;
 use tokio_rusqlite::Connection;
 
 use crate::schema::SCHEMA;
-use crate::{ClientStats, LegacyConfigRows, QueryFilter, SizeTrim, Storage, SummaryStats};
+use crate::{
+    ClientStats, LegacyConfigRows, QueryFilter, SizeTrim, Storage, SummaryStats, align_bucket,
+};
 use ferrite_core::error::{FeriteError, Result};
 use ferrite_core::recording::RecordScope;
 use ferrite_core::types::TimeseriesBucket;
 use ferrite_core::types::{QueryEntry, QueryStatus};
 use migrations::run_migrations;
-
-pub(crate) const ROLLUP_BUCKET_SECS: i64 = 600;
 
 /// Query rows a single size-cap pass drops per round. Big enough that a
 /// database far over its cap converges in a few rounds, small enough that each
@@ -984,10 +984,6 @@ fn collect_rollup_aggregates(
         device_agg.blocked += 1;
     }
     device_agg.last_seen = device_agg.last_seen.max(ts);
-}
-
-fn align_bucket(ts: i64) -> i64 {
-    (ts / ROLLUP_BUCKET_SECS) * ROLLUP_BUCKET_SECS
 }
 
 async fn top_domains_rollup_query(

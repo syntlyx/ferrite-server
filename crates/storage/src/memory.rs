@@ -31,10 +31,9 @@ use ferrite_core::error::Result;
 use ferrite_core::recording::RecordScope;
 use ferrite_core::types::{QueryEntry, QueryStatus, TimeseriesBucket};
 
-use crate::{ClientStats, LegacyConfigRows, QueryFilter, SizeTrim, Storage, SummaryStats};
-
-/// Rollup bucket width, matching the SQLite backend exactly.
-const ROLLUP_BUCKET_SECS: i64 = 600;
+use crate::{
+    ClientStats, LegacyConfigRows, QueryFilter, SizeTrim, Storage, SummaryStats, align_bucket,
+};
 
 /// Rough live size of one retained entry: the struct, plus its heap strings
 /// (domain, client IP, device token, upstream) and the allocator's share.
@@ -162,10 +161,6 @@ impl MemoryStorage {
     fn entries_for_bytes(max_bytes: u64) -> usize {
         ((max_bytes / APPROX_BYTES_PER_ENTRY).max(1) as usize).min(DEFAULT_MAX_ENTRIES)
     }
-}
-
-fn align_bucket(ts: i64) -> i64 {
-    ts.div_euclid(ROLLUP_BUCKET_SECS) * ROLLUP_BUCKET_SECS
 }
 
 /// The device identity token an entry is filed under: its tagged `device`,

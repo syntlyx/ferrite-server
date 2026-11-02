@@ -190,23 +190,13 @@ pub async fn login(
 fn generate_session_token() -> ferrite_core::error::Result<String> {
     let mut bytes = [0u8; 32];
     fill_random(&mut bytes)?;
-    Ok(to_lower_hex(&bytes))
+    Ok(hex::encode(bytes))
 }
 
 fn fill_random(bytes: &mut [u8]) -> ferrite_core::error::Result<()> {
     SystemRandom::new()
         .fill(bytes)
         .map_err(|_| FeriteError::Internal("secure random generation failed".into()))
-}
-
-fn to_lower_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }
 
 /// DELETE /api/auth — invalidate the current session token.

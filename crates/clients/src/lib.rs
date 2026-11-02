@@ -1,5 +1,6 @@
 mod mac;
 mod mdns;
+mod ptr;
 mod registry;
 mod resolver;
 
@@ -9,7 +10,6 @@ use std::sync::atomic::AtomicI64;
 use std::time::{Duration, Instant};
 
 use dashmap::{DashMap, DashSet};
-use ring::rand::{SecureRandom, SystemRandom};
 
 use ferrite_core::recording::RecordSwitches;
 use ferrite_storage::Storage;
@@ -98,38 +98,6 @@ pub struct ClientRegistry {
 }
 
 // ── Public utilities ──────────────────────────────────────────────────────────
-
-/// Build the reverse-DNS PTR domain for an IP.
-/// Shared by `resolver.rs` and `mdns.rs` to avoid duplication.
-pub(crate) fn ip_to_ptr_domain(ip: IpAddr) -> String {
-    match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            format!("{}.{}.{}.{}.in-addr.arpa", o[3], o[2], o[1], o[0])
-        }
-        IpAddr::V6(v6) => {
-            let nibbles: Vec<String> = v6
-                .octets()
-                .iter()
-                .rev()
-                .flat_map(|b| {
-                    [
-                        char::from_digit((b & 0xf) as u32, 16).unwrap_or('0'),
-                        char::from_digit((b >> 4) as u32, 16).unwrap_or('0'),
-                    ]
-                })
-                .map(|c| c.to_string())
-                .collect();
-            format!("{}.ip6.arpa", nibbles.join("."))
-        }
-    }
-}
-
-pub(crate) fn random_query_id() -> Option<u16> {
-    let mut bytes = [0u8; 2];
-    SystemRandom::new().fill(&mut bytes).ok()?;
-    Some(u16::from_be_bytes(bytes))
-}
 
 fn is_link_local_v6(v6: Ipv6Addr) -> bool {
     (v6.segments()[0] & 0xffc0) == 0xfe80

@@ -1,13 +1,7 @@
 use std::net::{IpAddr, Ipv6Addr};
 use std::time::Instant;
 
-use hickory_proto::op::{Message, MessageType, OpCode, Query};
-use hickory_proto::rr::{DNSClass, Name, RData, RecordType};
-use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
-
-use super::{
-    ClientRegistry, MISS_TTL, PtrEntry, RESOLVE_TTL, ip_to_ptr_domain, is_link_local_v6, mac, mdns,
-};
+use super::{ClientRegistry, MISS_TTL, PtrEntry, RESOLVE_TTL, is_link_local_v6, mac, mdns, ptr};
 
 impl ClientRegistry {
     pub(super) async fn run_pipeline(&self, ip: IpAddr) {
@@ -108,12 +102,12 @@ impl ClientRegistry {
     }
 
     async fn upstream_ptr(&self, ip: IpAddr) -> Option<String> {
-        let ptr_domain = ip_to_ptr_domain(ip);
+        let ptr_domain = ptr::ip_to_ptr_domain(ip);
         tracing::debug!("PTR lookup: {}", ptr_domain);
-        let raw = build_ptr_query(&ptr_domain)?;
+        let raw = ptr::build_query(&ptr_domain, true)?;
         match self.upstream.resolve_raw(raw).await {
             Ok((response, _)) => {
-                let name = parse_ptr_response(&response);
+                let name = ptr::parse_response(&response);
                 if let Some(ref n) = name {
                     tracing::debug!("PTR {} → {}", ip, n);
                 }
@@ -198,35 +192,6 @@ impl ClientRegistry {
 }
 
 // ── DNS helpers ───────────────────────────────────────────────────────────────
-
-fn build_ptr_query(ptr_domain: &str) -> Option<Vec<u8>> {
-    let name = Name::from_ascii(ptr_domain).ok()?;
-
-    let mut question = Query::new();
-    question.set_name(name);
-    question.set_query_type(RecordType::PTR);
-    question.set_query_class(DNSClass::IN);
-
-    let mut msg = Message::new(super::random_query_id()?, MessageType::Query, OpCode::Query);
-    msg.metadata.recursion_desired = true;
-    msg.add_query(question);
-
-    msg.to_bytes().ok()
-}
-
-fn parse_ptr_response(bytes: &[u8]) -> Option<String> {
-    let msg = Message::from_bytes(bytes).ok()?;
-    for answer in &msg.answers {
-        if let RData::PTR(ptr) = &answer.data {
-            let s = ptr.to_string();
-            let s = s.trim_end_matches('.');
-            if !s.is_empty() {
-                return Some(s.to_ascii_lowercase());
-            }
-        }
-    }
-    None
-}
 
 fn normalize_hostname(name: &str) -> String {
     for suffix in super::LOCAL_SUFFIXES {

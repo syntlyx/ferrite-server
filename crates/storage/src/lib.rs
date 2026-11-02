@@ -10,6 +10,15 @@ use serde::{Deserialize, Serialize};
 use ferrite_core::error::Result;
 use ferrite_core::recording::RecordScope;
 use ferrite_core::types::QueryEntry;
+
+/// Rollup bucket width. Both backends aggregate into the same 10-minute
+/// buckets, so a switch between them reads the same history the same way.
+pub(crate) const ROLLUP_BUCKET_SECS: i64 = 600;
+
+/// Start of the rollup bucket holding `ts`.
+pub(crate) fn align_bucket(ts: i64) -> i64 {
+    ts.div_euclid(ROLLUP_BUCKET_SECS) * ROLLUP_BUCKET_SECS
+}
 use ferrite_core::types::TimeseriesBucket;
 
 /// Filter parameters for querying the DNS log.

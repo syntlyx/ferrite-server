@@ -25,6 +25,7 @@ hickory-proto.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 parking_lot.workspace = true
+hex.workspace = true
 ring.workspace = true
 serde.workspace = true
 socket2.workspace = true

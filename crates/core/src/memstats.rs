@@ -123,20 +123,23 @@ pub fn smaps_rollup() -> Option<SmapsRollup> {
         return None;
     }
     let text = std::fs::read_to_string("/proc/self/smaps_rollup").ok()?;
-    let field = |name: &str| -> Option<u64> {
-        let kb: u64 = text
-            .lines()
-            .find(|l| l.starts_with(name))?
-            .split_whitespace()
-            .nth(1)?
-            .parse()
-            .ok()?;
-        Some(kb * 1024)
-    };
     Some(SmapsRollup {
-        rss_bytes: field("Rss:")?,
-        anonymous_bytes: field("Anonymous:")?,
+        rss_bytes: proc_kb_field(&text, "Rss:")?,
+        anonymous_bytes: proc_kb_field(&text, "Anonymous:")?,
     })
+}
+
+/// The `kB` value on the line starting with `name` (`"Rss:"`, `"Cached:"`) in
+/// a `/proc` file like `smaps_rollup` or `meminfo`, in bytes.
+pub fn proc_kb_field(text: &str, name: &str) -> Option<u64> {
+    let kb: u64 = text
+        .lines()
+        .find(|l| l.starts_with(name))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    Some(kb * 1024)
 }
 
 /// mimalloc's internal committed-slices counter (`stats.committed`). NOT
