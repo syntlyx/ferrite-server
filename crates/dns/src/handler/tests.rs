@@ -281,6 +281,8 @@ fn blocklist() -> Blocklist {
             domains: vec![],
             wildcard_block: vec![],
             services: vec![],
+            safe_search: false,
+            youtube_restricted: Default::default(),
             whitelist: vec![],
             client_bypass: vec![],
             profiles: vec![],
@@ -1075,6 +1077,98 @@ async fn pipeline_cost() {
             start.elapsed().as_nanos() as f64 / ROUNDS as f64
         );
     }
+
+    cleanup_sqlite(&h.db_path);
+}
+
+#[tokio::test]
+async fn safe_search_answers_with_a_cname_to_the_safe_host() {
+    use ferrite_blocklist::SafeSearch;
+    use ferrite_core::config::YoutubeRestrict;
+
+    let mut h = Harness::new("dns-safe-search").await;
+    let client = SocketAddr::from(([192, 0, 2, 10], 53_000));
+
+    // Off: the name is forwarded as asked.
+    let decision = decide(
+        &raw_query("www.google.com", RecordType::A),
+        client,
+        &h.ctx(),
+    );
+    assert!(matches!(decision, Decision::Upstream(ref p) if p.rewrite.is_none()));
+
+    h.blocklist.set_safe_search(SafeSearch {
+        search: true,
+        youtube: YoutubeRestrict::Strict,
+    });
+    // On, with the safe host's answer cached: served at once as a chain.
+    h.dns_cache.insert(
+        "forcesafesearch.google.com",
+        1,
+        false,
+        DnsResponse {
+            bytes: bytes::Bytes::from(a_response(
+                0,
+                "forcesafesearch.google.com",
+                Ipv4Addr::new(216, 239, 38, 120),
+                300,
+            )),
+            ttl: 300,
+        },
+    );
+    let response = handle_query(
+        query_with_id(0x4242, "www.google.com", RecordType::A)
+            .to_bytes()
+            .unwrap(),
+        client,
+        Arc::new(h.ctx()),
+    )
+    .await
+    .unwrap();
+    let msg = Message::from_bytes(&response).unwrap();
+    assert_eq!(msg.metadata.id, 0x4242);
+    assert_eq!(msg.queries[0].name().to_string(), "www.google.com.");
+    assert!(matches!(
+        &msg.answers[0].data,
+        RData::CNAME(c) if c.0.to_string() == "forcesafesearch.google.com."
+    ));
+    assert!(matches!(
+        msg.answers[1].data,
+        RData::A(A(ip)) if ip == Ipv4Addr::new(216, 239, 38, 120)
+    ));
+    assert!(msg.answers.iter().all(|r| r.ttl <= h.client_ttl));
+    let entry = h.rx.try_recv().unwrap();
+    assert_eq!(entry.status, QueryStatus::Cached);
+    assert_eq!(
+        entry.upstream.as_deref(),
+        Some("safesearch:forcesafesearch.google.com")
+    );
+
+    // Not cached yet: the upstream leg is asked for the safe host instead.
+    let decision = decide(
+        &raw_query("www.youtube.com", RecordType::AAAA),
+        client,
+        &h.ctx(),
+    );
+    assert!(matches!(
+        decision,
+        Decision::Upstream(ref p) if p.rewrite == Some("restrict.youtube.com")
+    ));
+
+    // A blocked name stays blocked: the blocklist runs first.
+    h.blocklist.add_blacklist("youtube.com").unwrap();
+    let decision = decide(
+        &raw_query("www.youtube.com", RecordType::A),
+        client,
+        &h.ctx(),
+    );
+    assert!(matches!(decision, Decision::Answer(_)));
+    let blocked = Message::from_bytes(&match decision {
+        Decision::Answer(b) => b,
+        _ => unreachable!(),
+    })
+    .unwrap();
+    assert_eq!(blocked.metadata.response_code, ResponseCode::NXDomain);
 
     cleanup_sqlite(&h.db_path);
 }

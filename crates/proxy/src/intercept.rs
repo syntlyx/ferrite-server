@@ -524,6 +524,8 @@ mod blocking_tests {
                 domains: vec![],
                 wildcard_block: vec![],
                 services: vec![],
+                safe_search: false,
+                youtube_restricted: Default::default(),
                 whitelist: vec![],
                 client_bypass,
                 profiles: vec![],

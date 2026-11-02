@@ -355,6 +355,15 @@ pub struct BlocklistConfig {
     /// an allowlist entry still exempts a domain, and a profile `allow` wins.
     #[serde(default)]
     pub services: Vec<String>,
+    /// Force SafeSearch on Google, Bing and DuckDuckGo for every device: their
+    /// search hosts resolve to the engines' safe endpoints. A profile can turn
+    /// it on for its devices too, never off.
+    #[serde(default)]
+    pub safe_search: bool,
+    /// YouTube Restricted Mode for every device. A profile can make it
+    /// stricter for its devices, never looser.
+    #[serde(default)]
+    pub youtube_restricted: YoutubeRestrict,
     /// DEPRECATED: superseded by `domains`, which holds exact entries too.
     /// Still accepted on load — `Config::normalize` migrates entries into
     /// `domains` — and no longer serialized, so the next save uses the new shape.
@@ -372,6 +381,18 @@ pub struct BlocklistConfig {
     /// `wildcard_block` are global and apply to every profile.
     #[serde(default)]
     pub profiles: Vec<BlocklistProfileConfig>,
+}
+
+/// YouTube Restricted Mode, enforced in DNS: YouTube's hosts resolve to the
+/// `restrictmoderate` or `restrict` endpoints Google publishes for this.
+/// Ordered, so the stricter of two settings is their maximum.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum YoutubeRestrict {
+    #[default]
+    Off,
+    Moderate,
+    Strict,
 }
 
 /// A named per-device blocking profile: which subscription lists (by name) apply,
@@ -398,6 +419,14 @@ pub struct BlocklistProfileConfig {
     /// whitelist, loses to this profile's `allow`.
     #[serde(default)]
     pub services: Vec<String>,
+    /// Force SafeSearch for this profile's clients (on top of the network-wide
+    /// setting, which a profile can't turn off).
+    #[serde(default)]
+    pub safe_search: bool,
+    /// YouTube Restricted Mode for this profile's clients; the stricter of this
+    /// and the network-wide setting applies.
+    #[serde(default)]
+    pub youtube_restricted: YoutubeRestrict,
     /// Domains allowed for this profile's clients, overriding the global block
     /// AND this profile's own subscription lists (exact or `*.wildcard`).
     #[serde(default)]
@@ -776,6 +805,8 @@ impl Default for BlocklistConfig {
             domains: vec![],
             wildcard_block: vec![],
             services: vec![],
+            safe_search: false,
+            youtube_restricted: Default::default(),
             whitelist: vec![],
             client_bypass: vec![],
             profiles: vec![],

@@ -12,6 +12,7 @@ use crate::engine::normalize_client_keys;
 use crate::loader::{self, FstMap, empty_fst};
 use crate::names::{domain_in_set, normalise, wildcard_to_regex};
 use crate::refresh;
+use crate::safesearch::SafeSearch;
 use crate::subscriptions::{FstInputs, MergedSet, meta_path};
 use ferrite_core::schedule::Schedule;
 use ferrite_core::services;
@@ -30,6 +31,9 @@ pub struct CompiledProfile {
     pub(crate) id: String,
     /// When the profile applies; always, without windows.
     pub(crate) schedule: Schedule,
+    /// SafeSearch / YouTube Restricted Mode for this profile's clients, on top
+    /// of the network-wide setting.
+    pub(crate) safe: SafeSearch,
     /// Normalised client keys (IP/MAC) this profile applies to.
     pub(crate) clients: HashSet<String>,
     pub(crate) fst: FstMap,
@@ -155,6 +159,10 @@ pub(crate) fn compile_profiles(
         compiled.push(Arc::new(CompiledProfile {
             id: cfg.id.clone(),
             schedule,
+            safe: SafeSearch {
+                search: cfg.safe_search,
+                youtube: cfg.youtube_restricted,
+            },
             clients,
             fst,
             cache: BlocklistCache::new(PROFILE_DECISION_CACHE),

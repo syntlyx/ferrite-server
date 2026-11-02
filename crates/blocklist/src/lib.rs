@@ -8,6 +8,7 @@ pub mod parser;
 pub mod pause;
 mod profiles;
 mod refresh;
+pub mod safesearch;
 mod services;
 mod subscriptions;
 
@@ -16,6 +17,7 @@ pub use engine::Blocklist;
 pub use names::{normalise_domain, wildcard_to_regex};
 pub use parser::AdblockStats;
 pub use profiles::CompiledProfile;
+pub use safesearch::SafeSearch;
 pub use subscriptions::Subscriptions;
 
 /// Which decision set a subscription list populates. Blocklists and allowlists

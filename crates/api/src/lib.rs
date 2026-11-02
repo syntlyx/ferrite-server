@@ -13,6 +13,7 @@ pub mod pause;
 pub mod profiles;
 pub mod proxy;
 pub mod queries;
+pub mod safesearch;
 pub mod services;
 pub mod settings;
 pub mod stats;
@@ -80,6 +81,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/services", get(services::get_catalog))
         .route("/blocklist/services", get(services::get_blocked))
         .route("/blocklist/services", put(services::put_blocked))
+        .route("/blocklist/safe-search", get(safesearch::get_safe_search))
+        .route("/blocklist/safe-search", put(safesearch::put_safe_search))
         // Remote list subscriptions: blocklists and allowlists share one set
         // of handlers, the polarity picks the set.
         .merge(lists::routes("/lists", ListPolarity::Block))

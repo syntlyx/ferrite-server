@@ -280,6 +280,13 @@ services = [
     # "tiktok",
 ]
 
+# SafeSearch for every device: Google, Bing and DuckDuckGo resolve to the
+# engines' safe hosts, so results are filtered whatever the browser says.
+# YouTube Restricted Mode: "off", "moderate" or "strict". A device profile has
+# the same two settings and can only make them stricter for its devices.
+# safe_search = true
+# youtube_restricted = "moderate"
+
 # Remote blocklist subscriptions (hosts or Adblock format, auto-detected).
 [[blocklist.lists]]
 name    = "StevenBlack"

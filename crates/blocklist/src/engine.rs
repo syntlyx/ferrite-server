@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
@@ -13,6 +13,7 @@ use crate::manual::ManualList;
 use crate::names::{has_suffix, is_registrable_or_deeper, matched_key, normalise};
 use crate::pause::Pauses;
 use crate::profiles::{CompiledProfile, compile_profiles};
+use crate::safesearch::SafeSearch;
 use crate::services::ServiceBlock;
 use crate::subscriptions::Subscriptions;
 use ferrite_core::config::{AllowlistConfig, BlocklistConfig};
@@ -112,6 +113,9 @@ pub struct Blocklist {
     /// would not hold DNS back for a merge. The next refresh recompiles them
     /// even if no list moved.
     profiles_stale: AtomicBool,
+    /// Network-wide SafeSearch / YouTube Restricted Mode, packed for one atomic
+    /// load on the DNS path: bit 0 = search, bits 1-2 = the YouTube level.
+    safe_search: AtomicU8,
     /// The box-local minute of the week profile schedules are judged by.
     /// A background tick keeps it current ([`Self::set_clock`]), so the DNS
     /// path never reads the system clock.
@@ -167,6 +171,10 @@ impl Blocklist {
             refresh_lock: tokio::sync::Mutex::new(()),
             profiles_stale: AtomicBool::new(false),
             clock: AtomicU32::new(ferrite_core::schedule::local_minute_of_week()),
+            safe_search: AtomicU8::new(pack_safe(SafeSearch {
+                search: config.safe_search,
+                youtube: config.youtube_restricted,
+            })),
         }
     }
 
@@ -488,6 +496,36 @@ impl Blocklist {
 
     pub fn clock(&self) -> u32 {
         self.clock.load(Ordering::Relaxed)
+    }
+
+    /// Replace the network-wide SafeSearch / YouTube Restricted Mode setting.
+    pub fn set_safe_search(&self, safe: SafeSearch) {
+        self.safe_search.store(pack_safe(safe), Ordering::Relaxed);
+    }
+
+    /// The network-wide SafeSearch / YouTube Restricted Mode setting.
+    pub fn safe_search(&self) -> SafeSearch {
+        unpack_safe(self.safe_search.load(Ordering::Relaxed))
+    }
+
+    /// The safe host `name` must resolve to for this client — the stricter of
+    /// the network-wide setting and its profile's — or `None` to resolve it as
+    /// usual. Expects a normalised name. With nothing enforced, as on most
+    /// installs, this is one atomic load.
+    pub fn safe_search_target(
+        &self,
+        name: &str,
+        profile: Option<&CompiledProfile>,
+    ) -> Option<&'static str> {
+        let global = self.safe_search();
+        let safe = match profile {
+            Some(p) => global.max(p.safe),
+            None => global,
+        };
+        if safe.is_off() {
+            return None;
+        }
+        safe.target(name)
     }
 
     /// Each compiled profile's id and whether its schedule has it on now.
@@ -896,6 +934,28 @@ impl Blocklist {
     #[allow(dead_code)]
     pub fn invalidate(&self, domain: &str) {
         self.cache.invalidate(domain);
+    }
+}
+
+fn pack_safe(safe: SafeSearch) -> u8 {
+    use ferrite_core::config::YoutubeRestrict;
+    let youtube = match safe.youtube {
+        YoutubeRestrict::Off => 0,
+        YoutubeRestrict::Moderate => 1,
+        YoutubeRestrict::Strict => 2,
+    };
+    u8::from(safe.search) | (youtube << 1)
+}
+
+fn unpack_safe(bits: u8) -> SafeSearch {
+    use ferrite_core::config::YoutubeRestrict;
+    SafeSearch {
+        search: bits & 1 == 1,
+        youtube: match bits >> 1 {
+            0 => YoutubeRestrict::Off,
+            1 => YoutubeRestrict::Moderate,
+            _ => YoutubeRestrict::Strict,
+        },
     }
 }
 

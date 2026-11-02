@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::ctx::DnsCtx;
 use crate::query::LazyQuery;
+use crate::safesearch;
 use crate::types::DnsResponse;
 use ferrite_core::error::Result;
 use ferrite_core::net::{ip_to_string, unmap_v4};
@@ -53,6 +54,9 @@ pub struct Pending {
     log_ignored: bool,
     client_ttl: u32,
     start: Instant,
+    /// SafeSearch: resolve this safe host instead and answer with a CNAME to
+    /// it (step 2b), rather than forwarding the client's own question.
+    rewrite: Option<&'static str>,
 }
 
 /// DNS query pipeline. Steps 1-4 are [`decide`], steps 5-7
@@ -62,7 +66,11 @@ pub struct Pending {
 ///  2. Blocklist → NXDOMAIN. Runs before routing on purpose: blocking decides
 ///     WHETHER a name resolves, routing only HOW its traffic leaves — so a
 ///     blocklisted subdomain of a routed domain stays blocked (whitelist it
-///     to route it anyway).
+///     to route it anyway). Step 2b, SafeSearch / YouTube Restricted Mode,
+///     follows: a CNAME to the engine's safe host plus its records — after
+///     the blocklist (a blocked YouTube stays blocked) and before routing
+///     (the safe host's addresses are what make the results safe, so a
+///     tunnel must not take the name elsewhere).
 ///  3. Selective routing → synthetic answer with the proxy's advertise IP.
 ///  4. DNS cache → return cached bytes (CNAME targets re-checked).
 ///  5. Forward to upstream pool.
@@ -206,6 +214,48 @@ pub fn decide(raw: &[u8], src: SocketAddr, ctx: &DnsCtx) -> Decision {
         return Decision::Answer(build_nxdomain(&query, client_ttl));
     }
 
+    // ── Step 2b: SafeSearch / YouTube Restricted Mode ─────────────────────
+    // The name resolves as a CNAME to the engine's safe host. A cached answer
+    // for that host serves it at once; otherwise the upstream leg asks for it.
+    if filtering_enabled
+        && let Some(target) = ctx.blocklist.safe_search_target(&name, profile.as_deref())
+    {
+        if let Some((cached, remaining_ttl)) =
+            ctx.dns_cache.get_with_remaining(target, qtype, false)
+            && let Some(bytes) = safesearch::rewrite_answer(&query, &name, target, &cached.bytes)
+        {
+            if !log_ignored {
+                emit(ctx, QueryStatus::Cached, |status| {
+                    make_entry(
+                        name,
+                        qtype,
+                        client_text.unwrap_or_else(|| ip_to_string(client_addr)),
+                        status,
+                        start.elapsed().as_millis() as u32,
+                        Some(format!("safesearch:{target}")),
+                        0,
+                    )
+                });
+            }
+            return Decision::Answer(cap_ttls(bytes, remaining_ttl.min(client_ttl)));
+        }
+        return Decision::Upstream(Pending {
+            name,
+            qtype,
+            // The CNAME ferrite makes up carries no signature, so asking for
+            // the safe host's would only bloat the answer.
+            want_dnssec: false,
+            filtering_enabled,
+            profile,
+            client_addr,
+            client_text,
+            log_ignored,
+            client_ttl,
+            start,
+            rewrite: Some(target),
+        });
+    }
+
     // ── Step 3: Selective routing / proxy interception ────────────────────
     // For a routed domain, answer with our advertise IP so the client connects
     // to the proxy listeners. The blocklist already ran, so a blocked name
@@ -290,6 +340,7 @@ pub fn decide(raw: &[u8], src: SocketAddr, ctx: &DnsCtx) -> Decision {
         log_ignored,
         client_ttl,
         start,
+        rewrite: None,
     })
 }
 
@@ -308,7 +359,26 @@ pub async fn resolve_upstream(raw: &[u8], pending: Pending, ctx: &DnsCtx) -> Vec
         log_ignored,
         client_ttl,
         start,
+        rewrite,
     } = pending;
+    if let Some(target) = rewrite {
+        let bytes = resolve_safe_host(raw, &name, qtype, target, ctx).await;
+        let rcode = wire::rcode(&bytes).unwrap_or(2);
+        if !log_ignored {
+            emit(ctx, QueryStatus::Upstream, |status| {
+                make_entry(
+                    name,
+                    qtype,
+                    client_text.unwrap_or_else(|| ip_to_string(client_addr)),
+                    status,
+                    start.elapsed().as_millis() as u32,
+                    Some(format!("safesearch:{target}")),
+                    rcode,
+                )
+            });
+        }
+        return cap_ttls(bytes, client_ttl);
+    }
     let query = LazyQuery::new(raw);
 
     // ── Step 5: Forward to upstream ───────────────────────────────────────
@@ -401,6 +471,61 @@ pub async fn resolve_upstream(raw: &[u8], pending: Pending, ctx: &DnsCtx) -> Vec
     // client caches — e.g. how long a client clings to a pre-rule direct answer
     // before re-querying and getting routed.
     cap_ttls(response_bytes, client_ttl)
+}
+
+/// Step 2b's upstream leg: ask for the safe host, cache what comes back under
+/// the safe host's own name, and answer the client with the CNAME chain. Any
+/// failure is SERVFAIL — never the unfiltered answer for the name asked.
+///
+/// Takes the raw query, not a [`LazyQuery`]: that one caches its decode in a
+/// cell, so a borrow of it can't be held across the upstream await by a task
+/// that has to be `Send`.
+async fn resolve_safe_host(
+    raw: &[u8],
+    name: &str,
+    qtype: u16,
+    target: &'static str,
+    ctx: &DnsCtx,
+) -> Vec<u8> {
+    let id = LazyQuery::new(raw).id();
+    let upstream = match safesearch::target_query(id, target, qtype) {
+        Some(q) => {
+            let q = sanitize_query(&q, ctx.dns_config.strip_ecs, false);
+            ctx.upstream_pool.resolve_raw(q).await
+        }
+        None => return build_servfail(&LazyQuery::new(raw)),
+    };
+    let query = LazyQuery::new(raw);
+    let bytes = match upstream {
+        Ok((bytes, _label)) if wire::rcode(&bytes).is_some() => bytes,
+        Ok((_, label)) => {
+            tracing::warn!(
+                "undecodable response from upstream {} for {}",
+                label,
+                target
+            );
+            return build_servfail(&query);
+        }
+        Err(e) => {
+            tracing::warn!("upstream error for safe host {}: {}", target, e);
+            return build_servfail(&query);
+        }
+    };
+    if wire::rcode(&bytes) == Some(0)
+        && let Some(ttl) = wire::cache_ttl(&bytes)
+    {
+        ctx.dns_cache.insert(
+            target,
+            qtype,
+            false,
+            DnsResponse {
+                bytes: bytes::Bytes::copy_from_slice(&bytes),
+                ttl,
+            },
+        );
+    }
+    safesearch::rewrite_answer(&query, name, target, &bytes)
+        .unwrap_or_else(|| build_servfail(&query))
 }
 
 // ---------------------------------------------------------------------------
