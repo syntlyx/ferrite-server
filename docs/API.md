@@ -423,7 +423,8 @@ Returns an empty list while `storage.keep_stats` is off: this list is assembled 
       "blocked": 932,
       "last_seen": 1745008923,
       "is_alias": false,
-      "blocking_bypassed": false
+      "blocking_bypassed": false,
+      "first_seen": 1761943500
     }
   ]
 }
@@ -434,6 +435,7 @@ Returns an empty list while `storage.keep_stats` is off: this list is assembled 
 - `is_alias` — `true` if the name was set manually via `POST /api/clients/aliases`.
 - `blocking_bypassed` — `true` if this client is exempt from blocklist filtering.
 - `last_seen` — Unix timestamp of the most recent query from any of this client's IPs.
+- `first_seen` — Unix timestamp the box first saw any of this client's MACs. Absent when no MAC is known, or for devices learned before 0.2 (which kept no first sighting).
 
 > PTR lookups run in the background on first sight. A new IP shows `name == ip` immediately and gets a resolved name within seconds.
 
@@ -730,6 +732,46 @@ and `service`, an unknown service, or one with `routable: false` → `400`. In
 `GET /api/proxy/stats` and the `ferrite_rule_hits_total` metric, a service
 rule's hits are keyed `service:<id>` (for example `service:youtube`) where a
 domain rule's are keyed by its pattern.
+
+---
+
+## Notifications
+
+One webhook, POSTed a JSON event for each kind that is switched on. Plain JSON,
+so ntfy, Home Assistant, a Slack/Telegram shim or anything that takes a POST
+works. Every event has `event`, `message` (one readable line) and `timestamp`.
+
+### `GET /api/notifications` · `PUT /api/notifications`
+
+```json
+{ "webhook": "https://ntfy.sh/my-ferrite", "tunnel_alerts": true, "new_device": true }
+```
+
+- `tunnel_alerts`: a tunnel stays down past a minute (`egress_down`, with
+  `egress`, `name`, `down_secs`), and its recovery (`egress_up`).
+- `new_device`: a device the box has never seen joins the network:
+
+  ```json
+  { "event": "new_device", "mac": "aa:bb:cc:dd:ee:ff", "ip": "192.168.1.42",
+    "name": "pixel-8", "message": "New device on the network: pixel-8 (192.168.1.42, aa:bb:cc:dd:ee:ff)",
+    "timestamp": "2026-11-02T21:05:00+00:00" }
+  ```
+
+  "Never seen" is per MAC and remembered in the database. What is on the
+  network when ferrite starts is the baseline, so a restart or an upgrade never
+  announces the whole household. The event waits ten seconds for the device's
+  name; `name` is `null` if it hasn't given one. Phones that rotate their Wi-Fi
+  MAC count as new each time they rotate.
+
+A non-http(s) `webhook` → `400`. Before 0.2 the webhook was `[proxy]
+alert_webhook`; an old config is moved over on load.
+
+### `POST /api/notifications/test`
+
+Sends `{ "event": "test", "message": "Test notification from ferrite", … }`.
+The body may carry `{ "webhook": "…" }` to try a URL before saving it; without
+one the saved webhook is used. `200` when the receiver accepted it, `400` with
+the reason when it answered an error status or couldn't be reached.
 
 ---
 
