@@ -603,6 +603,7 @@ GET → {
       "allowlists": ["anudeepND Whitelist"],  // allowlist subset; empty = ALL enabled
       "clients": ["aa:bb:cc:dd:ee:ff"],
       "block": [], "allow": ["ntp.example.com"],
+      "services": ["tiktok"],                 // catalog services blocked for these devices
       "default_deny": true                    // block everything not explicitly allowed
     }
   ],
@@ -614,6 +615,73 @@ GET → {
 Under `default_deny`, local-infrastructure names (reverse `*.arpa`, bare
 hostnames, `.lan`/`.local`/`.home`/`.internal`/`.localdomain`, and configured
 `[[zones]]` suffixes) keep resolving without any configuration.
+
+A profile's `services` work like its `block` entries: they beat the global
+whitelist and lose to the profile's own `allow`. Unknown service ids → `400`.
+
+---
+
+## Services
+
+A catalog of well-known services built into the binary (it updates with
+releases). Each service is a set of domains; every domain also covers its
+subdomains, like a manual block entry. A service can be blocked network-wide,
+blocked for a profile (`services` above), or routed through a tunnel.
+
+### `GET /api/services` — the catalog
+
+```json
+{
+  "categories": ["video", "music", "social", "messaging", "gaming", "ai", "shopping"],
+  "services": [
+    {
+      "id": "youtube", "name": "YouTube", "category": "video",
+      "routable": true,
+      "domains": ["youtube.com", "youtu.be", "googlevideo.com", "…"]
+    }
+  ]
+}
+```
+
+`routable: false` marks services a tunnel rule can't carry. Tunnels answer DNS
+with ferrite's own address and forward only HTTP and TLS on ports 80/443, and
+these services (messengers, game launchers and consoles, Spotify) also speak
+their own protocols to the names they resolve.
+
+### `GET /api/blocklist/services` · `PUT /api/blocklist/services` — blocked network-wide
+
+```
+PUT /api/blocklist/services
+{ "services": ["tiktok", "roblox"] }
+```
+
+```json
+{ "status": "ok", "services": ["tiktok", "roblox"], "persisted": true, "saved_to": "/etc/ferrite/config.toml" }
+```
+
+`PUT` replaces the whole set. It applies at once and is saved to
+`[blocklist] services`. These domains sit in the manual blacklist's tier: an
+allowlist entry still exempts one, and a profile's `allow` wins. Unknown ids →
+`400`. `GET /api/blocklist/check/:domain` names the service in its sources:
+
+```json
+{ "kind": "service", "name": "TikTok", "matched": "tiktok.com" }
+```
+
+### Routing a service through a tunnel
+
+A rule in `PUT /api/proxy` takes `service` in place of `pattern`:
+
+```json
+{ "service": "youtube", "egress": "wg-nl", "fail_closed": true, "clients": [] }
+```
+
+It routes every domain of the service. A narrower domain rule still wins for
+its own names (`music.youtube.com` → another egress). Setting both `pattern`
+and `service`, an unknown service, or one with `routable: false` → `400`. In
+`GET /api/proxy/stats` and the `ferrite_rule_hits_total` metric, a service
+rule's hits are keyed `service:<id>` (for example `service:youtube`) where a
+domain rule's are keyed by its pattern.
 
 ---
 
