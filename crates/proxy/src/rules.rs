@@ -3,7 +3,9 @@
 //! A rule pattern is either an exact domain (matches the name and any
 //! subdomain, like the blocklist hierarchy walk) or a wildcard (`*.example.com`,
 //! compiled with the same [`wildcard_to_regex`] semantics as the blocklist).
-//! Rules are pre-sorted most-specific-first so the first match wins.
+//! A service rule (`service = "youtube"`) compiles to one exact matcher per
+//! catalog domain, all sharing the rule's identity. Rules are pre-sorted
+//! most-specific-first so the first match wins.
 
 use std::collections::HashMap;
 
@@ -11,6 +13,7 @@ use regex::Regex;
 
 use ferrite_blocklist::wildcard_to_regex;
 use ferrite_core::config::RuleConfig;
+use ferrite_core::services;
 
 pub enum Matcher {
     /// Exact domain: matches the name itself and any subdomain of it.
@@ -21,8 +24,9 @@ pub enum Matcher {
 
 pub struct CompiledRule {
     pub matcher: Matcher,
-    /// The original config pattern — the stable identity hit counters are
-    /// keyed by (the matcher itself isn't comparable once compiled to a regex).
+    /// The rule's identity, [`RuleConfig::hit_key`] — its config pattern, or
+    /// `service:<id>` for every matcher a service rule expands to. Hit counters
+    /// are keyed by it (the matcher isn't comparable once compiled to a regex).
     pub pattern: String,
     pub egress_idx: usize,
     pub fail_closed: bool,
@@ -61,18 +65,47 @@ impl CompiledRule {
 
 /// Compile rules into matchers, resolving egress ids to snapshot indices and
 /// sorting most-specific-first. Rules whose egress isn't active (disabled or
-/// failed to build) or whose pattern is invalid are skipped with a warning.
+/// failed to build), whose pattern is invalid, or whose service the catalog
+/// can't route are skipped with a warning.
 pub fn compile(rules: &[RuleConfig], egress_idx: &HashMap<String, usize>) -> Vec<CompiledRule> {
     let mut out = Vec::new();
     for r in rules {
         let Some(&idx) = egress_idx.get(&r.egress) else {
             tracing::warn!(
                 "proxy: rule '{}' → egress '{}' is not active, skipping",
-                r.pattern,
+                r.hit_key(),
                 r.egress
             );
             continue;
         };
+        let clients: Vec<String> = r
+            .clients
+            .iter()
+            .map(|c| c.trim().to_ascii_lowercase())
+            .filter(|c| !c.is_empty())
+            .collect();
+        if let Some(id) = &r.service {
+            // Config loading already dropped these; a rule built in code
+            // (tests, a future caller) must not route an unroutable service.
+            let Some(svc) = services::find(id).filter(|s| s.routable) else {
+                tracing::warn!("proxy: service '{}' can't be routed, skipping its rule", id);
+                continue;
+            };
+            let key = r.hit_key();
+            for domain in &svc.domains {
+                out.push(CompiledRule {
+                    // Catalog domains are exact names: each matches itself and
+                    // its subdomains, ranked like a hand-written exact rule.
+                    matcher: Matcher::Exact(domain.clone()),
+                    pattern: key.clone(),
+                    egress_idx: idx,
+                    fail_closed: r.fail_closed,
+                    clients: clients.clone(),
+                    specificity: label_count(domain) * 2 + 1,
+                });
+            }
+            continue;
+        }
         let labels = label_count(&r.pattern);
         let (matcher, specificity) = if r.pattern.contains('*') {
             match wildcard_to_regex(&r.pattern) {
@@ -91,12 +124,7 @@ pub fn compile(rules: &[RuleConfig], egress_idx: &HashMap<String, usize>) -> Vec
             pattern: r.pattern.clone(),
             egress_idx: idx,
             fail_closed: r.fail_closed,
-            clients: r
-                .clients
-                .iter()
-                .map(|c| c.trim().to_ascii_lowercase())
-                .filter(|c| !c.is_empty())
-                .collect(),
+            clients,
             specificity,
         });
     }
@@ -120,6 +148,7 @@ mod tests {
     fn rule(pattern: &str, egress: &str) -> RuleConfig {
         RuleConfig {
             pattern: pattern.to_string(),
+            service: None,
             egress: egress.to_string(),
             fail_closed: true,
             clients: Vec::new(),
@@ -209,6 +238,57 @@ mod tests {
             .find(|r| r.matches("docs.google.com"))
             .unwrap();
         assert_eq!(docs.egress_idx, 0);
+    }
+
+    fn service_rule(service: &str, egress: &str) -> RuleConfig {
+        RuleConfig {
+            pattern: String::new(),
+            service: Some(service.to_string()),
+            egress: egress.to_string(),
+            fail_closed: true,
+            clients: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn service_rule_routes_every_catalog_domain_under_one_key() {
+        let compiled = compile(&[service_rule("youtube", "a")], &idx());
+        let youtube = services::find("youtube").unwrap();
+        assert_eq!(compiled.len(), youtube.domains.len());
+        for host in [
+            "www.youtube.com",
+            "rr4---sn-x.googlevideo.com",
+            "i.ytimg.com",
+        ] {
+            let hit = compiled.iter().find(|r| r.matches(host)).unwrap();
+            assert_eq!(hit.pattern, "service:youtube");
+            assert_eq!(hit.egress_idx, 0);
+        }
+        assert!(!compiled.iter().any(|r| r.matches("example.com")));
+    }
+
+    #[test]
+    fn a_narrower_domain_rule_beats_a_service_rule() {
+        let compiled = compile(
+            &[service_rule("youtube", "a"), rule("music.youtube.com", "b")],
+            &idx(),
+        );
+        let music = compiled
+            .iter()
+            .find(|r| r.matches("music.youtube.com"))
+            .unwrap();
+        assert_eq!(music.egress_idx, 1);
+        let www = compiled
+            .iter()
+            .find(|r| r.matches("www.youtube.com"))
+            .unwrap();
+        assert_eq!(www.egress_idx, 0);
+    }
+
+    #[test]
+    fn unroutable_or_unknown_service_rule_is_dropped() {
+        assert!(compile(&[service_rule("whatsapp", "a")], &idx()).is_empty());
+        assert!(compile(&[service_rule("nope", "a")], &idx()).is_empty());
     }
 
     #[test]

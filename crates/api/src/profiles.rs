@@ -1,7 +1,8 @@
 //! `/api/blocklist/profiles` — view and replace per-device blocking profiles.
 //!
-//! A profile applies a *subset* of the subscription lists to specific clients;
-//! devices matching no profile use all enabled lists (the default). The web UI
+//! A profile applies a *subset* of the subscription lists to specific clients,
+//! plus its own block/allow entries and catalog services; devices matching no
+//! profile use all enabled lists (the default). The web UI
 //! GETs the whole set and PUTs it back, mirroring `/api/proxy`. Applying is hot:
 //! [`Blocklist::set_profiles`] recompiles each profile's FST from the per-list
 //! disk caches the last refresh wrote — no network fetch, no restart.
@@ -131,6 +132,7 @@ fn validate(
                 )));
             }
         }
+        p.services = crate::services::known_ids(&p.services, &format!("profile '{}'", p.id))?;
     }
     Ok(profiles)
 }
@@ -190,6 +192,7 @@ mod tests {
             lists: Vec::new(),
             clients: vec!["10.0.0.2".into()],
             block: Vec::new(),
+            services: vec![],
             allow: Vec::new(),
             allowlists,
             default_deny: true,
@@ -254,6 +257,7 @@ mod tests {
                 lists: vec!["Ghost".into()],
                 clients: vec!["10.0.0.5".into()],
                 block: Vec::new(),
+                services: vec![],
                 allow: Vec::new(),
                 allowlists: Vec::new(),
                 default_deny: false,
@@ -271,6 +275,7 @@ mod tests {
                 lists: vec!["Ads".into()],
                 clients: vec!["10.0.0.5".into()],
                 block: Vec::new(),
+                services: vec![],
                 allow: Vec::new(),
                 allowlists: Vec::new(),
                 default_deny: false,

@@ -13,6 +13,7 @@ pub mod pause;
 pub mod profiles;
 pub mod proxy;
 pub mod queries;
+pub mod services;
 pub mod settings;
 pub mod stats;
 pub mod storage;
@@ -75,6 +76,10 @@ pub fn build_router(state: AppState) -> Router {
         // Per-device blocking profiles (replace-whole-set, like /api/proxy)
         .route("/blocklist/profiles", get(profiles::get_profiles))
         .route("/blocklist/profiles", put(profiles::put_profiles))
+        // The built-in service catalog, and the services blocked network-wide
+        .route("/services", get(services::get_catalog))
+        .route("/blocklist/services", get(services::get_blocked))
+        .route("/blocklist/services", put(services::put_blocked))
         // Remote list subscriptions: blocklists and allowlists share one set
         // of handlers, the polarity picks the set.
         .merge(lists::routes("/lists", ListPolarity::Block))

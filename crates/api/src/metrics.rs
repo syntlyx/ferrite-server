@@ -375,7 +375,7 @@ pub async fn get_metrics(State(state): State<AppState>) -> impl IntoResponse {
     family(
         &mut out,
         "ferrite_rule_hits_total",
-        "Connections routed per rule (pattern + egress).",
+        "Connections routed per rule (pattern, or service:<id> for a service rule, + egress).",
         "counter",
     );
     for r in stats.rule_hits_snapshot() {
@@ -455,6 +455,7 @@ mod tests {
             }],
             rules: vec![RuleConfig {
                 pattern: "*.example.com".to_string(),
+                service: None,
                 egress: "vpn".to_string(),
                 fail_closed: true,
                 clients: Vec::new(),

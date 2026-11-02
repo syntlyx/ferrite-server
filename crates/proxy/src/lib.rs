@@ -599,6 +599,7 @@ mod tests {
             }],
             rules: vec![RuleConfig {
                 pattern: "*.example.com".to_string(),
+                service: None,
                 egress: "t".to_string(),
                 fail_closed: true,
                 clients: Vec::new(),
@@ -725,6 +726,7 @@ mod tests {
     fn rule(pattern: &str, egress: &str) -> RuleConfig {
         RuleConfig {
             pattern: pattern.to_string(),
+            service: None,
             egress: egress.to_string(),
             fail_closed: true,
             clients: Vec::new(),

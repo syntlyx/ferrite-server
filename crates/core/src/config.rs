@@ -349,6 +349,11 @@ pub struct BlocklistConfig {
     /// `POST /api/blocklist/blacklist` write; the file is the only copy.
     #[serde(default)]
     pub domains: Vec<String>,
+    /// Catalog services blocked for every device (ids from
+    /// [`crate::services`]). Their domains join the manual block entries' tier:
+    /// an allowlist entry still exempts a domain, and a profile `allow` wins.
+    #[serde(default)]
+    pub services: Vec<String>,
     /// DEPRECATED: superseded by `domains`, which holds exact entries too.
     /// Still accepted on load — `Config::normalize` migrates entries into
     /// `domains` — and no longer serialized, so the next save uses the new shape.
@@ -387,6 +392,11 @@ pub struct BlocklistProfileConfig {
     /// whitelisted — the per-device block wins.
     #[serde(default)]
     pub block: Vec<String>,
+    /// Catalog services blocked for this profile's clients (ids from
+    /// [`crate::services`]). Same tier as `block`: beats the global
+    /// whitelist, loses to this profile's `allow`.
+    #[serde(default)]
+    pub services: Vec<String>,
     /// Domains allowed for this profile's clients, overriding the global block
     /// AND this profile's own subscription lists (exact or `*.wildcard`).
     #[serde(default)]
@@ -568,11 +578,18 @@ pub struct EgressConfig {
     pub backend: Option<String>,
 }
 
-/// Maps a domain pattern to an egress. `pattern` is an exact domain (matches the
-/// name and its subdomains) or a wildcard (`*.example.com`).
+/// Maps a domain pattern — or a whole catalog service — to an egress. `pattern`
+/// is an exact domain (matches the name and its subdomains) or a wildcard
+/// (`*.example.com`). A rule with `service` set routes every domain of that
+/// catalog service instead, and leaves `pattern` empty.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RuleConfig {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pattern: String,
+    /// Catalog service id ([`crate::services`]) this rule routes, instead of a
+    /// single `pattern`. Only services marked routable are accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
     pub egress: String,
     /// When the chosen egress is unhealthy: refuse the connection (true) rather
     /// than leak it directly (false). Enforced at connect time, not DNS time.
@@ -582,6 +599,18 @@ pub struct RuleConfig {
     /// clients. Lets a domain be routed only for specific devices.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clients: Vec<String>,
+}
+
+impl RuleConfig {
+    /// The rule's identity for hit counters and metrics: its pattern, or
+    /// `service:<id>` for a service rule. A colon can't occur in a domain
+    /// pattern, so the two never collide.
+    pub fn hit_key(&self) -> String {
+        match &self.service {
+            Some(id) => format!("service:{id}"),
+            None => self.pattern.clone(),
+        }
+    }
 }
 
 impl ProxyConfig {
@@ -632,14 +661,36 @@ impl ProxyConfig {
         rules.retain_mut(|r| {
             r.pattern = r.pattern.trim().trim_end_matches('.').to_ascii_lowercase();
             r.egress = r.egress.trim().to_ascii_lowercase();
-            if r.pattern.is_empty() {
+            r.service = r
+                .service
+                .take()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty());
+            if let Some(id) = &r.service {
+                match crate::services::find(id) {
+                    // A service rule routes the catalog's domains; a pattern
+                    // left beside it would never be read.
+                    Some(s) if s.routable => r.pattern.clear(),
+                    Some(_) => {
+                        tracing::warn!(
+                            "proxy: service '{}' can't be routed through a tunnel, dropping its rule",
+                            id
+                        );
+                        return false;
+                    }
+                    None => {
+                        tracing::warn!("proxy: rule references unknown service '{}', dropping", id);
+                        return false;
+                    }
+                }
+            } else if r.pattern.is_empty() {
                 tracing::warn!("proxy: dropping rule with empty pattern");
                 return false;
             }
             if !ids.contains(r.egress.as_str()) {
                 tracing::warn!(
                     "proxy: rule '{}' references unknown egress '{}', dropping",
-                    r.pattern,
+                    r.hit_key(),
                     r.egress
                 );
                 return false;
@@ -718,6 +769,7 @@ impl Default for BlocklistConfig {
             }],
             domains: vec![],
             wildcard_block: vec![],
+            services: vec![],
             whitelist: vec![],
             client_bypass: vec![],
             profiles: vec![],
@@ -918,7 +970,23 @@ impl BlocklistConfig {
             .filter_map(|key| normalize_client_key(key))
             .collect();
         self.client_bypass = normalized.into_iter().collect();
+
+        self.services = known_services(&self.services, "[blocklist] services");
+        for p in &mut self.profiles {
+            let owner = format!("profile '{}'", p.id);
+            p.services = known_services(&p.services, &owner);
+        }
     }
+}
+
+/// Configured service ids, cleaned up, with any the catalog doesn't know
+/// dropped and logged — a service a newer build removed must not stop startup.
+fn known_services(ids: &[String], owner: &str) -> Vec<String> {
+    let (known, unknown) = crate::services::normalize_ids(ids);
+    for id in unknown {
+        tracing::warn!("{owner}: unknown service '{id}', ignoring it");
+    }
+    known
 }
 
 fn normalize_secret(value: Option<String>) -> Option<String> {
@@ -1112,6 +1180,58 @@ mod tests {
         // The rule pointing at a non-existent egress is dropped; the valid one stays.
         assert_eq!(cfg.proxy.rules.len(), 1);
         assert_eq!(cfg.proxy.rules[0].pattern, "example.com");
+    }
+
+    #[test]
+    fn services_load_cleaned_and_service_rules_round_trip() {
+        let cfg = Config::from_toml(
+            r#"
+            [blocklist]
+            services = ["TikTok", "tiktok", "gone"]
+
+            [[blocklist.profiles]]
+            id = "kids"
+            name = "Kids"
+            services = ["youtube", "gone"]
+
+            [proxy]
+            enabled = true
+
+            [[proxy.egresses]]
+            id = "wg"
+            kind = "direct"
+
+            [[proxy.rules]]
+            service = "YouTube"
+            pattern = "stray.example"
+            egress = "wg"
+
+            [[proxy.rules]]
+            service = "whatsapp"
+            egress = "wg"
+
+            [[proxy.rules]]
+            service = "gone"
+            egress = "wg"
+            "#,
+        )
+        .unwrap();
+
+        // Unknown ids are dropped, the rest lowercased and deduped.
+        assert_eq!(cfg.blocklist.services, vec!["tiktok"]);
+        assert_eq!(cfg.blocklist.profiles[0].services, vec!["youtube"]);
+        // Only the routable, known service rule survives, without a pattern.
+        assert_eq!(cfg.proxy.rules.len(), 1);
+        let rule = &cfg.proxy.rules[0];
+        assert_eq!(rule.service.as_deref(), Some("youtube"));
+        assert!(rule.pattern.is_empty());
+
+        // A service rule saves without an empty `pattern` line and reloads.
+        let saved = cfg.to_toml().unwrap();
+        assert!(saved.contains("service = \"youtube\""), "{saved}");
+        assert!(!saved.contains("pattern = \"\""), "{saved}");
+        let reloaded = Config::from_toml(&saved).unwrap();
+        assert_eq!(reloaded.proxy.rules[0].hit_key(), "service:youtube");
     }
 
     #[test]

@@ -523,6 +523,7 @@ mod blocking_tests {
                 lists: vec![],
                 domains: vec![],
                 wildcard_block: vec![],
+                services: vec![],
                 whitelist: vec![],
                 client_bypass,
                 profiles: vec![],

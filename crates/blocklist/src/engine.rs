@@ -13,6 +13,7 @@ use crate::manual::ManualList;
 use crate::names::{has_suffix, is_registrable_or_deeper, matched_key, normalise};
 use crate::pause::Pauses;
 use crate::profiles::{CompiledProfile, compile_profiles};
+use crate::services::ServiceBlock;
 use crate::subscriptions::Subscriptions;
 use ferrite_core::config::{AllowlistConfig, BlocklistConfig};
 use ferrite_core::error::Result;
@@ -49,10 +50,12 @@ pub struct MatchInfo {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BlockSource {
-    /// `"blacklist"` (manual exact), `"wildcard"` (manual or config wildcard), or
-    /// `"list"` (a subscription).
+    /// `"blacklist"` (manual exact), `"wildcard"` (manual or config wildcard),
+    /// `"service"` (a catalog service blocked network-wide), or `"list"` (a
+    /// subscription).
     pub kind: String,
-    /// Human label: the list name, `"manual blacklist"`, or the wildcard pattern.
+    /// Human label: the list name, `"manual blacklist"`, the wildcard pattern,
+    /// or the service's display name.
     pub name: String,
     /// The key or pattern that produced the match (the domain or a matched parent).
     pub matched: String,
@@ -93,6 +96,10 @@ pub struct Blocklist {
     whitelist: ManualList,
     /// Manual block entries — `[blocklist] domains`.
     blacklist: ManualList,
+    /// Catalog services blocked for every device — `[blocklist] services`.
+    /// Same tier as `blacklist`: consulted inside every profile's
+    /// [`Self::check_blocked_in`], exempted by the whitelist tier.
+    blocked_services: ArcSwap<ServiceBlock>,
     cache: BlocklistCache,
     /// Configured `[[zones]]` suffixes (normalised), exempt from profile
     /// default-deny alongside the built-in local suffixes. Set once at startup
@@ -150,6 +157,7 @@ impl Blocklist {
             client_bypass: ArcSwap::from_pointee(client_bypass),
             whitelist,
             blacklist,
+            blocked_services: ArcSwap::from_pointee(ServiceBlock::new(&config.services)),
             cache: BlocklistCache::new(config.decision_cache_size),
             local_zones: RwLock::new(Vec::new()),
             refresh_lock: tokio::sync::Mutex::new(()),
@@ -420,7 +428,7 @@ impl Blocklist {
         // Manual blacklist: exact match, then walk up the hierarchy so a
         // blacklist entry for `evil.com` also blocks `www.evil.com` —
         // symmetric with the FST walk below and the whitelist walk.
-        if self.blacklist.contains(domain) {
+        if self.blacklist.contains(domain) || self.blocked_services.load().contains(domain) {
             return true;
         }
 
@@ -623,6 +631,14 @@ impl Blocklist {
                 matched: domain.clone(),
             });
         }
+        // Catalog services blocked network-wide.
+        for (svc, key) in self.blocked_services.load().matches(&domain) {
+            sources.push(BlockSource {
+                kind: "service".into(),
+                name: svc.name.clone(),
+                matched: key,
+            });
+        }
         // Subscription lists: scan each enabled list's own on-disk FST so the
         // match attributes to a specific list (the merged hot-path FST can't).
         let mut list_matched = false;
@@ -731,6 +747,21 @@ impl Blocklist {
     pub fn remove_blacklist(&self, domain: &str) {
         self.blacklist.remove(domain);
         self.clear_decision_caches();
+    }
+
+    /// Replace the catalog services blocked for every device. Unknown ids are
+    /// dropped; the API validates before calling.
+    pub fn set_blocked_services(&self, ids: &[String]) {
+        self.blocked_services
+            .store(Arc::new(ServiceBlock::new(ids)));
+        // Service domains match through the hierarchy walk inside every
+        // profile's decision, so every cache may hold a stale answer.
+        self.clear_decision_caches();
+    }
+
+    /// The catalog services blocked for every device, as configured.
+    pub fn blocked_services(&self) -> Vec<String> {
+        self.blocked_services.load().ids().to_vec()
     }
 
     pub fn list_whitelist(&self) -> Vec<String> {

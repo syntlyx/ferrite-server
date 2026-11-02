@@ -8,6 +8,7 @@ pub mod parser;
 pub mod pause;
 mod profiles;
 mod refresh;
+mod services;
 mod subscriptions;
 
 pub use domains::DomainSet;

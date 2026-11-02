@@ -14,6 +14,7 @@ use crate::ApiError;
 use ferrite_app::AppState;
 use ferrite_core::config::{EgressConfig, ProxyConfig};
 use ferrite_core::error::FeriteError;
+use ferrite_core::services;
 use ferrite_proxy::usable_rcvbuf_bytes;
 
 /// GET /api/proxy — current config (socks5 passwords redacted) + egress health.
@@ -252,14 +253,36 @@ fn validate(cfg: &ProxyConfig) -> Result<(), ApiError> {
         }
     }
     for r in &cfg.rules {
-        if r.pattern.trim().is_empty() {
-            return Err(bad("a rule is missing its pattern"));
+        let service = r
+            .service
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        match service {
+            Some(_) if !r.pattern.trim().is_empty() => {
+                return Err(bad("a rule routes a domain pattern or a service, not both"));
+            }
+            Some(id) => match services::find(&id.to_ascii_lowercase()) {
+                None => return Err(bad(&format!("rule references unknown service '{id}'"))),
+                Some(s) if !s.routable => {
+                    return Err(bad(&format!(
+                        "{} can't be routed through a tunnel: it also uses its own protocol, which the proxy can't forward",
+                        s.name
+                    )));
+                }
+                Some(_) => {}
+            },
+            None if r.pattern.trim().is_empty() => {
+                return Err(bad("a rule is missing its pattern"));
+            }
+            None => {}
         }
         let eg = r.egress.trim().to_ascii_lowercase();
         if !ids.contains(&eg) {
             return Err(bad(&format!(
                 "rule '{}' references unknown egress '{}'",
-                r.pattern, r.egress
+                r.hit_key(),
+                r.egress
             )));
         }
     }
@@ -422,6 +445,7 @@ mod tests {
             enabled: true,
             rules: vec![RuleConfig {
                 pattern: "x.test".to_string(),
+                service: None,
                 egress: "ghost".to_string(),
                 fail_closed: true,
                 clients: Vec::new(),
@@ -437,6 +461,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_accepts_a_routable_service_rule_and_rejects_the_rest() {
+        let (state, db) = test_support::app_state("proxy-put-service").await;
+        let cfg = |service: &str, pattern: &str| ProxyConfig {
+            enabled: true,
+            egresses: vec![egress("direct", "direct")],
+            rules: vec![RuleConfig {
+                pattern: pattern.to_string(),
+                service: Some(service.to_string()),
+                egress: "direct".to_string(),
+                fail_closed: true,
+                clients: Vec::new(),
+            }],
+            ..ProxyConfig::default()
+        };
+        for (service, pattern) in [("whatsapp", ""), ("nope", ""), ("youtube", "x.test")] {
+            let err = put_proxy(State(state.clone()), Json(cfg(service, pattern)))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err.0, FeriteError::Config(_)),
+                "{service}/{pattern}"
+            );
+        }
+        let Json(_) = put_proxy(State(state.clone()), Json(cfg(" YouTube ", "")))
+            .await
+            .unwrap();
+        let rules = state.live_config.read().proxy.rules.clone();
+        assert_eq!(rules[0].service.as_deref(), Some("youtube"));
+        assert_eq!(rules[0].hit_key(), "service:youtube");
+        drop(state);
+        test_support::cleanup_sqlite(&db);
+    }
+
+    #[tokio::test]
     async fn put_updates_live_config() {
         let (state, db) = test_support::app_state("proxy-put-ok").await;
         let cfg = ProxyConfig {
@@ -444,6 +502,7 @@ mod tests {
             egresses: vec![egress("work", "socks5")],
             rules: vec![RuleConfig {
                 pattern: "*.example.com".to_string(),
+                service: None,
                 egress: "work".to_string(),
                 fail_closed: true,
                 clients: Vec::new(),
@@ -471,6 +530,7 @@ mod tests {
             egresses: vec![egress("work", "socks5")],
             rules: vec![RuleConfig {
                 pattern: "*.example.com".to_string(),
+                service: None,
                 egress: "work".to_string(),
                 fail_closed: true,
                 clients: Vec::new(),

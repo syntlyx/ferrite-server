@@ -13,6 +13,7 @@ use crate::loader::{self, FstMap, empty_fst};
 use crate::names::{domain_in_set, normalise, wildcard_to_regex};
 use crate::refresh;
 use crate::subscriptions::{FstInputs, MergedSet, meta_path};
+use ferrite_core::services;
 
 /// Decision-cache size for a per-device profile. Smaller than the global cache
 /// (there are usually only a handful of profiles, each seeing one device's
@@ -30,7 +31,8 @@ pub struct CompiledProfile {
     pub(crate) cache: BlocklistCache,
     /// Per-profile manual overrides (exact + wildcard), applied *before* the
     /// global rules for this profile's clients: `allow` beats everything
-    /// (including a global block), `block` beats the global whitelist.
+    /// (including a global block), `block` beats the global whitelist. The
+    /// domains of the profile's catalog `services` are in `block_exact`.
     pub(crate) allow_exact: HashSet<String>,
     pub(crate) allow_wild: Vec<Regex>,
     pub(crate) block_exact: HashSet<String>,
@@ -129,7 +131,9 @@ pub(crate) fn compile_profiles(
         };
         let clients: HashSet<String> = normalize_client_keys(&cfg.clients).into_iter().collect();
         let (allow_exact, allow_wild) = split_patterns(&cfg.allow);
-        let (block_exact, block_wild) = split_patterns(&cfg.block);
+        let (mut block_exact, block_wild) = split_patterns(&cfg.block);
+        // Catalog services are this profile's block entries spelled by name.
+        block_exact.extend(services::domains_of(&cfg.services).map(str::to_string));
         compiled.push(Arc::new(CompiledProfile {
             clients,
             fst,

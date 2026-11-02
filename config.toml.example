@@ -270,6 +270,16 @@ domains = [
     # "ads.example.com",
 ]
 
+# Services from the built-in catalog, blocked for every device: "youtube",
+# "tiktok", "steam", … (the full list: GET /api/services, or the Blocklist
+# page). Each service is a set of domains matched like the entries above, so
+# an [allowlist] entry still exempts one. Device profiles take their own
+# `services = [...]`, and a tunnel rule routes a whole service with
+# `service = "youtube"` in place of `pattern`.
+services = [
+    # "tiktok",
+]
+
 # Remote blocklist subscriptions (hosts or Adblock format, auto-detected).
 [[blocklist.lists]]
 name    = "StevenBlack"

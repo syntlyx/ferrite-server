@@ -107,10 +107,10 @@ impl ProxyStats {
     pub fn prune(&self, cfg: &ProxyConfig) {
         self.egresses
             .retain(|id, _| cfg.egresses.iter().any(|e| e.id == *id));
-        self.rule_hits.retain(|(pattern, egress), _| {
+        self.rule_hits.retain(|(key, egress), _| {
             cfg.rules
                 .iter()
-                .any(|r| r.pattern == *pattern && r.egress == *egress)
+                .any(|r| r.hit_key() == *key && r.egress == *egress)
         });
         self.probes
             .retain(|id, _| cfg.egresses.iter().any(|e| e.id == *id));
@@ -355,6 +355,8 @@ pub struct DomainSnapshot {
 
 #[derive(Serialize)]
 pub struct RuleHits {
+    /// The rule's [`RuleConfig::hit_key`](ferrite_core::config::RuleConfig::hit_key):
+    /// its domain pattern, or `service:<id>` for a service rule.
     pub pattern: String,
     pub egress: String,
     pub hits: u64,
@@ -612,6 +614,7 @@ mod tests {
             }],
             rules: vec![RuleConfig {
                 pattern: "a.test".to_string(),
+                service: None,
                 egress: "keep".to_string(),
                 fail_closed: true,
                 clients: Vec::new(),

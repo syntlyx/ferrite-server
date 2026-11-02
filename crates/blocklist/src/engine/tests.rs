@@ -1,6 +1,6 @@
 use super::*;
 use crate::{AdblockStats, loader, refresh};
-use ferrite_core::config::ListConfig;
+use ferrite_core::config::{BlocklistProfileConfig, ListConfig};
 use fst::Map;
 
 fn temp_fst_path(name: &str) -> PathBuf {
@@ -25,6 +25,7 @@ async fn refresh_preserves_wildcard_block_rules() {
             lists: vec![],
             domains: vec![],
             wildcard_block: vec!["*.ads.test".to_string()],
+            services: vec![],
             whitelist: vec![],
             client_bypass: vec![],
             profiles: vec![],
@@ -81,6 +82,7 @@ fn load_from_disk_restores_per_list_counts_and_stats_from_cache() {
             }],
             domains: vec![],
             wildcard_block: vec![],
+            services: vec![],
             whitelist: vec![],
             client_bypass: vec![],
             profiles: vec![],
@@ -107,8 +109,6 @@ fn load_from_disk_restores_per_list_counts_and_stats_from_cache() {
 
 #[test]
 fn per_device_profile_applies_a_list_subset_to_matched_clients() {
-    use ferrite_core::config::BlocklistProfileConfig;
-
     let fst_path = temp_fst_path("ferrite-blocklist-profiles");
     let cache_dir = fst_path.parent().unwrap().join("lists");
     std::fs::create_dir_all(&cache_dir).unwrap();
@@ -153,6 +153,7 @@ fn per_device_profile_applies_a_list_subset_to_matched_clients() {
             ],
             domains: vec![],
             wildcard_block: vec![],
+            services: vec![],
             whitelist: vec![],
             client_bypass: vec![],
             profiles: vec![BlocklistProfileConfig {
@@ -161,6 +162,7 @@ fn per_device_profile_applies_a_list_subset_to_matched_clients() {
                 lists: vec!["Ads".into(), "Adult".into()],
                 clients: vec!["10.0.0.5".into()],
                 block: Vec::new(),
+                services: vec![],
                 allow: Vec::new(),
                 allowlists: Vec::new(),
                 default_deny: false,
@@ -187,6 +189,7 @@ fn per_device_profile_applies_a_list_subset_to_matched_clients() {
         lists: vec!["Ads".into()],
         clients: vec!["aa:bb:cc:dd:ee:ff".into()],
         block: Vec::new(),
+        services: vec![],
         allow: Vec::new(),
         allowlists: Vec::new(),
         default_deny: false,
@@ -205,8 +208,6 @@ fn per_device_profile_applies_a_list_subset_to_matched_clients() {
 
 #[test]
 fn per_profile_manual_rules_override_global() {
-    use ferrite_core::config::BlocklistProfileConfig;
-
     let fst_path = temp_fst_path("ferrite-blocklist-profile-overrides");
     let cache_dir = fst_path.parent().unwrap().join("lists");
     std::fs::create_dir_all(&cache_dir).unwrap();
@@ -236,6 +237,7 @@ fn per_profile_manual_rules_override_global() {
             whitelist: vec!["news.example".into()],
             domains: vec![],
             wildcard_block: vec![],
+            services: vec![],
             client_bypass: vec![],
             profiles: vec![
                 // "me": allow social.example (override the global block) for one device.
@@ -245,6 +247,7 @@ fn per_profile_manual_rules_override_global() {
                     lists: vec!["Ads".into()],
                     clients: vec!["10.0.0.1".into()],
                     block: vec![],
+                    services: vec![],
                     allow: vec!["social.example".into()],
                     allowlists: Vec::new(),
                     default_deny: false,
@@ -256,6 +259,7 @@ fn per_profile_manual_rules_override_global() {
                     lists: vec!["Ads".into()],
                     clients: vec!["10.0.0.2".into()],
                     block: vec!["news.example".into(), "*.games.example".into()],
+                    services: vec![],
                     allow: vec![],
                     allowlists: Vec::new(),
                     default_deny: false,
@@ -308,6 +312,7 @@ async fn refresh_keeps_existing_fst_when_enabled_lists_all_fail() {
             }],
             domains: vec![],
             wildcard_block: vec![],
+            services: vec![],
             whitelist: vec![],
             client_bypass: vec![],
             profiles: vec![],
@@ -341,6 +346,7 @@ fn config_entries_are_normalized_once_for_hot_path_lookups() {
             lists: vec![],
             domains: vec![],
             wildcard_block: vec!["*.Ads.Test.".to_string()],
+            services: vec![],
             whitelist: vec!["Safe.Test.".to_string(), "*.Trusted.Test.".to_string()],
             client_bypass: vec![],
             profiles: vec![],
@@ -364,6 +370,7 @@ fn explain_attributes_sources_and_whitelist() {
             lists: vec![],
             domains: vec![],
             wildcard_block: vec!["*.ads.test".to_string()],
+            services: vec![],
             whitelist: vec!["safe.test".to_string()],
             client_bypass: vec![],
             profiles: vec![],
@@ -411,6 +418,7 @@ fn whitelisting_parent_domain_exempts_subdomains() {
             lists: vec![],
             domains: vec![],
             wildcard_block: vec![],
+            services: vec![],
             whitelist: vec!["google.com".to_string()],
             client_bypass: vec![],
             profiles: vec![],
@@ -437,6 +445,7 @@ fn blacklisting_parent_domain_blocks_subdomains() {
             lists: vec![],
             domains: vec![],
             wildcard_block: vec![],
+            services: vec![],
             whitelist: vec![],
             client_bypass: vec![],
             profiles: vec![],
@@ -467,6 +476,7 @@ fn blacklisting_parent_clears_stale_allow_for_subdomain() {
             lists: vec![],
             domains: vec![],
             wildcard_block: vec![],
+            services: vec![],
             whitelist: vec![],
             client_bypass: vec![],
             profiles: vec![],
@@ -493,6 +503,7 @@ fn public_suffix_entry_does_not_overmatch_ccsld() {
             lists: vec![],
             domains: vec![],
             wildcard_block: vec![],
+            services: vec![],
             whitelist: vec![],
             client_bypass: vec![],
             profiles: vec![],
@@ -531,6 +542,7 @@ async fn subscribed_allowlist_exempts_blocked_domains() {
             }],
             domains: vec![],
             wildcard_block: vec![],
+            services: vec![],
             whitelist: vec![],
             client_bypass: vec![],
             profiles: vec![],
@@ -579,8 +591,6 @@ async fn subscribed_allowlist_exempts_blocked_domains() {
 
 #[tokio::test]
 async fn profile_block_overrides_subscribed_allowlist() {
-    use ferrite_core::config::BlocklistProfileConfig;
-
     let fst_path = temp_fst_path("ferrite-allowlist-profile-block");
     let dir = fst_path.parent().unwrap().to_path_buf();
     std::fs::create_dir_all(&dir).unwrap();
@@ -594,6 +604,7 @@ async fn profile_block_overrides_subscribed_allowlist() {
             lists: vec![],
             domains: vec![],
             wildcard_block: vec![],
+            services: vec![],
             whitelist: vec![],
             client_bypass: vec![],
             profiles: vec![BlocklistProfileConfig {
@@ -602,6 +613,7 @@ async fn profile_block_overrides_subscribed_allowlist() {
                 lists: vec![],
                 clients: vec!["10.0.0.2".into()],
                 block: vec!["social.example".into()],
+                services: vec![],
                 allow: vec![],
                 allowlists: Vec::new(),
                 default_deny: false,
@@ -649,6 +661,7 @@ fn load_from_disk_restores_allowlist_fst_and_counts() {
             lists: vec![],
             domains: vec![],
             wildcard_block: vec![],
+            services: vec![],
             whitelist: vec![],
             client_bypass: vec![],
             profiles: vec![],
@@ -693,6 +706,7 @@ fn load_from_disk_misses_when_allowlists_configured_but_not_cached() {
             lists: vec![],
             domains: vec![],
             wildcard_block: vec![],
+            services: vec![],
             whitelist: vec![],
             client_bypass: vec![],
             profiles: vec![],
@@ -722,6 +736,7 @@ fn allow_list_crud_mirrors_blocklist_semantics() {
             lists: vec![],
             domains: vec![],
             wildcard_block: vec![],
+            services: vec![],
             whitelist: vec![],
             client_bypass: vec![],
             profiles: vec![],
@@ -769,8 +784,6 @@ fn allow_list_crud_mirrors_blocklist_semantics() {
 
 #[tokio::test]
 async fn default_deny_blocks_everything_except_allow_tiers() {
-    use ferrite_core::config::BlocklistProfileConfig;
-
     let fst_path = temp_fst_path("ferrite-default-deny");
     let dir = fst_path.parent().unwrap().to_path_buf();
     std::fs::create_dir_all(&dir).unwrap();
@@ -784,6 +797,7 @@ async fn default_deny_blocks_everything_except_allow_tiers() {
             lists: vec![],
             domains: vec![],
             wildcard_block: vec![],
+            services: vec![],
             whitelist: vec![],
             client_bypass: vec![],
             profiles: vec![BlocklistProfileConfig {
@@ -792,6 +806,7 @@ async fn default_deny_blocks_everything_except_allow_tiers() {
                 lists: vec![],
                 clients: vec!["10.0.0.2".into()],
                 block: vec![],
+                services: vec![],
                 allow: vec!["app.example".into()],
                 allowlists: vec![],
                 default_deny: true,
@@ -830,8 +845,6 @@ async fn default_deny_blocks_everything_except_allow_tiers() {
 
 #[tokio::test]
 async fn default_deny_exempts_local_infra_but_not_from_blacklist() {
-    use ferrite_core::config::BlocklistProfileConfig;
-
     let blocklist = Blocklist::new(
         BlocklistConfig {
             enabled: true,
@@ -839,6 +852,7 @@ async fn default_deny_exempts_local_infra_but_not_from_blacklist() {
             lists: vec![],
             domains: vec![],
             wildcard_block: vec![],
+            services: vec![],
             whitelist: vec![],
             client_bypass: vec![],
             profiles: vec![BlocklistProfileConfig {
@@ -847,6 +861,7 @@ async fn default_deny_exempts_local_infra_but_not_from_blacklist() {
                 lists: vec![],
                 clients: vec!["10.0.0.3".into()],
                 block: vec![],
+                services: vec![],
                 allow: vec![],
                 allowlists: vec![],
                 default_deny: true,
@@ -892,8 +907,6 @@ fn has_suffix_respects_label_boundaries() {
 
 #[tokio::test]
 async fn profile_allowlist_subset_overrides_the_global_allow_set() {
-    use ferrite_core::config::BlocklistProfileConfig;
-
     let fst_path = temp_fst_path("ferrite-profile-allowlist-subset");
     let dir = fst_path.parent().unwrap().to_path_buf();
     std::fs::create_dir_all(&dir).unwrap();
@@ -909,6 +922,7 @@ async fn profile_allowlist_subset_overrides_the_global_allow_set() {
             lists: vec![],
             domains: vec![],
             wildcard_block: vec![],
+            services: vec![],
             whitelist: vec![],
             client_bypass: vec![],
             profiles: vec![BlocklistProfileConfig {
@@ -917,6 +931,7 @@ async fn profile_allowlist_subset_overrides_the_global_allow_set() {
                 lists: vec![],
                 clients: vec!["10.0.0.2".into()],
                 block: vec![],
+                services: vec![],
                 allow: vec![],
                 allowlists: vec!["KidSafe".into()],
                 default_deny: true,
@@ -992,6 +1007,7 @@ async fn unchanged_lists_reuse_the_merged_fst() {
             ],
             domains: vec![],
             wildcard_block: vec![],
+            services: vec![],
             whitelist: vec![],
             client_bypass: vec![],
             profiles: vec![],
@@ -1035,7 +1051,6 @@ async fn unchanged_lists_reuse_the_merged_fst() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_profile_recompiles_only_when_its_own_lists_move() {
-    use ferrite_core::config::BlocklistProfileConfig;
     use std::os::unix::fs::MetadataExt;
 
     let fst_path = temp_fst_path("ferrite-profile-fingerprint");
@@ -1067,6 +1082,7 @@ async fn a_profile_recompiles_only_when_its_own_lists_move() {
             ],
             domains: vec![],
             wildcard_block: vec![],
+            services: vec![],
             whitelist: vec![],
             client_bypass: vec![],
             // Two of the three, so the profile keeps a map of its own rather
@@ -1077,6 +1093,7 @@ async fn a_profile_recompiles_only_when_its_own_lists_move() {
                 lists: vec!["Ads".into(), "Track".into()],
                 clients: vec!["10.0.0.2".into()],
                 block: vec![],
+                services: vec![],
                 allow: vec![],
                 allowlists: vec![],
                 default_deny: false,
@@ -1158,6 +1175,7 @@ async fn refresh_cost_cold_vs_unchanged() {
             lists,
             domains: vec![],
             wildcard_block: vec![],
+            services: vec![],
             whitelist: vec![],
             client_bypass: vec![],
             profiles: vec![],
@@ -1182,8 +1200,6 @@ async fn refresh_cost_cold_vs_unchanged() {
 /// that file rather than merge the same inputs into a private copy of it.
 #[tokio::test]
 async fn profile_covering_every_list_serves_the_merged_fst() {
-    use ferrite_core::config::BlocklistProfileConfig;
-
     let fst_path = temp_fst_path("ferrite-profile-merge-reuse");
     let dir = fst_path.parent().unwrap().to_path_buf();
     std::fs::create_dir_all(&dir).unwrap();
@@ -1219,6 +1235,7 @@ async fn profile_covering_every_list_serves_the_merged_fst() {
             lists: lists.clone(),
             domains: vec![],
             wildcard_block: vec![],
+            services: vec![],
             whitelist: vec![],
             client_bypass: vec![],
             profiles: vec![
@@ -1228,6 +1245,7 @@ async fn profile_covering_every_list_serves_the_merged_fst() {
                     lists: lists.iter().map(|l| l.name.clone()).collect(),
                     clients: vec!["10.0.0.2".into()],
                     block: vec![],
+                    services: vec![],
                     allow: vec![],
                     allowlists: vec![],
                     default_deny: false,
@@ -1238,6 +1256,7 @@ async fn profile_covering_every_list_serves_the_merged_fst() {
                     lists: vec!["Ads".into(), "Track".into()],
                     clients: vec!["10.0.0.3".into()],
                     block: vec![],
+                    services: vec![],
                     allow: vec![],
                     allowlists: vec![],
                     default_deny: false,
@@ -1286,6 +1305,7 @@ fn whitelisted_parent_overrides_blocked_subdomain() {
             lists: vec![],
             domains: vec![],
             wildcard_block: vec![],
+            services: vec![],
             whitelist: vec![],
             client_bypass: vec![],
             profiles: vec![],
@@ -1336,7 +1356,6 @@ fn a_pause_lifts_filtering_box_wide_or_for_one_device() {
 /// then rebuilds the profile even though no list moved.
 #[tokio::test]
 async fn startup_after_an_upgrade_serves_last_runs_profile_map_until_a_refresh() {
-    use ferrite_core::config::BlocklistProfileConfig;
     use std::os::unix::fs::MetadataExt;
 
     let fst_path = temp_fst_path("ferrite-profile-upgrade");
@@ -1365,6 +1384,7 @@ async fn startup_after_an_upgrade_serves_last_runs_profile_map_until_a_refresh()
         ],
         domains: vec![],
         wildcard_block: vec![],
+        services: vec![],
         whitelist: vec![],
         client_bypass: vec![],
         profiles: vec![BlocklistProfileConfig {
@@ -1373,6 +1393,7 @@ async fn startup_after_an_upgrade_serves_last_runs_profile_map_until_a_refresh()
             lists: vec!["Ads".into(), "Track".into()],
             clients: vec!["10.0.0.2".into()],
             block: vec![],
+            services: vec![],
             allow: vec![],
             allowlists: vec![],
             default_deny: false,
@@ -1429,4 +1450,114 @@ async fn startup_after_an_upgrade_serves_last_runs_profile_map_until_a_refresh()
     assert!(restarted.should_block_for("track.example", kid.as_deref()));
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+fn services_config(
+    services: Vec<String>,
+    profiles: Vec<BlocklistProfileConfig>,
+) -> BlocklistConfig {
+    BlocklistConfig {
+        enabled: true,
+        decision_cache_size: 1000,
+        lists: vec![],
+        domains: vec![],
+        wildcard_block: vec![],
+        services,
+        whitelist: vec![],
+        client_bypass: vec![],
+        profiles,
+    }
+}
+
+#[test]
+fn network_wide_services_block_everyone_below_the_allow_tiers() {
+    let blocklist = Blocklist::new(
+        services_config(
+            vec!["tiktok".into()],
+            vec![BlocklistProfileConfig {
+                id: "adults".into(),
+                name: "Adults".into(),
+                lists: vec![],
+                clients: vec!["10.0.0.9".into()],
+                block: vec![],
+                services: vec![],
+                allow: vec!["tiktok.com".into()],
+                allowlists: Vec::new(),
+                default_deny: false,
+            }],
+        ),
+        AllowlistConfig {
+            domains: vec!["ttwstatic.com".into()],
+            lists: vec![],
+        },
+        temp_fst_path("ferrite-services-global"),
+    );
+    blocklist.rebuild_profiles();
+
+    // Every device, subdomains included, through the hierarchy walk.
+    assert!(blocklist.should_block_for("www.tiktok.com", None));
+    assert!(blocklist.should_block_for("v16.tiktokcdn.com", None));
+    assert!(!blocklist.should_block_for("example.com", None));
+    // Same tier as the manual blacklist: an allowlist entry exempts a domain.
+    assert!(!blocklist.should_block_for("ttwstatic.com", None));
+    // A profile's own allow beats it.
+    let adults = blocklist.profile_for("10.0.0.9", None);
+    assert!(adults.is_some());
+    assert!(!blocklist.should_block_for("www.tiktok.com", adults.as_deref()));
+    assert!(blocklist.should_block_for("tiktokv.com", adults.as_deref()));
+
+    // The diagnostic names the service and the key that matched.
+    let why = blocklist.explain("m.tiktok.com");
+    assert!(why.blocked);
+    assert!(
+        why.sources
+            .iter()
+            .any(|s| s.kind == "service" && s.name == "TikTok" && s.matched == "tiktok.com"),
+        "{:?}",
+        why.sources
+    );
+
+    // Unblocking drops the cached decisions with it.
+    assert_eq!(blocklist.blocked_services(), vec!["tiktok"]);
+    blocklist.set_blocked_services(&[]);
+    assert!(blocklist.blocked_services().is_empty());
+    assert!(!blocklist.should_block_for("www.tiktok.com", None));
+    assert!(!blocklist.should_block_for("tiktokv.com", adults.as_deref()));
+}
+
+#[test]
+fn profile_services_block_like_profile_block_entries() {
+    let blocklist = Blocklist::new(
+        services_config(
+            vec![],
+            vec![BlocklistProfileConfig {
+                id: "kids".into(),
+                name: "Kids".into(),
+                lists: vec![],
+                clients: vec!["10.0.0.2".into()],
+                block: vec![],
+                services: vec!["youtube".into()],
+                allow: vec!["youtubekids.com".into()],
+                allowlists: Vec::new(),
+                default_deny: false,
+            }],
+        ),
+        AllowlistConfig {
+            domains: vec!["youtube.com".into()],
+            lists: vec![],
+        },
+        temp_fst_path("ferrite-services-profile"),
+    );
+    blocklist.rebuild_profiles();
+
+    let kids = blocklist.profile_for("10.0.0.2", None);
+    assert!(kids.is_some());
+    // Beats the global whitelist, like a profile `block` entry.
+    assert!(blocklist.should_block_for("www.youtube.com", kids.as_deref()));
+    assert!(blocklist.should_block_for("rr1.googlevideo.com", kids.as_deref()));
+    // The profile's own allow still wins.
+    assert!(!blocklist.should_block_for("www.youtubekids.com", kids.as_deref()));
+    // Other devices are untouched.
+    assert!(!blocklist.should_block_for("rr1.googlevideo.com", None));
+    assert!(!blocklist.should_block_for("www.youtube.com", None));
 }

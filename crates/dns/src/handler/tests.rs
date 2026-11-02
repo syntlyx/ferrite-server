@@ -280,6 +280,7 @@ fn blocklist() -> Blocklist {
             lists: vec![],
             domains: vec![],
             wildcard_block: vec![],
+            services: vec![],
             whitelist: vec![],
             client_bypass: vec![],
             profiles: vec![],
