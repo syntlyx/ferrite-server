@@ -61,6 +61,11 @@ impl CompiledProfile {
         self.clients.contains(client_ip) || mac.is_some_and(|m| self.clients.contains(m))
     }
 
+    /// The profile's id, as configured.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
     /// Is the profile on at `minute` of the week (box-local)?
     pub(crate) fn active_at(&self, minute: u32) -> bool {
         self.schedule.is_active(minute)

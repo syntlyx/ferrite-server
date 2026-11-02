@@ -382,3 +382,12 @@ domains = [
 # webhook       = "https://ntfy.sh/my-ferrite"
 # tunnel_alerts = true    # a tunnel down for over a minute, and its recovery
 # new_device    = true    # a device the box has never seen joins the network
+
+# ── MCP (AI assistants) ───────────────────────────────────────────────────────
+# /api/mcp lets an assistant such as Claude Code read what ferrite is doing,
+# using the API key. Off by default; allow_changes also lets it block, allow
+# and pause.
+#
+# [mcp]
+# enabled       = true
+# allow_changes = false

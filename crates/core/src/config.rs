@@ -54,6 +54,10 @@ pub struct Config {
     /// joining — and which of those it tells.
     #[serde(default)]
     pub notifications: NotificationsConfig,
+    /// The MCP endpoint that lets an AI assistant read — and, if allowed,
+    /// change — what ferrite does.
+    #[serde(default)]
+    pub mcp: McpConfig,
     /// Verbose debug-level logging for the `ferrite` target. **Off by default**:
     /// every DNS query and proxied connection emits a record, and each one costs
     /// two allocations, a process-wide ring-buffer lock and a stdout write — real
@@ -843,10 +847,24 @@ impl Default for Config {
             client_aliases: vec![],
             proxy: ProxyConfig::default(),
             notifications: NotificationsConfig::default(),
+            mcp: McpConfig::default(),
             debug_logging: false,
             web_dir: None,
         }
     }
+}
+
+/// The MCP endpoint, `/api/mcp` (Model Context Protocol, Streamable HTTP). It
+/// sits behind the same authentication as the rest of the API, so an assistant
+/// connects with the API key.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct McpConfig {
+    /// Serve the endpoint at all. Off until someone turns it on.
+    pub enabled: bool,
+    /// Offer the tools that change things — block or allow a domain, pause
+    /// filtering, block a service. Off: an assistant can look, not touch.
+    pub allow_changes: bool,
 }
 
 /// Webhook notifications: one URL, POSTed a JSON event for each kind that is

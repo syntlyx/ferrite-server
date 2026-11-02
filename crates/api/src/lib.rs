@@ -7,6 +7,7 @@ pub mod error;
 mod ingress;
 pub mod lists;
 pub mod logs;
+pub mod mcp;
 pub mod metrics;
 pub mod middleware;
 pub mod notifications;
@@ -96,6 +97,12 @@ pub fn build_router(state: AppState) -> Router {
             delete(custom_records::delete_record),
         )
         // Temporary pauses of filtering (box-wide or per device; not persisted)
+        // Model Context Protocol endpoint for AI assistants (off by default)
+        .route("/mcp", post(mcp::post).get(mcp::get))
+        .route(
+            "/settings/mcp",
+            get(mcp::get_settings).put(mcp::put_settings),
+        )
         .route("/notifications", get(notifications::get_notifications))
         .route("/notifications", put(notifications::put_notifications))
         .route(
