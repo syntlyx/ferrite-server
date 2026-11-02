@@ -1,55 +1,73 @@
 # ferrite
 
-**Self-hosted DNS that blocks ads & trackers — and routes any device through a
-tunnel.** It's a Pi-hole-style sinkhole that goes further: send chosen domains,
-or whole devices, through **WireGuard, SOCKS5, or Tor** with DPI evasion and
-encrypted upstreams. Filtering and a privacy tunnel in **one binary, no root**,
-written in Rust.
+**A self-hosted DNS filter and router for the home network — one Rust binary.**
 
-> Pi-hole keeps your DNS clean. ferrite keeps it clean **and** lets you decide,
-> per device, what leaves your network and how.
+ferrite answers DNS for every device in the house. It blocks ads, trackers and
+malware for all of them, applies stricter rules to the devices that need them —
+a kid's tablet, a games console, the IoT corner — and sends the traffic you
+choose through WireGuard, SOCKS5 or Tor. Its panel shows what every device is
+doing and why each name was allowed, blocked or routed.
 
-## Why ferrite
+It runs as one process without root on anything from a Raspberry Pi to a NAS,
+and keeps everything it learns on that box.
 
-- **Filtering _and_ per-device routing in one box.** No glue between a DNS
-  blocker and a VPN — it's the same server.
-- **Anti-censorship built in.** Route blocked domains through Tor or a tunnel,
-  with TLS-ClientHello (SNI) fragmentation to defeat DPI — per device, your choice.
-- **Per-device profiles, up to default-deny.** Different block/allow lists per
-  device — or flip a profile to *block everything except an allowlist* (kid /
-  IoT mode) while local network names keep resolving.
-- **No root, no TUN device.** WireGuard runs in userspace (boringtun + smoltcp),
-  fully in-process.
-- **Fast and small.** Rust, single binary. ~60 MB RSS on an ARM board serving 30
-  clients off a 1.8M-domain blocklist, sub-2 ms cache/block decisions,
-  tens-of-thousands of QPS.
-- **Self-hosted and private.** No telemetry, no phone-home. Your queries stay on
-  your box.
+## What it does
 
-## How it compares
+**Filtering for the whole network.** Subscribe to blocklists and allowlists in
+hosts, Adblock or plain-domain format (a curated catalog is built in, or paste
+any URL); they compile into one compact lookup. Add your own block and allow
+entries, block whole services network-wide, and turn on SafeSearch and YouTube
+Restricted Mode. Every verdict can be explained: which list, rule or service
+matched, and what exempted it.
 
-|                                                            | ferrite               | Pi-hole              | AdGuard Home       | NextDNS            |
-| ---------------------------------------------------------- | --------------------- | -------------------- | ------------------ | ------------------ |
-| Ad / tracker blocking                                       | yes                   | yes                  | yes                | yes                |
-| Per-device filtering profiles                                | yes                   | yes (groups)         | yes (clients)      | yes                |
-| Encrypted upstreams (DoT / DoH / DoQ)                        | built in              | needs unbound or cloudflared | built in   | n/a — it *is* the upstream |
-| **Per-device / per-domain egress via WireGuard, SOCKS5, Tor** | **yes**               | no                   | no                 | no                 |
-| **DPI evasion (TLS ClientHello / SNI fragmentation)**        | **yes**               | no                   | no                 | no                 |
-| Runs without root                                            | yes (no TUN either)   | no                   | needs a capability | n/a                |
-| Self-hosted, no third party sees your queries                | yes                   | yes                  | yes                | no                 |
-| DHCP server                                                  | not yet               | yes                  | yes                | n/a                |
-| Maturity                                                     | v0.1.x, one developer | mature               | mature             | mature             |
+**Rules per device.** Profiles apply to chosen devices by MAC or IP:
 
-Short version: if you want a sinkhole and nothing else, Pi-hole and AdGuard Home
-are mature and excellent — use them. ferrite is for when you also want to decide
-**per device which tunnel the traffic leaves through**, without hand-wiring a DNS
-blocker to a VPN client and a proxy.
+- block services from a catalog of 43 — TikTok, Roblox, YouTube, Discord,
+  Fortnite and more, in seven categories — with one click each;
+- run on a weekly schedule ("school nights, 21:30–07:00");
+- force SafeSearch and YouTube Restricted Mode;
+- use a subset of the lists, plus their own block and allow entries;
+- or flip to default-deny: only what is allowed resolves, while local names
+  keep working.
+
+Any device can be paused for a few minutes or exempted from filtering.
+
+**Routing through tunnels.** Send a domain, a whole service or everything a
+device does through an egress: built-in WireGuard (paste a `.conf`; the kernel
+does the crypto when ferrite has `CAP_NET_ADMIN`, an in-process userspace
+tunnel otherwise — no TUN device either way), SOCKS5 (point it at Tor), or
+direct with TLS ClientHello fragmentation to get past DPI. Rules can be scoped to devices and fail closed when a tunnel is down.
+ferrite reads the SNI or Host and never terminates TLS. Routing decides *how*
+traffic leaves; blocking still decides *whether* a name resolves.
+
+**Seeing what happens.** A live dashboard, a query log with device names, and a
+side panel for any domain or device: its verdict and why, a day of activity,
+the services behind it, the profile that governs it. Notifications go to ntfy,
+Telegram, Discord, Slack, Gotify or a JSON webhook when a tunnel stays down or
+a device the box has never seen joins the network.
+
+**Private DNS.** Plain, DoT, DoH and DoQ upstreams in one pool with failover; an
+upstream's queries can themselves ride a tunnel. EDNS Client Subnet is stripped,
+DNSSEC is requested, local zones can be forwarded to your router, and custom
+`A` / `AAAA` / `CNAME` records (exact or wildcard) answer first.
+
+**Automation.** Everything the panel does is a REST API. Prometheus metrics at
+`/api/metrics`, config export and import, self-update from the panel, and an
+MCP endpoint so an AI assistant can ask why a site is blocked — or, if you
+allow it, block one.
+
+**Small and fast.** ~60 MB RSS on an ARM board serving 30 clients off a
+1.8M-domain blocklist, sub-2 ms cache and block decisions, tens of thousands
+of queries per second. Static musl binaries for `x86_64` and `aarch64`,
+a Docker image, and an Unraid template.
 
 ## Screenshots
 
 > Images live in the [web UI repo](https://github.com/syntlyx/ferrite-web/tree/main/screenshots).
 
 ![Dashboard](https://raw.githubusercontent.com/syntlyx/ferrite-web/main/screenshots/dashboard.png)
+![Profiles](https://raw.githubusercontent.com/syntlyx/ferrite-web/main/screenshots/profiles.png)
+![Device panel](https://raw.githubusercontent.com/syntlyx/ferrite-web/main/screenshots/device.png)
 ![Tunnels](https://raw.githubusercontent.com/syntlyx/ferrite-web/main/screenshots/tunnels.png)
 
 ## Privacy
@@ -57,8 +75,9 @@ blocker to a VPN client and a proxy.
 ferrite is a privacy tool first. What that means concretely:
 
 - **No telemetry, no analytics, no phone-home.** The only outbound call ferrite
-  makes on its own is an hourly GitHub check for updates (and blocklist fetches
-  you configure). Nothing about your queries ever leaves the box.
+  makes on its own is an hourly GitHub check for updates (plus the blocklist
+  fetches and notifications you configure). Nothing about your queries ever
+  leaves the box.
 - **Your DNS, encrypted upstream.** Plain, DoT, DoH, and DoQ upstreams in one
   pool. A resolver's queries can also ride a **tunnel** (DNS-over-TCP or DoT
   through an egress) — so your ISP sees only WireGuard, not your lookups.
@@ -88,32 +107,38 @@ answer:
 
 ```
 client ──▶ ferrite
-            1. custom records   → local A/AAAA/CNAME answer
-            2. selective routing→ matches a rule? answer with ferrite's own IP
-            3. blocklist        → blocked? NXDOMAIN
+            1. custom records   → local A / AAAA / CNAME answer
+            2. blocklist        → blocked for this device? NXDOMAIN
+               2b. SafeSearch   → CNAME to the engine's safe host
+            3. routing rule     → answer with ferrite's own IP (traffic goes through the tunnel)
             4. cache            → fresh? cached answer
-            5. upstream         → DoT/DoH/DoQ/plain (round-robin + failover)
+            5. upstream         → DoT / DoH / DoQ / plain (round-robin + failover)
+            6. CNAME check      → a blocked CNAME target blocks the answer too
 ```
 
-**Selective routing / tunnels.** When a domain matches a routing rule, ferrite
-answers DNS with **its own LAN IP**, so the client connects to ferrite. The
-listeners peek the **SNI** (`:443`) or **Host** (`:80`) — without terminating TLS
-— re-match the rule on the real hostname, and splice the connection through the
-chosen **egress**:
+The blocklist step is per device: a profile's own allow and block entries and
+its services come first, then the allowlists, then default-deny if the profile
+has it on, then the network-wide entries, services and lists. A profile outside its schedule steps aside until
+its window opens.
+
+**Tunnels.** When a domain matches a routing rule, ferrite answers DNS with
+**its own LAN IP**, so the client connects to ferrite. The listeners peek the
+**SNI** (`:443`) or **Host** (`:80`) — without terminating TLS — re-match the
+rule on the real hostname, and splice the connection through the chosen
+**egress**:
 
 | Egress      | What it does                                                                                                                       |
 | ----------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | `direct`    | Connect straight out (resolved via ferrite's upstream — no DNS leak).                                                              |
 | `socks5`    | Forward through a SOCKS5 proxy (hostname sent as `ATYP=domain`). Point it at a local **Tor** (`127.0.0.1:9050`) to route over Tor. |
-| `wireguard` | Built-in userspace WireGuard — paste a `.conf`. DNS for routed names resolves _through_ the tunnel.                                |
+| `wireguard` | Built-in WireGuard — paste a `.conf`. Kernel-backed when allowed, userspace otherwise. DNS for routed names resolves _through_ the tunnel. |
 | `evasion`   | Like `direct`, but splits the TLS ClientHello at the SNI across TCP segments so DPI can't read the hostname.                       |
 
-Rules can be scoped to **specific devices** (by name/MAC/IP) — route a kid's
-tablet through a tunnel while everything else goes direct. Routing decides *how*
-traffic leaves, blocking decides *whether* a name resolves: a blocklisted domain
-stays blocked even when a routing rule covers it (so routing a service through a
-tunnel doesn't unblock its tracker subdomains). To deliberately reach a
-blocklisted domain, whitelist it — it then routes as usual. Rules, egresses, and
+Rules match a domain or a catalog service and can be scoped to **specific
+devices** (by name/MAC/IP) — route a kid's tablet through a tunnel while
+everything else goes direct. A blocklisted domain stays blocked even when a
+routing rule covers it (routing a service through a tunnel doesn't unblock its
+tracker subdomains); whitelist it to route it anyway. Rules, egresses and
 listener ports **hot-reload** — no restart.
 
 ## Install
@@ -148,7 +173,7 @@ docker run -d --name ferrite \
 with a `.sha256` next to each, so you can verify before running anything:
 
 ```bash
-VER=v0.1.8; ARCH=$(uname -m)-unknown-linux-musl
+VER=v0.2.0; ARCH=$(uname -m)-unknown-linux-musl
 BASE=https://github.com/syntlyx/ferrite-server/releases/download/$VER
 curl -fsSLO $BASE/ferrite-$VER-$ARCH.tar.gz
 curl -fsSL  $BASE/ferrite-$VER-$ARCH.tar.gz.sha256 | sha256sum -c -
@@ -206,16 +231,26 @@ via `egress = "<id>"` (plain/DoT only):
 
 ```toml
 [[upstream]]
-type = "plain"; address = "8.8.8.8"; port = 53
+type = "plain"
+address = "8.8.8.8"
+port = 53
 
 [[upstream]]
-type = "tls"; address = "1.1.1.1"; port = 853; tls_name = "cloudflare-dns.com"
+type = "tls"
+address = "1.1.1.1"
+port = 853
+tls_name = "cloudflare-dns.com"
 
 [[upstream]]
-type = "https"; url = "https://cloudflare-dns.com/dns-query"; bootstrap_ip = "1.1.1.1"
+type = "https"
+url = "https://cloudflare-dns.com/dns-query"
+bootstrap_ip = "1.1.1.1"
 
 [[upstream]]
-type = "quic"; address = "94.140.14.14"; port = 853; tls_name = "dns.adguard-dns.com"
+type = "quic"
+address = "94.140.14.14"
+port = 853
+tls_name = "dns.adguard-dns.com"
 ```
 
 > `bootstrap_ip` is needed for DoH when ferrite is the system resolver (it can't
@@ -256,20 +291,45 @@ your `[[zones]]` — stay resolvable automatically, no extra configuration.
 
 ```toml
 [[blocklist.profiles]]
-id = "iot"; name = "IoT Devices"
+id = "iot"
+name = "IoT Devices"
 clients      = ["aa:bb:cc:dd:ee:ff"]
 allowlists   = ["anudeepND Whitelist"]   # empty = all enabled allowlists apply
 default_deny = true                      # block everything not explicitly allowed
+```
+
+A profile can also block catalog **services**, run on a **schedule** (box-local
+time; a window may cross midnight) and force **SafeSearch** — the same three
+exist network-wide under `[blocklist]`:
+
+```toml
+[[blocklist.profiles]]
+id = "kids"
+name = "Kids"
+clients  = ["aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"]
+services = ["tiktok", "roblox", "fortnite"]     # GET /api/services lists the catalog
+safe_search = true
+youtube_restricted = "moderate"                 # off | moderate | strict
+
+[[blocklist.profiles.schedule]]                 # no windows = always on
+days = ["sun", "mon", "tue", "wed", "thu"]
+from = "21:30"
+to = "07:00"
 ```
 
 **Custom records** (take priority over blocklist + upstream):
 
 ```toml
 [[custom_records]]
-domain = "router.lan"; type = "A"; value = "192.168.1.1"; ttl = 300
+domain = "router.lan"
+type = "A"
+value = "192.168.1.1"
+ttl = 300
 
 [[custom_records]]
-domain = "*.home.lan"; type = "A"; value = "192.168.1.100"
+domain = "*.home.lan"
+type = "A"
+value = "192.168.1.100"
 ```
 
 **Selective routing** — an egress + a rule. Paste a standard WireGuard `.conf`:
@@ -281,7 +341,9 @@ max_connections = 256
 # advertise_ipv4 / advertise_ipv6 auto-detect when unset
 
 [[proxy.egresses]]
-id = "nl-proton"; name = "NL Proton"; enabled = true
+id = "nl-proton"
+name = "NL Proton"
+enabled = true
 kind = "wireguard"        # direct | socks5 | wireguard | evasion
 buffer_kb = 512           # wireguard per-connection window (throughput vs RAM; 256–1024 KiB)
 config = """
@@ -303,9 +365,24 @@ fail_closed = true        # if the egress is down, refuse rather than leak the c
 clients = []              # empty = all devices; or restrict by IP/MAC
 ```
 
+A rule can name a catalog service instead of a pattern — `service = "netflix"` —
+for every domain the service uses.
+
 The HTTP listener is shared with the panel on `:80` (demuxed by `Host`); TLS is
 `:443`. Binding 80/443 needs privilege — ferrite already binds `:53`, so deploy
 with `CAP_NET_BIND_SERVICE`.
+
+**Notifications** — tunnel outages and new devices, shaped for the receiver:
+
+```toml
+[notifications]
+webhook = "https://ntfy.sh/my-ferrite"
+format  = "ntfy"          # json | ntfy | discord | slack | telegram (+ chat_id) | gotify
+tunnel_alerts = true
+new_device    = true
+```
+
+`config.toml.example` documents every key.
 
 ## Authentication
 
@@ -315,8 +392,12 @@ ferrite passwd                 # set a web UI password (Argon2id hash, stored in
 
 If neither a password nor an `api_key` is set, the API/panel is open — fine on
 loopback, **set a password before binding to the LAN** (ferrite warns you if you
-don't). For scripts, set `api_key` and send `Authorization: Bearer <key>` or
-`X-Api-Key: <key>`. Password login returns a 24 h session token:
+don't). A browser session lasts 7 days since it was last used and survives
+restarts and updates; Settings → Access lists the signed-in browsers and signs
+any of them out. Changing the password signs out every other session.
+
+For scripts, set `api_key` and send `Authorization: Bearer <key>` or
+`X-Api-Key: <key>`. A password login returns a session token too:
 
 ```bash
 TOKEN=$(curl -s -X POST http://localhost:8080/api/auth \
@@ -327,41 +408,23 @@ curl -s http://localhost:8080/api/stats/summary -H "Authorization: Bearer $TOKEN
 ## API
 
 Everything in the web UI is this REST API — anything you do by hand, a script can
-too. Base URL `http://127.0.0.1:8080`, all under `/api`, behind auth when configured.
+too. Base URL `http://127.0.0.1:8080`, all under `/api`, behind auth when
+configured. The full reference is [docs/API.md](docs/API.md); the main groups:
 
 ```
-GET/POST/DELETE  /api/auth                     session status · log in · log out
-
-GET    /api/stats/summary                      live counters
-GET    /api/stats/timeseries                   24 h, 144 × 10 min buckets
-GET    /api/stats/top-blocked|top-domains|top-clients
-GET    /api/stats/system                       host/process metrics
-GET    /api/queries        DELETE /api/queries query log (filterable) · clear
-GET    /api/logs                               recent in-memory server logs
-
-GET    /api/clients                            clients grouped by name (IPs + MACs)
-GET/POST/DELETE  /api/clients/aliases[/{ip}]   manual client aliases
-
-GET/POST  /api/blocklist/whitelist|blacklist   list · add (exact or *.wildcard)
-DELETE    /api/blocklist/whitelist|blacklist/{domain}
-GET    /api/blocklist/check/{domain}           why-blocked: which list/rule matched
-GET/PUT   /api/blocklist/profiles              per-device profiles (list subsets, default-deny)
-
-GET/POST  /api/lists      PATCH/DELETE /api/lists/{name}    blocklist subscriptions
-POST   /api/lists/refresh · /api/lists/{name}/refresh
-
-GET/POST  /api/allowlists PATCH/DELETE /api/allowlists/{name}   allowlist subscriptions
-POST   /api/allowlists/refresh · /api/allowlists/{name}/refresh
-
-GET/POST  /api/custom-records   DELETE /api/custom-records/{domain}
-
-GET    /api/proxy   PUT /api/proxy             selective-routing config (secrets redacted)
-
-GET    /api/tools/resolve?name=&type=          DNS lookup (any record type)
-GET    /api/tools/whois?query=                 WHOIS
-
-GET    /api/settings   PATCH /api/settings      config (secrets redacted; restart-fields flagged)
-GET    /api/update/check   POST /api/update/server|web
+/auth, /auth/sessions                 sign in and out, signed-in browsers
+/stats/*, /queries, /logs, /metrics    counters, charts, the query log, server logs, Prometheus
+/clients, /clients/{device}/stats      devices, names, one device in detail
+/blocklist/*, /lists, /allowlists      entries, subscriptions, profiles, services, SafeSearch, why-blocked
+/services                              the service catalog
+/blocking/pause, /blocking/resume      pause filtering, box-wide or per device
+/custom-records                        local DNS records
+/proxy, /proxy/stats                   tunnels: egresses, rules, live counters
+/notifications                         webhook target and events; a test send
+/settings, /config/export|import       runtime settings, backup and restore
+/tools/*                               DNS lookup, DNSSEC, WHOIS, certificate and reachability probes
+/update/*                              update checks and self-update
+/mcp                                   Model Context Protocol endpoint (off by default)
 ```
 
 ## More
@@ -374,16 +437,18 @@ GET    /api/update/check   POST /api/update/server|web
 ## Data files
 
 Configuration lives in `config.toml` and only there — settings, subscriptions,
-manual block/allow entries, custom records, client aliases, tunnels. Everything
-the UI changes is written straight back to it, so backing up that one file backs
-up the whole setup. The database holds only what ferrite observed (the query log
-and the device inventory): delete it and you lose history, never configuration.
+manual block/allow entries, profiles, custom records, client aliases, tunnels,
+notifications. Everything the UI changes is written straight back to it, so
+backing up that one file backs up the whole setup. The database holds what
+ferrite observed (the query log, the device inventory and when each device was
+first seen) and the panel's login sessions: delete it and you lose history and
+have to sign in again, never configuration.
 
 All under `~/.local/share/ferrite/`:
 
 | File                  | Contents                                                       |
 | --------------------- | -------------------------------------------------------------- |
-| `ferrite.db`          | SQLite — query log, rollups, learned device inventory          |
+| `ferrite.db`          | SQLite — query log, rollups, device inventory, login sessions  |
 |                       | (absent entirely with `storage.backend = "memory"`)            |
 | `blocklist.fst`       | Compiled blocklist (rebuilt on list changes)                   |
 | `allowlist.fst`       | Compiled subscribed allowlists                                 |
