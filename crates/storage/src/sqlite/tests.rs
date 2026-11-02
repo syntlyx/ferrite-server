@@ -405,14 +405,15 @@ async fn devices_and_ip_bindings_round_trip_and_last_binding_wins() {
     assert_eq!(devices.len(), 2);
     let laptop = devices
         .iter()
-        .find(|(m, _)| m == "aa:bb:cc:dd:ee:ff")
+        .find(|d| d.mac == "aa:bb:cc:dd:ee:ff")
         .unwrap();
-    assert_eq!(laptop.1.as_deref(), Some("alex-laptop"));
+    assert_eq!(laptop.hostname.as_deref(), Some("alex-laptop"));
+    assert!(laptop.first_seen > 0, "a first sighting is recorded");
     let nameless = devices
         .iter()
-        .find(|(m, _)| m == "11:22:33:44:55:66")
+        .find(|d| d.mac == "11:22:33:44:55:66")
         .unwrap();
-    assert_eq!(nameless.1, None);
+    assert_eq!(nameless.hostname, None);
 
     // IP .50 first belongs to the laptop, then is reassigned ("last binding wins").
     storage
@@ -461,7 +462,7 @@ async fn delete_all_ip_bindings_clears_bindings_but_keeps_devices() {
     assert!(storage.load_ip_bindings().await.unwrap().is_empty());
     let devices = storage.load_devices().await.unwrap();
     assert_eq!(devices.len(), 1);
-    assert_eq!(devices[0].1.as_deref(), Some("laptop"));
+    assert_eq!(devices[0].hostname.as_deref(), Some("laptop"));
 }
 
 #[tokio::test]
@@ -991,5 +992,42 @@ async fn migration_upgrades_a_legacy_v0_database() {
             .unwrap()
             .total,
         2
+    );
+}
+
+#[test]
+fn v10_backfills_bound_macs_as_known_devices_of_unknown_age() {
+    let mut c = rusqlite::Connection::open_in_memory().unwrap();
+    // A v9 database: devices without first_seen, one named device, and a
+    // binding for a MAC that was never named.
+    c.execute_batch(
+        "CREATE TABLE devices (mac TEXT PRIMARY KEY, hostname TEXT, last_seen INTEGER NOT NULL DEFAULT 0);
+         CREATE TABLE ip_bindings (ip TEXT PRIMARY KEY, mac TEXT NOT NULL, last_seen INTEGER NOT NULL DEFAULT 0);
+         INSERT INTO devices VALUES ('aa:bb:cc:dd:ee:ff', 'laptop', 100);
+         INSERT INTO ip_bindings VALUES ('192.168.1.5', '11:22:33:44:55:66', 200);
+         INSERT INTO ip_bindings VALUES ('192.168.1.6', 'aa:bb:cc:dd:ee:ff', 300);
+         PRAGMA user_version = 9;",
+    )
+    .unwrap();
+    super::migrations::run_migrations(&mut c).unwrap();
+
+    let mut rows: Vec<(String, Option<String>, i64)> = c
+        .prepare("SELECT mac, hostname, first_seen FROM devices ORDER BY mac")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("11:22:33:44:55:66".to_string(), None, 0),
+            (
+                "aa:bb:cc:dd:ee:ff".to_string(),
+                Some("laptop".to_string()),
+                0
+            ),
+        ]
     );
 }

@@ -38,6 +38,17 @@ pub struct QueryFilter {
     pub before_ts: Option<i64>,
 }
 
+/// A learned device as stored: its MAC, last-known hostname, and when the box
+/// first saw it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredDevice {
+    pub mac: String,
+    pub hostname: Option<String>,
+    /// Unix seconds the MAC was first recorded. 0 for devices learned before
+    /// ferrite kept this — "known for a while", not "new".
+    pub first_seen: i64,
+}
+
 /// Aggregated statistics per device (keyed by the device identity token: a MAC
 /// when known, else an IP fallback — see [`ferrite_core::types::QueryEntry::device`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,14 +149,16 @@ pub trait Storage: Send + Sync {
 
     // ── Learned device identities & IP bindings ───────────────────────────────
 
-    /// Upsert a learned device: MAC → last-known hostname. Bumps `last_seen`.
+    /// Upsert a learned device: MAC → last-known hostname. Bumps `last_seen`;
+    /// a MAC recorded for the first time gets `first_seen` = now. A `None`
+    /// hostname keeps the one already stored.
     async fn upsert_device(&self, mac: &str, hostname: Option<&str>) -> Result<()>;
 
     /// Upsert the last-known IP → MAC binding ("last binding wins"). Bumps `last_seen`.
     async fn upsert_ip_binding(&self, ip: &str, mac: &str) -> Result<()>;
 
-    /// Load all learned devices: returns (mac, hostname) pairs.
-    async fn load_devices(&self) -> Result<Vec<(String, Option<String>)>>;
+    /// Load all learned devices.
+    async fn load_devices(&self) -> Result<Vec<StoredDevice>>;
 
     /// Load all IP → MAC bindings: returns (ip, mac) pairs.
     async fn load_ip_bindings(&self) -> Result<Vec<(String, String)>>;

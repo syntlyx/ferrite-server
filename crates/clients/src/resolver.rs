@@ -140,6 +140,7 @@ impl ClientRegistry {
                     self.bind_ip(ip, m);
                     self.persist_binding(ip, m).await;
                 }
+                self.note_mac(ip, m).await;
                 Some(m)
             }
             None => self.ip_to_mac.get(&ip).map(|e| *e),

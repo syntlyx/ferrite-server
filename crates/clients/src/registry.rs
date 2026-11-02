@@ -9,7 +9,9 @@ use ferrite_upstream::ZoneRouter;
 
 use ferrite_core::net::{format_mac, parse_ip, parse_mac, unmap_v4};
 
-use super::{BINDING_RETENTION, BINDING_TOUCH_INTERVAL, ClientRegistry, DashMap, DashSet};
+use super::{
+    BINDING_RETENTION, BINDING_TOUCH_INTERVAL, ClientRegistry, DashMap, DashSet, NewDevice,
+};
 
 impl ClientRegistry {
     pub async fn new(
@@ -28,6 +30,9 @@ impl ClientRegistry {
             mac_to_ips: DashMap::new(),
             in_flight: DashSet::new(),
             last_binding_touch: std::sync::atomic::AtomicI64::new(0),
+            first_seen: DashMap::new(),
+            baseline: std::sync::atomic::AtomicBool::new(true),
+            new_devices: tokio::sync::broadcast::channel(64).0,
             upstream,
             storage,
             switches,
@@ -79,8 +84,12 @@ impl ClientRegistry {
         match registry.storage.load_devices().await {
             Ok(devices) => {
                 let now = Instant::now();
-                for (mac_s, hostname) in devices {
-                    if let (Some(mac), Some(name)) = (parse_mac(&mac_s), hostname) {
+                for device in devices {
+                    let Some(mac) = parse_mac(&device.mac) else {
+                        continue;
+                    };
+                    registry.first_seen.insert(mac, device.first_seen);
+                    if let Some(name) = device.hostname {
                         registry.mac_to_name.insert(mac, (name, now));
                     }
                 }
@@ -95,6 +104,8 @@ impl ClientRegistry {
                 for (ip_s, mac_s) in bindings {
                     if let (Some(ip), Some(mac)) = (parse_ip(&ip_s), parse_mac(&mac_s)) {
                         registry.bind_ip(unmap_v4(ip), mac);
+                        // Bound before devices kept a first sighting: known.
+                        registry.first_seen.entry(mac).or_insert(0);
                     }
                 }
             }
@@ -273,7 +284,59 @@ impl ClientRegistry {
         self.ip_to_mac.clear();
         self.mac_to_ips.clear();
         self.mac_to_name.clear();
+        // The household is about to be re-learned from scratch; that is not a
+        // houseful of new devices.
+        self.first_seen.clear();
+        self.baseline.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    // ── First sightings ────────────────────────────────────────────────────────
+
+    /// Hear about devices the box has never seen before. Each event comes once
+    /// per MAC, ever (as far as the inventory remembers), and never for what
+    /// was on the network when ferrite started.
+    pub fn subscribe_new_devices(&self) -> tokio::sync::broadcast::Receiver<NewDevice> {
+        self.new_devices.subscribe()
+    }
+
+    /// When `mac` (`aa:bb:…`) was first recorded: unix seconds, 0 when it
+    /// predates that record, `None` for a MAC the box doesn't know.
+    pub fn first_seen(&self, mac: &str) -> Option<i64> {
+        parse_mac(mac).and_then(|m| self.first_seen.get(&m).map(|e| *e))
+    }
+
+    /// Note that `mac` was seen at `ip`. A MAC not seen before is recorded
+    /// (first sighting = now) and — once the startup baseline is past —
+    /// announced to [`Self::subscribe_new_devices`].
+    pub(crate) async fn note_mac(&self, ip: IpAddr, mac: [u8; 6]) {
+        let now = chrono::Utc::now().timestamp();
+        // Insert-if-absent in one step, guard dropped before the await below.
+        let fresh = match self.first_seen.entry(mac) {
+            dashmap::Entry::Occupied(_) => false,
+            dashmap::Entry::Vacant(v) => {
+                v.insert(now);
+                true
+            }
+        };
+        if !fresh {
+            return;
+        }
+        let mac_s = format_mac(&mac);
+        if self.switches.scope().records_anything()
+            && let Err(e) = self.storage.upsert_device(&mac_s, None).await
+        {
+            tracing::debug!("failed to record device {}: {}", mac_s, e);
+        }
+        if self.baseline.load(Ordering::Relaxed) {
+            return;
+        }
+        tracing::info!("new device on the network: {} at {}", mac_s, ip);
+        let _ = self.new_devices.send(NewDevice {
+            mac: mac_s,
+            ip,
+            first_seen: now,
+        });
     }
 
     // ── IP ↔ MAC bindings ──────────────────────────────────────────────────────
@@ -398,7 +461,11 @@ impl ClientRegistry {
                 self.persist_binding(ip, mac).await;
                 learned += 1;
             }
+            self.note_mac(ip, mac).await;
         }
+        // Whatever this first scan found was already here: from now on, a MAC
+        // the box hasn't seen is news.
+        self.baseline.store(false, Ordering::Relaxed);
         if learned > 0 {
             tracing::debug!("neighbor mirror: {} new/changed bindings", learned);
         }
@@ -601,6 +668,43 @@ mod tests {
             assert!(storage.load_ip_bindings().await.unwrap().is_empty());
             assert!(storage.load_devices().await.unwrap().is_empty());
         }
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// The first scan is the baseline; after it a never-seen MAC is announced
+    /// once, recorded with its first sighting, and remembered across a restart.
+    #[tokio::test]
+    async fn a_new_mac_is_announced_once_after_the_startup_baseline() {
+        let db = temp_db("clients-new-device");
+        let reg = registry(&db).await;
+        let mut events = reg.subscribe_new_devices();
+        let tv = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let phone = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+        let ip: IpAddr = "192.168.1.20".parse().unwrap();
+
+        // Baseline: already here at startup, not news.
+        reg.note_mac(ip, tv).await;
+        reg.baseline.store(false, Ordering::Relaxed);
+        assert!(events.try_recv().is_err());
+        assert!(reg.first_seen("02:00:00:00:00:01").unwrap() > 0);
+
+        // A newcomer is announced exactly once.
+        reg.note_mac(ip, phone).await;
+        reg.note_mac(ip, phone).await;
+        let event = events.try_recv().unwrap();
+        assert_eq!(event.mac, "02:00:00:00:00:02");
+        assert_eq!(event.ip, ip);
+        assert!(events.try_recv().is_err());
+
+        // After a restart both are known; nothing is announced again.
+        drop(reg);
+        let reg = registry(&db).await;
+        let mut events = reg.subscribe_new_devices();
+        reg.baseline.store(false, Ordering::Relaxed);
+        reg.note_mac(ip, phone).await;
+        assert!(events.try_recv().is_err());
+        assert!(reg.first_seen("02:00:00:00:00:02").unwrap() > 0);
 
         let _ = std::fs::remove_file(&db);
     }

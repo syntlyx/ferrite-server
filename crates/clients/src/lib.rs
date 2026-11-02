@@ -15,6 +15,17 @@ use ferrite_core::recording::RecordSwitches;
 use ferrite_storage::Storage;
 use ferrite_upstream::ZoneRouter;
 
+/// A device the box had never seen joined the network.
+#[derive(Debug, Clone)]
+pub struct NewDevice {
+    /// `aa:bb:cc:dd:ee:ff`.
+    pub mac: String,
+    /// The address it was first seen at.
+    pub ip: IpAddr,
+    /// Unix seconds.
+    pub first_seen: i64,
+}
+
 // ── Constants (visible to registry.rs and resolver.rs) ───────────────────────
 
 /// How long a successful PTR/mDNS result is considered fresh.
@@ -89,6 +100,16 @@ pub struct ClientRegistry {
     last_binding_touch: AtomicI64,
     upstream: Arc<ZoneRouter>,
     storage: Arc<dyn Storage>,
+    /// Every MAC the box knows, with the unix second it was first recorded
+    /// (0 = known from before ferrite kept that). A MAC missing here is a new
+    /// device — see [`ClientRegistry::subscribe_new_devices`].
+    first_seen: DashMap<[u8; 6], i64>,
+    /// Set until the first neighbour scan after startup has run: whatever is
+    /// on the network then is the baseline, not news — so a restart, an
+    /// upgrade or "record nothing" never announces the whole household.
+    baseline: std::sync::atomic::AtomicBool,
+    /// Where "a device never seen before joined" goes. Nobody listening is fine.
+    new_devices: tokio::sync::broadcast::Sender<NewDevice>,
     /// The same switches the query log and statistics answer to. A device
     /// inventory — which MACs are on this network, and what they are called —
     /// is not query history, but it is still a record of the household, and

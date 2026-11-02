@@ -37,6 +37,10 @@ struct ClientGroup {
     is_alias: bool,
     /// `true` when this client is explicitly exempt from blocklist filtering.
     blocking_bypassed: bool,
+    /// Unix seconds the box first saw any of this client's MACs; absent when
+    /// none is known or they predate ferrite keeping it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_seen: Option<i64>,
 }
 
 /// GET /api/clients
@@ -100,6 +104,7 @@ pub async fn list_clients(
             last_seen: 0,
             is_alias: info.is_alias,
             blocking_bypassed,
+            first_seen: None,
         });
         for ip in &info.ips {
             if !group.ips.iter().any(|x| x == ip) {
@@ -109,6 +114,13 @@ pub async fn list_clients(
         for mac in &info.macs {
             if !group.macs.iter().any(|m| m == mac) {
                 group.macs.push(mac.clone());
+            }
+            // The earliest real sighting across the group's MACs; 0 means
+            // "known since before first sightings were kept" and says nothing.
+            if let Some(seen) = state.inner.client_registry.first_seen(mac)
+                && seen > 0
+            {
+                group.first_seen = Some(group.first_seen.map_or(seen, |s| s.min(seen)));
             }
         }
         group.total += stat.total;

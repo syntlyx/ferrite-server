@@ -8,7 +8,8 @@ use tokio_rusqlite::Connection;
 
 use crate::schema::SCHEMA;
 use crate::{
-    ClientStats, LegacyConfigRows, QueryFilter, SizeTrim, Storage, SummaryStats, align_bucket,
+    ClientStats, LegacyConfigRows, QueryFilter, SizeTrim, Storage, StoredDevice, SummaryStats,
+    align_bucket,
 };
 use ferrite_core::error::{FeriteError, Result};
 use ferrite_core::recording::RecordScope;
@@ -594,9 +595,10 @@ impl Storage for SqliteStorage {
             .call(move |c| {
                 // COALESCE keeps a previously learned hostname if this call has none,
                 // so a transient nameless resolve never blanks a known device.
+                // `first_seen` is written on insert only; an update leaves it.
                 c.execute(
-                    "INSERT INTO devices (mac, hostname, last_seen)
-                     VALUES (?1, ?2, ?3)
+                    "INSERT INTO devices (mac, hostname, last_seen, first_seen)
+                     VALUES (?1, ?2, ?3, ?3)
                      ON CONFLICT(mac) DO UPDATE SET
                          hostname  = COALESCE(excluded.hostname, devices.hostname),
                          last_seen = excluded.last_seen",
@@ -702,13 +704,17 @@ impl Storage for SqliteStorage {
             .map_err(FeriteError::TokioDatabase)
     }
 
-    async fn load_devices(&self) -> Result<Vec<(String, Option<String>)>> {
+    async fn load_devices(&self) -> Result<Vec<StoredDevice>> {
         self.conn
             .call(|c| {
-                let mut stmt = c.prepare("SELECT mac, hostname FROM devices")?;
+                let mut stmt = c.prepare("SELECT mac, hostname, first_seen FROM devices")?;
                 let rows = stmt
                     .query_map([], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                        Ok(StoredDevice {
+                            mac: row.get(0)?,
+                            hostname: row.get(1)?,
+                            first_seen: row.get(2)?,
+                        })
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 Ok(rows)

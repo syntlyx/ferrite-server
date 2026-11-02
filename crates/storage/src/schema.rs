@@ -95,7 +95,8 @@ CREATE TABLE IF NOT EXISTS domain_buckets_10m (
 CREATE TABLE IF NOT EXISTS devices (
     mac         TEXT    PRIMARY KEY,            -- 'aa:bb:cc:dd:ee:ff'
     hostname    TEXT,                           -- last learned PTR/mDNS name (nullable)
-    last_seen   INTEGER NOT NULL DEFAULT 0
+    last_seen   INTEGER NOT NULL DEFAULT 0,
+    first_seen  INTEGER NOT NULL DEFAULT 0      -- unix secs first recorded; 0 = before v10
 );
 
 -- ---------------------------------------------------------------

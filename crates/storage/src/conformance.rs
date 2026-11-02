@@ -380,13 +380,18 @@ async fn the_device_inventory_behaves_the_same() {
             .await
             .unwrap();
 
-        assert_eq!(
-            storage.load_devices().await.unwrap(),
-            vec![(
-                "aa:bb:cc:dd:ee:ff".to_string(),
-                Some("laptop.lan".to_string())
-            )]
-        );
+        // A nameless re-learn keeps the name, and the first sighting stays put.
+        let first = storage.load_devices().await.unwrap()[0].first_seen;
+        storage
+            .upsert_device("aa:bb:cc:dd:ee:ff", None)
+            .await
+            .unwrap();
+        let devices = storage.load_devices().await.unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].mac, "aa:bb:cc:dd:ee:ff");
+        assert_eq!(devices[0].hostname.as_deref(), Some("laptop.lan"));
+        assert!(first > 0);
+        assert_eq!(devices[0].first_seen, first);
         assert_eq!(
             storage.load_ip_bindings().await.unwrap(),
             vec![("192.168.1.10".to_string(), "aa:bb:cc:dd:ee:ff".to_string())]

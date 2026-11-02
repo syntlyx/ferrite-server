@@ -4,7 +4,7 @@ use super::table_exists;
 use crate::ROLLUP_BUCKET_SECS;
 
 /// Latest schema version. Bump when adding a migration step below.
-pub(super) const SCHEMA_VERSION: i64 = 9;
+pub(super) const SCHEMA_VERSION: i64 = 10;
 
 /// Apply versioned migrations on top of the baseline `SCHEMA`.
 ///
@@ -29,6 +29,7 @@ pub(super) fn run_migrations(c: &mut rusqlite::Connection) -> rusqlite::Result<(
             7 => migrate_v7_drop_unused_domain_index(&tx)?,
             8 => migrate_v8_drop_unused_domain_bucket_index(&tx)?,
             9 => migrate_v9_drop_unread_client_rollups(&tx)?,
+            10 => migrate_v10_device_first_seen(&tx)?,
             _ => unreachable!("no migration step for v{next}"),
         }
         // PRAGMA can't be parameter-bound; the value is our own constant.
@@ -195,6 +196,26 @@ fn migrate_v9_drop_unread_client_rollups(tx: &rusqlite::Transaction) -> rusqlite
 /// v4: per-device rollup table — the same shape as the IP-keyed rollups it
 /// replaces, but keyed by device so a phone keeps one row across a DHCP change.
 /// The IP-keyed table is dropped in v9.
+/// v10: devices remember when they were first seen, and every MAC the box has
+/// a binding for becomes a device row. "A new device joined" is then a MAC
+/// with no row — so the backfill is what keeps an upgrade from announcing
+/// every device already on the network. Rows that predate this keep
+/// `first_seen = 0`: known, but not since when.
+fn migrate_v10_device_first_seen(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
+    let has_col: bool = tx.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('devices') WHERE name='first_seen'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? > 0;
+    if !has_col {
+        tx.execute_batch("ALTER TABLE devices ADD COLUMN first_seen INTEGER NOT NULL DEFAULT 0")?;
+    }
+    tx.execute_batch(
+        "INSERT OR IGNORE INTO devices (mac, hostname, last_seen, first_seen)
+         SELECT mac, NULL, MAX(last_seen), 0 FROM ip_bindings GROUP BY mac",
+    )
+}
+
 fn migrate_v4_device_buckets(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS device_buckets_10m (

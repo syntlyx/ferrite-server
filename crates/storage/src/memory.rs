@@ -32,7 +32,8 @@ use ferrite_core::recording::RecordScope;
 use ferrite_core::types::{QueryEntry, QueryStatus, TimeseriesBucket};
 
 use crate::{
-    ClientStats, LegacyConfigRows, QueryFilter, SizeTrim, Storage, SummaryStats, align_bucket,
+    ClientStats, LegacyConfigRows, QueryFilter, SizeTrim, Storage, StoredDevice, SummaryStats,
+    align_bucket,
 };
 
 /// Rough live size of one retained entry: the struct, plus its heap strings
@@ -86,8 +87,8 @@ struct Inner {
     query_buckets: BTreeMap<i64, QueryBucket>,
     domain_buckets: BTreeMap<(i64, String), DomainBucket>,
     device_buckets: BTreeMap<(i64, String), DeviceBucket>,
-    /// Learned device inventory: MAC → last known hostname.
-    devices: BTreeMap<String, Option<String>>,
+    /// Learned device inventory: MAC → (last known hostname, first seen).
+    devices: BTreeMap<String, (Option<String>, i64)>,
     /// Last-known IP → MAC binding.
     ip_bindings: BTreeMap<String, Binding>,
     /// Highest id ever stored, kept across trims so ids stay monotonic.
@@ -460,10 +461,13 @@ impl Storage for MemoryStorage {
     }
 
     async fn upsert_device(&self, mac: &str, hostname: Option<&str>) -> Result<()> {
-        self.inner
-            .write()
-            .devices
-            .insert(mac.to_string(), hostname.map(str::to_string));
+        let now = chrono::Utc::now().timestamp();
+        let mut inner = self.inner.write();
+        let entry = inner.devices.entry(mac.to_string()).or_insert((None, now));
+        // Like SQLite's COALESCE: a nameless re-learn keeps a known name.
+        if let Some(name) = hostname {
+            entry.0 = Some(name.to_string());
+        }
         Ok(())
     }
 
@@ -478,13 +482,17 @@ impl Storage for MemoryStorage {
         Ok(())
     }
 
-    async fn load_devices(&self) -> Result<Vec<(String, Option<String>)>> {
+    async fn load_devices(&self) -> Result<Vec<StoredDevice>> {
         Ok(self
             .inner
             .read()
             .devices
             .iter()
-            .map(|(mac, host)| (mac.clone(), host.clone()))
+            .map(|(mac, (hostname, first_seen))| StoredDevice {
+                mac: mac.clone(),
+                hostname: hostname.clone(),
+                first_seen: *first_seen,
+            })
             .collect())
     }
 
