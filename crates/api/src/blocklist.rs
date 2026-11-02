@@ -124,6 +124,49 @@ fn add_config_domain(state: &AppState, polarity: Polarity, domain: &str) {
     }
 }
 
+/// Add manual entries in bulk (an import): each one the engine accepts goes
+/// into the config too. Entries already there are counted as skipped; nothing
+/// is persisted or evicted here — the caller does both once.
+pub(crate) fn import_entries(state: &AppState, allow: bool, entries: &[String]) -> Value {
+    let engine = &state.inner.blocklist;
+    let have: std::collections::HashSet<String> = if allow {
+        engine.list_whitelist()
+    } else {
+        engine.list_blacklist()
+    }
+    .into_iter()
+    .collect();
+    let polarity = if allow {
+        Polarity::Allow
+    } else {
+        Polarity::Block
+    };
+    let (mut added, mut already, mut skipped) = (0, 0, Vec::new());
+    for raw in entries {
+        let entry = ferrite_blocklist::normalise_domain(raw);
+        if entry.is_empty() {
+            continue;
+        }
+        if have.contains(&entry) {
+            already += 1;
+            continue;
+        }
+        let result = if allow {
+            engine.add_whitelist(&entry)
+        } else {
+            engine.add_blacklist(&entry)
+        };
+        match result {
+            Ok(()) => {
+                add_config_domain(state, polarity, &entry);
+                added += 1;
+            }
+            Err(e) => skipped.push(format!("{entry}: {e}")),
+        }
+    }
+    json!({ "added": added, "already": already, "skipped": skipped })
+}
+
 /// Mirror an engine removal into `live_config`. Compares against the normalised
 /// form of each entry, so an entry hand-written as `Ads.Example.COM.` is still
 /// the one the UI deleted — before, a file-sourced entry survived the delete

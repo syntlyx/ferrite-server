@@ -113,6 +113,7 @@ dirs = "6"        # locate config & data directories
 
 # ── Self-update (download & unpack release archives) ──────────────────────────
 flate2 = "1"      # gzip decompression
+yaml-rust2 = { version = "0.13", default-features = false }  # reads AdGuardHome.yaml for import
 tar = "0.4"       # tar extraction (server binary + web bundle)
 
 # ── WireGuard egress (userspace, in-process; no TUN / no root) ────────────────

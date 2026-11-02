@@ -52,6 +52,11 @@ upstream's queries can themselves ride a tunnel. EDNS Client Subnet is stripped,
 DNSSEC is requested, local zones can be forwarded to your router, and custom
 `A` / `AAAA` / `CNAME` records (exact or wildcard) answer first.
 
+**Coming from Pi-hole or AdGuard Home?** Settings → System reads a Pi-hole v6
+Teleporter export or an `AdGuardHome.yaml` and shows what comes over — lists,
+rules, local records, groups and per-device settings, blocked services — and
+what can't, before anything changes.
+
 **Automation.** Everything the panel does is a REST API. Prometheus metrics at
 `/api/metrics`, config export and import, self-update from the panel, and an
 MCP endpoint so an AI assistant can ask why a site is blocked — or, if you

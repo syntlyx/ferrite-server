@@ -4,6 +4,7 @@ pub mod blocklist;
 pub mod clients;
 pub mod custom_records;
 pub mod error;
+pub mod import;
 mod ingress;
 pub mod lists;
 pub mod logs;
@@ -28,7 +29,9 @@ mod web;
 pub use error::ApiError;
 
 use axum::{
-    Router, middleware as axum_middleware,
+    Router,
+    extract::DefaultBodyLimit,
+    middleware as axum_middleware,
     routing::{delete, get, patch, post, put},
 };
 use tower_http::trace::TraceLayer;
@@ -119,6 +122,12 @@ pub fn build_router(state: AppState) -> Router {
         // Whole-config backup and restore
         .route("/config/export", get(backup::export_config))
         .route("/config/import", post(backup::import_config))
+        // Bring a Pi-hole or AdGuard Home setup over (a Teleporter archive
+        // can run to a few MiB, past the default body limit)
+        .route(
+            "/import",
+            post(import::post_import).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
         // Settings
         .route("/settings", get(settings::get_settings))
         .route("/settings", patch(settings::update_settings))

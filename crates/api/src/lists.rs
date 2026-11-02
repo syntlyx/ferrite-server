@@ -111,6 +111,13 @@ fn refresh_in_background(state: &AppState, what: String) {
     });
 }
 
+/// After subscriptions were added in bulk: write them to the config once and
+/// fetch what is new, off the request.
+pub(crate) async fn sync_and_refresh(state: &AppState, what: &str) {
+    sync_lists_to_config(state).await;
+    refresh_in_background(state, what.to_string());
+}
+
 /// Sync the current in-memory subscription sets (block and allow) into
 /// `live_config` and save to disk.
 async fn sync_lists_to_config(state: &AppState) {

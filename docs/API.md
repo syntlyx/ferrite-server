@@ -954,6 +954,40 @@ so every section applies.
 { "saved_to": "/etc/ferrite/config.toml", "backup": "/etc/ferrite/config.toml.bak", "restart": true }
 ```
 
+
+### `POST /api/import` — move over from Pi-hole or AdGuard Home
+
+The body is the file itself (any content type, up to 32 MiB): a **Pi-hole v6
+Teleporter archive** (`.zip` — `gravity.db` and `pihole.toml` are read) or an
+**`AdGuardHome.yaml`**. Without a query it only reads: the answer is
+`{ "plan": … }` — everything the file says, in ferrite's terms, and `notes`,
+one line per thing that can't come over and why.
+
+`?apply=lists,rules,records,devices,services,dns,upstreams` imports those
+parts of the same file:
+
+| Part        | What                                                                                  |
+| ----------- | ------------------------------------------------------------------------------------- |
+| `lists`     | Block and allow subscriptions not already there (by URL or name)                       |
+| `rules`     | Manual entries — names, wildcards, `/regex/` (Pi-hole regexes, AdGuard `\|\|x^` rules) |
+| `records`   | Local DNS records and rewrites                                                         |
+| `devices`   | Device names, profiles (Pi-hole groups, AdGuard per-client settings), filtering bypass |
+| `services`  | Blocked services (mapped to the catalog) and SafeSearch, joined to what is set          |
+| `dns`       | Block answer, rate limit, allowed/denied clients, optimistic cache                     |
+| `upstreams` | Upstreams and zone forwarding — **replaces** them, and the service restarts            |
+
+Everything but `upstreams` is added beside what ferrite has; nothing already
+there is removed or changed. Each part goes through the same checks as the
+panel. The answer reports what each part added and skipped, and
+`restart_required`.
+
+Mapping notes: a Pi-hole group with clients becomes a profile (its lists, plus
+the network's when its clients are in Default too); a list only some groups use
+comes in switched off, since ferrite's lists are network-wide and narrowed per
+profile. AdGuard rules with modifiers (`$client`, `$dnstype`, `$dnsrewrite`…),
+ClientIDs, DNSCrypt upstreams, per-client upstreams and the blocked-services
+pause schedule have no counterpart and are listed in `notes`.
+
 ---
 
 ## Subscription Lists
