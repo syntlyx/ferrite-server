@@ -1,0 +1,548 @@
+# Built-in service catalog: named sets of domains that a profile, or the whole
+# network, can block (`services = ["tiktok"]`) and a tunnel rule can route
+# (`service = "youtube"`). Compiled into the binary, so it ships and updates
+# with releases.
+#
+# Every domain matches itself and all of its subdomains, like a manual
+# blocklist entry. List only domains the service owns: shared infrastructure
+# (generic CDNs, googleapis.com, akamaihd.net) would catch unrelated sites.
+# A specific host on shared infrastructure is fine (`yt3.ggpht.com`).
+#
+# `routable = false` keeps a service out of tunnel rules. Tunnels answer DNS
+# with ferrite's own address and forward only HTTP and TLS on ports 80/443, so
+# a service that also talks its own protocol to a resolved name (messengers,
+# game launchers and consoles, Spotify's access points) would break if routed.
+# Blocking works the same for every service.
+#
+# Categories: video, music, social, messaging, gaming, ai, shopping.
+# `ferrite_core::services` tests check ids, categories and domain syntax, and
+# that no domain is listed twice.
+
+# ── Video ────────────────────────────────────────────────────────────────────
+
+[[service]]
+id = "youtube"
+name = "YouTube"
+category = "video"
+domains = [
+  "youtube.com",
+  "youtu.be",
+  "yt.be",
+  "ytimg.com",
+  "googlevideo.com",
+  "youtube-nocookie.com",
+  "youtubekids.com",
+  "youtubei.googleapis.com",
+  "youtube.googleapis.com",
+  "yt3.ggpht.com",
+  "yt3.googleusercontent.com",
+]
+
+[[service]]
+id = "netflix"
+name = "Netflix"
+category = "video"
+domains = [
+  "netflix.com",
+  "netflix.net",
+  "nflxvideo.net",
+  "nflximg.net",
+  "nflximg.com",
+  "nflxext.com",
+  "nflxso.net",
+]
+
+[[service]]
+id = "twitch"
+name = "Twitch"
+category = "video"
+domains = [
+  "twitch.tv",
+  "ttvnw.net",
+  "jtvnw.net",
+  "twitchcdn.net",
+  "twitchsvc.net",
+  "ext-twitch.tv",
+]
+
+[[service]]
+id = "disneyplus"
+name = "Disney+"
+category = "video"
+domains = [
+  "disneyplus.com",
+  "disney-plus.net",
+  "dssott.com",
+  "bamgrid.com",
+  "disneystreaming.com",
+]
+
+[[service]]
+id = "primevideo"
+name = "Prime Video"
+category = "video"
+domains = [
+  "primevideo.com",
+  "amazonvideo.com",
+  "aiv-cdn.net",
+  "aiv-delivery.net",
+  "pv-cdn.net",
+]
+
+[[service]]
+id = "hbomax"
+name = "HBO Max"
+category = "video"
+domains = [
+  "hbomax.com",
+  "max.com",
+  "hbo.com",
+]
+
+# ── Music ────────────────────────────────────────────────────────────────────
+
+[[service]]
+id = "spotify"
+name = "Spotify"
+category = "music"
+routable = false
+domains = [
+  "spotify.com",
+  "scdn.co",
+  "spotifycdn.com",
+  "spotifycdn.net",
+  "spoti.fi",
+  "pscdn.co",
+  "audio-ak-spotify-com.akamaized.net",
+]
+
+[[service]]
+id = "soundcloud"
+name = "SoundCloud"
+category = "music"
+domains = [
+  "soundcloud.com",
+  "sndcdn.com",
+]
+
+[[service]]
+id = "deezer"
+name = "Deezer"
+category = "music"
+domains = [
+  "deezer.com",
+  "dzcdn.net",
+]
+
+# ── Social ───────────────────────────────────────────────────────────────────
+
+[[service]]
+id = "tiktok"
+name = "TikTok"
+category = "social"
+domains = [
+  "tiktok.com",
+  "tiktokv.com",
+  "tiktokv.us",
+  "tiktokv.eu",
+  "tiktokw.us",
+  "tiktokcdn.com",
+  "tiktokcdn-us.com",
+  "tiktokcdn-eu.com",
+  "tik-tokapi.com",
+  "ttwstatic.com",
+  "musical.ly",
+  "muscdn.com",
+  "byteoversea.com",
+  "byteintlapi.com",
+  "ibytedtos.com",
+  "ibyteimg.com",
+  "ipstatp.com",
+  "isnssdk.com",
+]
+
+[[service]]
+id = "instagram"
+name = "Instagram"
+category = "social"
+domains = [
+  "instagram.com",
+  "cdninstagram.com",
+  "instagr.am",
+  "ig.me",
+]
+
+[[service]]
+id = "facebook"
+name = "Facebook"
+category = "social"
+domains = [
+  "facebook.com",
+  "facebook.net",
+  "fbcdn.net",
+  "fbsbx.com",
+  "fb.com",
+  "fb.me",
+  "fb.gg",
+  "messenger.com",
+  "m.me",
+]
+
+[[service]]
+id = "x"
+name = "X (Twitter)"
+category = "social"
+domains = [
+  "x.com",
+  "twitter.com",
+  "twimg.com",
+  "twttr.com",
+  "t.co",
+]
+
+[[service]]
+id = "snapchat"
+name = "Snapchat"
+category = "social"
+domains = [
+  "snapchat.com",
+  "sc-cdn.net",
+  "sc-static.net",
+  "snap-dev.net",
+  "feelinsonice-hrd.appspot.com",
+]
+
+[[service]]
+id = "reddit"
+name = "Reddit"
+category = "social"
+domains = [
+  "reddit.com",
+  "redd.it",
+  "redditmedia.com",
+  "redditstatic.com",
+]
+
+[[service]]
+id = "pinterest"
+name = "Pinterest"
+category = "social"
+domains = [
+  "pinterest.com",
+  "pinimg.com",
+  "pin.it",
+]
+
+[[service]]
+id = "linkedin"
+name = "LinkedIn"
+category = "social"
+domains = [
+  "linkedin.com",
+  "licdn.com",
+  "lnkd.in",
+]
+
+[[service]]
+id = "threads"
+name = "Threads"
+category = "social"
+domains = [
+  "threads.net",
+  "threads.com",
+]
+
+[[service]]
+id = "bluesky"
+name = "Bluesky"
+category = "social"
+domains = [
+  "bsky.app",
+  "bsky.social",
+  "bsky.network",
+]
+
+[[service]]
+id = "vk"
+name = "VK"
+category = "social"
+domains = [
+  "vk.com",
+  "vk.ru",
+  "vk.me",
+  "vkontakte.ru",
+  "userapi.com",
+  "vk-cdn.net",
+  "vkuser.net",
+  "vkuseraudio.net",
+  "vkuservideo.net",
+]
+
+# ── Messaging ────────────────────────────────────────────────────────────────
+
+[[service]]
+id = "whatsapp"
+name = "WhatsApp"
+category = "messaging"
+routable = false
+domains = [
+  "whatsapp.com",
+  "whatsapp.net",
+  "wa.me",
+]
+
+[[service]]
+id = "telegram"
+name = "Telegram"
+category = "messaging"
+routable = false
+domains = [
+  "telegram.org",
+  "telegram.me",
+  "t.me",
+  "telesco.pe",
+  "telegra.ph",
+  "tdesktop.com",
+]
+
+# Voice runs over UDP to `discord.media`, which is left out so a tunnel rule
+# can carry the HTTPS and gateway traffic without breaking calls.
+[[service]]
+id = "discord"
+name = "Discord"
+category = "messaging"
+domains = [
+  "discord.com",
+  "discord.gg",
+  "discord.co",
+  "discord.gift",
+  "discordapp.com",
+  "discordapp.net",
+  "discordstatus.com",
+  "dis.gd",
+]
+
+[[service]]
+id = "signal"
+name = "Signal"
+category = "messaging"
+routable = false
+domains = [
+  "signal.org",
+  "signal.me",
+  "signal.group",
+  "signal.art",
+  "whispersystems.org",
+]
+
+[[service]]
+id = "viber"
+name = "Viber"
+category = "messaging"
+routable = false
+domains = [
+  "viber.com",
+]
+
+# ── Gaming ───────────────────────────────────────────────────────────────────
+# Launchers and consoles keep chat and matchmaking on their own ports, so none
+# of these can be routed through a tunnel.
+
+[[service]]
+id = "roblox"
+name = "Roblox"
+category = "gaming"
+routable = false
+domains = [
+  "roblox.com",
+  "rbxcdn.com",
+  "rbx.com",
+  "robloxlabs.com",
+]
+
+[[service]]
+id = "fortnite"
+name = "Fortnite / Epic Games"
+category = "gaming"
+routable = false
+domains = [
+  "fortnite.com",
+  "epicgames.com",
+  "epicgames.dev",
+]
+
+[[service]]
+id = "minecraft"
+name = "Minecraft"
+category = "gaming"
+routable = false
+domains = [
+  "minecraft.net",
+  "mojang.com",
+  "minecraftservices.com",
+]
+
+[[service]]
+id = "steam"
+name = "Steam"
+category = "gaming"
+routable = false
+domains = [
+  "steampowered.com",
+  "steamcommunity.com",
+  "steamstatic.com",
+  "steamcontent.com",
+  "steamusercontent.com",
+  "steamserver.net",
+  "steamgames.com",
+  "steam-chat.com",
+  "steamcdn-a.akamaihd.net",
+]
+
+[[service]]
+id = "playstation"
+name = "PlayStation Network"
+category = "gaming"
+routable = false
+domains = [
+  "playstation.com",
+  "playstation.net",
+  "sonyentertainmentnetwork.com",
+]
+
+[[service]]
+id = "xbox"
+name = "Xbox Network"
+category = "gaming"
+routable = false
+domains = [
+  "xbox.com",
+  "xboxlive.com",
+  "xboxservices.com",
+]
+
+[[service]]
+id = "nintendo"
+name = "Nintendo"
+category = "gaming"
+routable = false
+domains = [
+  "nintendo.com",
+  "nintendo.net",
+]
+
+[[service]]
+id = "battlenet"
+name = "Battle.net"
+category = "gaming"
+routable = false
+domains = [
+  "battle.net",
+  "blizzard.com",
+]
+
+[[service]]
+id = "riot"
+name = "Riot Games"
+category = "gaming"
+routable = false
+domains = [
+  "riotgames.com",
+  "leagueoflegends.com",
+  "playvalorant.com",
+  "riotcdn.net",
+  "pvp.net",
+]
+
+# ── AI ───────────────────────────────────────────────────────────────────────
+
+[[service]]
+id = "chatgpt"
+name = "ChatGPT"
+category = "ai"
+domains = [
+  "chatgpt.com",
+  "openai.com",
+  "oaistatic.com",
+  "oaiusercontent.com",
+]
+
+[[service]]
+id = "claude"
+name = "Claude"
+category = "ai"
+domains = [
+  "claude.ai",
+  "claude.com",
+  "anthropic.com",
+  "claudeusercontent.com",
+]
+
+[[service]]
+id = "gemini"
+name = "Gemini"
+category = "ai"
+domains = [
+  "gemini.google.com",
+  "gemini.google",
+  "bard.google.com",
+  "aistudio.google.com",
+  "generativelanguage.googleapis.com",
+]
+
+[[service]]
+id = "copilot"
+name = "Microsoft Copilot"
+category = "ai"
+domains = [
+  "copilot.microsoft.com",
+  "sydney.bing.com",
+]
+
+[[service]]
+id = "deepseek"
+name = "DeepSeek"
+category = "ai"
+domains = [
+  "deepseek.com",
+]
+
+[[service]]
+id = "perplexity"
+name = "Perplexity"
+category = "ai"
+domains = [
+  "perplexity.ai",
+  "pplx.ai",
+]
+
+# ── Shopping ─────────────────────────────────────────────────────────────────
+
+[[service]]
+id = "aliexpress"
+name = "AliExpress"
+category = "shopping"
+domains = [
+  "aliexpress.com",
+  "aliexpress.ru",
+  "aliexpress.us",
+  "aliexpress-media.com",
+]
+
+[[service]]
+id = "temu"
+name = "Temu"
+category = "shopping"
+domains = [
+  "temu.com",
+  "kwcdn.com",
+]
+
+[[service]]
+id = "shein"
+name = "SHEIN"
+category = "shopping"
+domains = [
+  "shein.com",
+  "ltwebstatic.com",
+]
