@@ -735,6 +735,49 @@ domain rule's are keyed by its pattern.
 
 ---
 
+## MCP (AI assistants)
+
+`/api/mcp` is a [Model Context Protocol](https://modelcontextprotocol.io)
+server over Streamable HTTP, so an assistant such as Claude Code can ask
+ferrite what it is doing — and, if allowed, change it. Off by default.
+
+```
+claude mcp add --transport http ferrite http://<box>/api/mcp \
+  --header "Authorization: Bearer <api_key>"
+```
+
+It sits behind the API's authentication, so assistants connect with the API
+key. Every request gets one JSON answer (no SSE stream; `GET` → `405`), and a
+browser `Origin` other than the box's own host is refused with `403` (DNS
+rebinding). Protocol versions 2025-11-25, 2025-06-18 and 2025-03-26.
+
+| Tool | Does |
+|---|---|
+| `get_status` | Filtering on/paused, counts, profiles on now, services, SafeSearch, tunnel health |
+| `search_queries` | The query log, by domain substring, client IP/MAC, status, last N minutes |
+| `check_domain` | Why a domain is blocked or allowed; with `client`, that device's decision |
+| `top_domains` | Most queried or most blocked over the last hours |
+| `list_clients` | Devices, their counts, first/last seen and the profile on now |
+| `list_profiles` · `list_services` · `tunnel_status` · `recent_logs` | As named |
+| `block_domain` · `allow_domain` · `remove_domain_rule` | The network-wide lists ¹ |
+| `pause_filtering` · `resume_filtering` | Whole network or given devices ¹ |
+| `set_service_blocked` | A catalog service, network-wide or for a profile ¹ |
+| `refresh_lists` | Fetch every list again ¹ |
+
+¹ Only listed, and only run, while `allow_changes` is on. Changes go through
+the same handlers as the panel, so they are validated, persisted and logged the
+same way.
+
+### `GET /api/settings/mcp` · `PUT /api/settings/mcp`
+
+```json
+{ "enabled": true, "allow_changes": false }
+```
+
+While `enabled` is off, `/api/mcp` answers `404`.
+
+---
+
 ## Notifications
 
 One webhook, POSTed a JSON event for each kind that is switched on. Plain JSON,
