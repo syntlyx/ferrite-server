@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use axum::{Json, extract::State};
+use axum::{Json, extract::State, http::HeaderMap};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -146,6 +146,7 @@ pub struct SettingsPatch {
 /// so a process supervisor (systemd, launchd, etc.) can restart it cleanly.
 pub async fn update_settings(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(patch): Json<SettingsPatch>,
 ) -> Result<Json<Value>, ApiError> {
     // Pre-compute password hash outside the write lock — Argon2id is deliberately slow
@@ -198,6 +199,11 @@ pub async fn update_settings(
         }
 
         if let Some(hash_opt) = pre_hashed_password {
+            // Keep the caller signed in under the new password; every other
+            // session was issued under the old one and lapses with it.
+            if let Some(hash) = hash_opt.as_deref() {
+                crate::auth::rebind_session(&state, &headers, hash);
+            }
             cfg.api.password_hash = hash_opt;
             hot_changed.push("password");
         }

@@ -16,10 +16,17 @@ use serde_json::{Value, json};
 
 use crate::ApiError;
 use ferrite_app::AppState;
+use ferrite_app::sessions::Session;
 use ferrite_core::error::FeriteError;
 
-/// Session TTL — 24 hours.
-const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// A session lasts this long since it was last used — sliding, so someone
+/// who opens the panel every few days stays signed in, and one left alone
+/// for a week has to sign in again.
+const SESSION_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// A session's expiry is pushed forward at most this often, so an active
+/// panel writes to the database about once a day, not on every request.
+const SESSION_RENEW_EVERY: i64 = 24 * 60 * 60;
 
 /// Token-bucket rate limiter for the password login endpoint.
 ///
@@ -117,26 +124,80 @@ pub fn extract_session_token(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-/// Returns `true` if the request carries a valid, non-expired session token.
+/// How a session is looked up: the SHA-256 of its token, hex. The token
+/// itself is never kept — not in memory, not in the database.
+fn session_key(token: &str) -> String {
+    hex::encode(ring::digest::digest(
+        &ring::digest::SHA256,
+        token.as_bytes(),
+    ))
+}
+
+/// A short fingerprint of a password hash. A session remembers the one it was
+/// issued under; once the password changes — from the panel, `ferrite passwd`
+/// or a restored config — every older session stops working.
+fn password_fingerprint(password_hash: &str) -> String {
+    hex::encode(
+        &ring::digest::digest(&ring::digest::SHA256, password_hash.as_bytes()).as_ref()[..8],
+    )
+}
+
+fn unix_now() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// Returns `true` if the request carries a valid, non-expired session token
+/// issued under the current password. Using a session keeps it alive.
 pub fn is_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
-    let token = match extract_session_token(headers) {
-        Some(t) => t,
-        None => return false,
+    let Some(token) = extract_session_token(headers) else {
+        return false;
     };
-    // Copy the Instant out before dropping the Ref<> guard. DashMap's `get`
-    // holds a read lock; calling `remove` on the same shard while the read
-    // lock is still alive causes a self-deadlock in parking_lot (RwLock does
-    // not support reentrancy). `Some(_)` in a match arm does NOT drop the
-    // guard immediately — it lives until the end of the arm.
-    let expiry = match state.sessions.get(&token) {
-        Some(e) => *e,
-        None => return false,
+    let Some(password_fp) = state
+        .live_config
+        .read()
+        .api
+        .password_hash()
+        .map(password_fingerprint)
+    else {
+        return false;
     };
-    if expiry > Instant::now() {
-        true
-    } else {
-        state.sessions.remove(&token);
-        false
+    let key = session_key(&token);
+    let Some(session) = state.sessions.get(&key) else {
+        return false;
+    };
+    let now = unix_now();
+    if session.expires <= now || session.password_fp != password_fp {
+        state.sessions.forget(&key);
+        return false;
+    }
+    let ttl = SESSION_TTL.as_secs() as i64;
+    if ttl - (session.expires - now) >= SESSION_RENEW_EVERY {
+        state.sessions.update(
+            &key,
+            Session {
+                password_fp,
+                expires: now + ttl,
+            },
+        );
+    }
+    true
+}
+
+/// After the password changed, keep the session of the request that changed
+/// it: re-issue it under the new password. Every other session lapses.
+pub fn rebind_session(state: &AppState, headers: &HeaderMap, new_password_hash: &str) {
+    let Some(token) = extract_session_token(headers) else {
+        return;
+    };
+    let key = session_key(&token);
+    if state.sessions.get(&key).is_some() {
+        state.sessions.update(
+            &key,
+            Session {
+                password_fp: password_fingerprint(new_password_hash),
+                expires: unix_now() + SESSION_TTL.as_secs() as i64,
+            },
+        );
     }
 }
 
@@ -173,13 +234,16 @@ pub async fn login(
     }
 
     let token = generate_session_token()?;
-
-    let expiry = Instant::now() + SESSION_TTL;
-    state.sessions.insert(token.clone(), expiry);
-
-    // Evict expired sessions while we're here.
-    let now = Instant::now();
-    state.sessions.retain(|_, exp| *exp > now);
+    state
+        .sessions
+        .insert(
+            session_key(&token),
+            Session {
+                password_fp: password_fingerprint(&hash),
+                expires: unix_now() + SESSION_TTL.as_secs() as i64,
+            },
+        )
+        .await;
 
     Ok(Json(json!({
         "token": token,
@@ -202,7 +266,7 @@ fn fill_random(bytes: &mut [u8]) -> ferrite_core::error::Result<()> {
 /// DELETE /api/auth — invalidate the current session token.
 pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Json<Value> {
     if let Some(token) = extract_session_token(&headers) {
-        state.sessions.remove(&token);
+        state.sessions.remove(&session_key(&token)).await;
     }
     Json(json!({ "status": "ok" }))
 }
@@ -302,12 +366,12 @@ mod tests {
             "x-session-token",
             HeaderValue::from_str(&token).expect("token is a valid header value"),
         );
-        assert!(state.sessions.contains_key(&token));
+        assert!(state.sessions.get(&session_key(&token)).is_some());
         assert!(is_authenticated(&state, &headers));
 
         let Json(body) = logout(State(state.clone()), headers).await;
         assert_eq!(body["status"], "ok");
-        assert!(!state.sessions.contains_key(&token));
+        assert!(state.sessions.get(&session_key(&token)).is_none());
 
         drop(state);
         test_support::cleanup_sqlite(&db_path);
@@ -339,16 +403,89 @@ mod tests {
     #[tokio::test]
     async fn expired_session_is_rejected_and_removed() {
         let (state, db_path) = test_support::app_state("auth-expired").await;
-        state.sessions.insert(
-            "expired-token".to_string(),
-            Instant::now() - Duration::from_secs(1),
-        );
+        let hash = hash_password("secret").unwrap();
+        state.live_config.write().api.password_hash = Some(hash.clone());
+        state
+            .sessions
+            .insert(
+                session_key("expired-token"),
+                Session {
+                    password_fp: password_fingerprint(&hash),
+                    expires: unix_now() - 1,
+                },
+            )
+            .await;
 
         let mut headers = HeaderMap::new();
         headers.insert("x-session-token", HeaderValue::from_static("expired-token"));
 
         assert!(!is_authenticated(&state, &headers));
-        assert!(!state.sessions.contains_key("expired-token"));
+        assert!(state.sessions.get(&session_key("expired-token")).is_none());
+
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
+    }
+
+    async fn login_token(state: &AppState) -> String {
+        let Json(body) = login(
+            State(state.clone()),
+            Json(LoginRequest {
+                password: "secret".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        body["token"].as_str().unwrap().to_string()
+    }
+
+    fn token_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-token", HeaderValue::from_str(token).unwrap());
+        headers
+    }
+
+    #[tokio::test]
+    async fn a_session_survives_a_restart_but_not_a_password_change() {
+        let (state, db_path) = test_support::app_state("auth-restart").await;
+        let hash = hash_password("secret").unwrap();
+        state.live_config.write().api.password_hash = Some(hash.clone());
+        let token = login_token(&state).await;
+        drop(state);
+
+        // A new process over the same database: still signed in.
+        let config = {
+            let mut c = ferrite_core::config::Config::default();
+            c.storage.path = db_path.clone();
+            c.blocklist.lists.clear();
+            c.api.password_hash = Some(hash);
+            c
+        };
+        let state = AppState::init(&config, config.clone()).await.unwrap();
+        assert!(is_authenticated(&state, &token_headers(&token)));
+        // The database holds the token's hash, never the token.
+        assert!(state.sessions.get(&token).is_none());
+
+        // A new password — however it got there — ends the session.
+        state.live_config.write().api.password_hash = Some(hash_password("other").unwrap());
+        assert!(!is_authenticated(&state, &token_headers(&token)));
+
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
+    }
+
+    #[tokio::test]
+    async fn changing_the_password_keeps_only_the_session_that_changed_it() {
+        let (state, db_path) = test_support::app_state("auth-rebind").await;
+        state.live_config.write().api.password_hash = Some(hash_password("secret").unwrap());
+        let mine = login_token(&state).await;
+        let other = login_token(&state).await;
+
+        let new_hash = hash_password("new secret").unwrap();
+        state.live_config.write().api.password_hash = Some(new_hash.clone());
+        rebind_session(&state, &token_headers(&mine), &new_hash);
+
+        assert!(is_authenticated(&state, &token_headers(&mine)));
+        assert!(!is_authenticated(&state, &token_headers(&other)));
 
         drop(state);
         test_support::cleanup_sqlite(&db_path);

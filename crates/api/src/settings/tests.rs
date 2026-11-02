@@ -53,6 +53,7 @@ async fn hot_settings_patch_updates_runtime_state_and_persists_config() {
 
     let Json(value) = update_settings(
         State(state.clone()),
+        axum::http::HeaderMap::new(),
         Json(SettingsPatch {
             api_key: Some(Some("new-key".to_string())),
             dns_min_ttl: Some(120),
@@ -134,6 +135,7 @@ async fn an_unusable_storage_path_is_refused_before_it_is_saved() {
     ] {
         let err = update_settings(
             State(state.clone()),
+            axum::http::HeaderMap::new(),
             Json(SettingsPatch {
                 storage_path: Some(PathBuf::from(bad)),
                 ..Default::default()
@@ -148,6 +150,7 @@ async fn an_unusable_storage_path_is_refused_before_it_is_saved() {
     assert!(
         update_settings(
             State(state.clone()),
+            axum::http::HeaderMap::new(),
             Json(SettingsPatch {
                 storage_path: Some(dir.clone()),
                 ..Default::default()
@@ -180,6 +183,7 @@ async fn a_usable_storage_path_is_saved_and_asks_for_a_restart() {
 
     let Json(value) = update_settings(
         State(state.clone()),
+        axum::http::HeaderMap::new(),
         Json(SettingsPatch {
             storage_path: Some(target.clone()),
             ..Default::default()
@@ -219,6 +223,7 @@ async fn blocklist_cache_dir_is_validated_then_saved() {
     for bad in [PathBuf::from("relative/cache"), file.clone()] {
         let err = update_settings(
             State(state.clone()),
+            axum::http::HeaderMap::new(),
             Json(SettingsPatch {
                 blocklist_cache_dir: Some(bad.clone()),
                 ..Default::default()
@@ -236,6 +241,7 @@ async fn blocklist_cache_dir_is_validated_then_saved() {
     let target = std::env::temp_dir().join(format!("ferrite-cache-dir-{}", std::process::id()));
     let Json(value) = update_settings(
         State(state.clone()),
+        axum::http::HeaderMap::new(),
         Json(SettingsPatch {
             blocklist_cache_dir: Some(target.clone()),
             ..Default::default()
@@ -290,6 +296,7 @@ async fn privacy_switches_stop_recording_and_drop_what_is_in_memory() {
 
     let Json(value) = update_settings(
         State(state.clone()),
+        axum::http::HeaderMap::new(),
         Json(SettingsPatch {
             log_queries: Some(false),
             keep_stats: Some(false),
@@ -324,6 +331,7 @@ async fn privacy_switches_stop_recording_and_drop_what_is_in_memory() {
     // And back on again without a restart.
     let _ = update_settings(
         State(state.clone()),
+        axum::http::HeaderMap::new(),
         Json(SettingsPatch {
             log_queries: Some(true),
             keep_stats: Some(true),
@@ -373,6 +381,7 @@ async fn switching_recording_off_scrubs_the_snapshot_already_on_disk() {
 
     let _ = update_settings(
         State(state.clone()),
+        axum::http::HeaderMap::new(),
         Json(SettingsPatch {
             log_queries: Some(false),
             keep_stats: Some(false),
@@ -404,6 +413,7 @@ async fn nullable_api_key_patch_clears_secret() {
 
     let Json(value) = update_settings(
         State(state.clone()),
+        axum::http::HeaderMap::new(),
         Json(SettingsPatch {
             api_key: Some(None),
             ..Default::default()
@@ -433,6 +443,7 @@ async fn invalid_ttl_patch_is_rejected_without_mutating_runtime_config() {
     // and make the patch valid.
     let err = update_settings(
         State(state.clone()),
+        axum::http::HeaderMap::new(),
         Json(SettingsPatch {
             dns_min_ttl: Some(MAX_TTL),
             dns_max_ttl: Some(120),
@@ -465,6 +476,7 @@ async fn zero_max_ttl_patch_means_no_ceiling() {
 
     let Json(value) = update_settings(
         State(state.clone()),
+        axum::http::HeaderMap::new(),
         Json(SettingsPatch {
             dns_min_ttl: Some(120),
             dns_max_ttl: Some(0),
@@ -499,6 +511,7 @@ async fn blank_api_key_patch_is_rejected_without_persisting() {
 
     let err = update_settings(
         State(state.clone()),
+        axum::http::HeaderMap::new(),
         Json(SettingsPatch {
             api_key: Some(Some("  ".to_string())),
             ..Default::default()
@@ -522,6 +535,7 @@ async fn invalid_client_bypass_patch_is_rejected_without_mutating_config() {
 
     let err = update_settings(
         State(state.clone()),
+        axum::http::HeaderMap::new(),
         Json(SettingsPatch {
             blocklist_client_bypass: Some(vec!["not-an-ip-or-mac".to_string()]),
             ..Default::default()
@@ -543,6 +557,50 @@ async fn invalid_client_bypass_patch_is_rejected_without_mutating_config() {
             .client_bypasses_blocking("192.0.2.10", None)
     );
     assert!(!config_path.exists());
+
+    drop(state);
+    test_support::cleanup_sqlite(&db_path);
+}
+
+#[tokio::test]
+async fn changing_the_password_keeps_the_caller_signed_in_and_no_one_else() {
+    use axum::http::{HeaderMap, HeaderValue};
+
+    let (state, db_path) = test_support::app_state("settings-password-sessions").await;
+    state.live_config.write().api.password_hash =
+        Some(crate::auth::hash_password("old secret").unwrap());
+    let login = |state: AppState| async move {
+        let Json(v) = crate::auth::login(
+            State(state),
+            Json(crate::auth::LoginRequest {
+                password: "old secret".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(
+            "x-session-token",
+            HeaderValue::from_str(v["token"].as_str().unwrap()).unwrap(),
+        );
+        h
+    };
+    let mine = login(state.clone()).await;
+    let theirs = login(state.clone()).await;
+
+    let Json(_) = update_settings(
+        State(state.clone()),
+        mine.clone(),
+        Json(SettingsPatch {
+            password: Some(Some("new secret".into())),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert!(crate::auth::is_authenticated(&state, &mine));
+    assert!(!crate::auth::is_authenticated(&state, &theirs));
 
     drop(state);
     test_support::cleanup_sqlite(&db_path);

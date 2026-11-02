@@ -201,7 +201,6 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use std::time::{Duration, Instant};
     use tower::ServiceExt;
 
     use crate::auth::hash_password;
@@ -287,10 +286,15 @@ mod tests {
     async fn password_session_auth_allows_protected_api_access() {
         let (state, db_path) = test_support::app_state("api-session-auth").await;
         state.live_config.write().api.password_hash = Some(hash_password("secret").unwrap());
-        state.sessions.insert(
-            "session-token".to_string(),
-            Instant::now() + Duration::from_secs(60),
-        );
+        let axum::Json(login) = crate::auth::login(
+            axum::extract::State(state.clone()),
+            axum::Json(crate::auth::LoginRequest {
+                password: "secret".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let token = login["token"].as_str().unwrap().to_string();
         let app = build_router(state.clone());
 
         let missing = app.clone().oneshot(request("/api/settings")).await.unwrap();
@@ -300,7 +304,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/settings")
-                    .header("x-session-token", "session-token")
+                    .header("x-session-token", token.as_str())
                     .body(Body::empty())
                     .unwrap(),
             )

@@ -2,6 +2,7 @@
 //! warm-restart snapshot, and the per-subsystem context builders that hand each
 //! task exactly the state it needs.
 
+pub mod sessions;
 pub mod snapshot;
 
 #[cfg(any(test, feature = "testutil"))]
@@ -12,7 +13,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::time::Instant;
 
-use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::{Notify, Semaphore, mpsc};
 
@@ -85,8 +85,8 @@ pub struct AppState {
     /// Serializes every writer of [`Self::config_path`]. See
     /// [`AppState::persist_config`].
     config_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Active sessions: token → expiry Instant.
-    pub sessions: Arc<DashMap<String, Instant>>,
+    /// Web-panel login sessions, kept across restarts.
+    pub sessions: Arc<sessions::Sessions>,
     /// Signals the stats writer to flush its current batch immediately (used on shutdown).
     pub flush_notify: Arc<Notify>,
     /// Signalled by the stats writer once its final flush is complete.
@@ -493,6 +493,9 @@ impl AppState {
             query_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
         });
 
+        let sessions = sessions::Sessions::new(Arc::clone(&inner.storage));
+        sessions.restore(chrono::Utc::now().timestamp()).await;
+
         Ok(Self {
             inner,
             query_tx,
@@ -502,7 +505,7 @@ impl AppState {
             snapshot_path: Arc::new(snapshot_path),
             snapshot_lock: Arc::new(tokio::sync::Mutex::new(())),
             config_lock: Arc::new(tokio::sync::Mutex::new(())),
-            sessions: Arc::new(DashMap::new()),
+            sessions: Arc::new(sessions),
             flush_notify: Arc::new(Notify::new()),
             flush_done: Arc::new(Notify::new()),
             cpu_sampler: Arc::new(CpuSampler::new()),
