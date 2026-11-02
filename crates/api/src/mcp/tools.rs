@@ -14,7 +14,6 @@ use serde_json::{Value, json};
 use crate::ApiError;
 use ferrite_app::AppState;
 use ferrite_core::config::BlocklistProfileConfig;
-use ferrite_core::net::{normalize_client_key, parse_ip, unmap_v4};
 
 /// What a call came to.
 pub(super) enum Outcome {
@@ -425,40 +424,12 @@ async fn search_queries(s: AppState, args: &Value) -> Result<Value, String> {
 
 async fn check_domain(s: AppState, args: &Value) -> Result<Value, String> {
     let domain = ferrite_blocklist::normalise_domain(required(args, "domain")?);
-    let Json(mut v) = crate::blocklist::check_domain(State(s.clone()), Path(domain.clone()))
+    let params = crate::blocklist::CheckParams {
+        client: str_arg(args, "client").map(str::to_string),
+    };
+    let Json(v) = crate::blocklist::check_domain(State(s), Path(domain), Query(params))
         .await
         .map_err(api_err)?;
-    if let Some(client) = str_arg(args, "client") {
-        let bl = &s.inner.blocklist;
-        let (ip, mac) = match parse_ip(client) {
-            Some(ip) => {
-                let ip = unmap_v4(ip);
-                (ip.to_string(), s.inner.client_registry.get_mac(ip))
-            }
-            None => match normalize_client_key(client) {
-                Some(mac) => (String::new(), Some(mac)),
-                None => return Err(format!("`{client}` is neither an IP nor a MAC")),
-            },
-        };
-        let filtering_off =
-            !bl.blocking_enabled() || bl.client_filtering_off_normalized(&ip, mac.as_deref());
-        let profile = bl.profile_for(&ip, mac.as_deref());
-        let blocked = !filtering_off && bl.should_block_for(&domain, profile.as_deref());
-        // A block answers first; SafeSearch only rewrites what resolves.
-        let safe_host = if filtering_off || blocked {
-            None
-        } else {
-            bl.safe_search_target(&domain, profile.as_deref())
-        };
-        v["for_client"] = json!({
-            "client": client,
-            "mac": mac,
-            "profile": profile.as_ref().map(|p| p.id().to_string()),
-            "filtering_off": filtering_off,
-            "blocked": blocked,
-            "safe_search_answer": safe_host,
-        });
-    }
     Ok(v)
 }
 

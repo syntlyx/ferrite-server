@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
@@ -147,17 +147,37 @@ fn evict_domain_cache(state: &AppState, domain: &str) {
     state.inner.dns_cache.evict_domain(domain);
 }
 
-/// GET /api/blocklist/check/:domain
+#[derive(Debug, Default, Deserialize)]
+pub struct CheckParams {
+    /// A device IP or MAC: also answer for that device (its profile, pause,
+    /// SafeSearch) under `for_client`.
+    pub client: Option<String>,
+}
+
+/// GET /api/blocklist/check/:domain[?client=<ip|mac>]
 ///
 /// Returns the block decision **plus attribution**: which source(s) match (manual
-/// blacklist, wildcard, or a named subscription list), the whitelist entry that
-/// exempts it, and the **routing decision** — which egress (if any) the domain
-/// would be tunnelled through. The attribution scans each list's on-disk FST, so it
+/// blacklist, wildcard, service, or a named subscription list), the whitelist
+/// entry that exempts it, and the **routing decision** — which egress (if any)
+/// the domain would be tunnelled through. With `client`, `for_client` gives that
+/// device's own decision. The attribution scans each list's on-disk FST, so it
 /// runs in `spawn_blocking` and off the DNS hot path.
 pub async fn check_domain(
     State(state): State<AppState>,
     Path(domain): Path<String>,
+    Query(params): Query<CheckParams>,
 ) -> Result<Json<Value>, ApiError> {
+    let for_client = match params.client.as_deref().map(str::trim) {
+        Some(client) if !client.is_empty() => Some(
+            client_view(
+                &state,
+                &ferrite_blocklist::normalise_domain(&domain),
+                client,
+            )
+            .map_err(|e| ApiError(FeriteError::Config(e)))?,
+        ),
+        _ => None,
+    };
     // Routing decision (cheap, in-memory snapshot): paired with `enabled` so the UI
     // can distinguish "no rule matches" from "matches a rule but routing is off".
     let route = state
@@ -177,8 +197,47 @@ pub async fn check_domain(
         .map_err(|e| ApiError(FeriteError::Internal(format!("serialize explanation: {e}"))))?;
     if let Some(obj) = value.as_object_mut() {
         obj.insert("routing".to_string(), routing);
+        if let Some(view) = for_client {
+            obj.insert("for_client".to_string(), view);
+        }
     }
     Ok(Json(value))
+}
+
+/// One device's decision for `domain` (normalised): the profile on for it right
+/// now, whether its filtering is off (paused or bypassed), whether the name is
+/// blocked for it, and the SafeSearch host it resolves to instead, if any.
+pub(crate) fn client_view(state: &AppState, domain: &str, client: &str) -> Result<Value, String> {
+    use ferrite_core::net::{normalize_client_key, parse_ip, unmap_v4};
+    let bl = &state.inner.blocklist;
+    let (ip, mac) = match parse_ip(client) {
+        Some(ip) => {
+            let ip = unmap_v4(ip);
+            (ip.to_string(), state.inner.client_registry.get_mac(ip))
+        }
+        None => match normalize_client_key(client) {
+            Some(mac) => (String::new(), Some(mac)),
+            None => return Err(format!("`{client}` is neither an IP nor a MAC")),
+        },
+    };
+    let filtering_off =
+        !bl.blocking_enabled() || bl.client_filtering_off_normalized(&ip, mac.as_deref());
+    let profile = bl.profile_for(&ip, mac.as_deref());
+    let blocked = !filtering_off && bl.should_block_for(domain, profile.as_deref());
+    // A block answers first; SafeSearch only rewrites what resolves.
+    let safe_host = if filtering_off || blocked {
+        None
+    } else {
+        bl.safe_search_target(domain, profile.as_deref())
+    };
+    Ok(json!({
+        "client": client,
+        "mac": mac,
+        "profile": profile.as_ref().map(|p| p.id().to_string()),
+        "filtering_off": filtering_off,
+        "blocked": blocked,
+        "safe_search_answer": safe_host,
+    }))
 }
 
 /// GET /api/blocklist/blacklist
