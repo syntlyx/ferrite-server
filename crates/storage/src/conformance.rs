@@ -529,3 +529,27 @@ fn cleanup(path: &std::path::Path) {
     let _ = std::fs::remove_file(path.with_extension("db-shm"));
     let _ = std::fs::remove_file(path.with_extension("db-wal"));
 }
+
+#[tokio::test]
+async fn sessions_save_update_lapse_and_delete_the_same() {
+    for_each_backend("conformance-sessions", |storage| async move {
+        let s = |hash: &str, expires: i64| crate::StoredSession {
+            token_hash: hash.into(),
+            password_fp: "fp1".into(),
+            expires,
+        };
+        storage.save_session(&s("live", 2_000)).await.unwrap();
+        storage.save_session(&s("lapsed", 500)).await.unwrap();
+        // Saving again under the same hash replaces it (a renewal).
+        storage.save_session(&s("live", 3_000)).await.unwrap();
+
+        let loaded = storage.load_sessions(1_000).await.unwrap();
+        assert_eq!(loaded, vec![s("live", 3_000)]);
+        // The lapsed one is gone for good, not just filtered.
+        assert_eq!(storage.load_sessions(0).await.unwrap().len(), 1);
+
+        storage.delete_session("live").await.unwrap();
+        assert!(storage.load_sessions(0).await.unwrap().is_empty());
+    })
+    .await;
+}

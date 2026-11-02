@@ -49,6 +49,18 @@ pub struct StoredDevice {
     pub first_seen: i64,
 }
 
+/// A web-panel login session as stored. Never the token itself — only its
+/// SHA-256, so the database can't be used to sign in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredSession {
+    pub token_hash: String,
+    /// A fingerprint of the password hash the session was issued under; a
+    /// changed password makes every older session unusable.
+    pub password_fp: String,
+    /// Unix seconds the session lapses at.
+    pub expires: i64,
+}
+
 /// Aggregated statistics per device (keyed by the device identity token: a MAC
 /// when known, else an IP fallback — see [`ferrite_core::types::QueryEntry::device`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +189,18 @@ pub trait Storage: Send + Sync {
     /// the network and what they call themselves is exactly what "record
     /// nothing" must not leave behind.
     async fn delete_all_devices(&self) -> Result<()>;
+
+    /// Save a login session (insert or replace by token hash). Sessions are
+    /// authentication, not a record of the household, so they are kept
+    /// whatever the privacy switches say.
+    async fn save_session(&self, session: &StoredSession) -> Result<()>;
+
+    /// Forget one login session.
+    async fn delete_session(&self, token_hash: &str) -> Result<()>;
+
+    /// Every session still valid at `now` (unix seconds). Lapsed ones are
+    /// deleted on the way.
+    async fn load_sessions(&self, now: i64) -> Result<Vec<StoredSession>>;
 
     /// Refresh `last_seen = now` for the given IPs (currently-present devices), so
     /// age-based pruning keeps live bindings and only expires long-absent ones.

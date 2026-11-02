@@ -110,4 +110,15 @@ CREATE TABLE IF NOT EXISTS ip_bindings (
     last_seen   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_ip_bindings_mac ON ip_bindings (mac);
+
+-- ---------------------------------------------------------------
+-- Web-panel login sessions, so a restart doesn't sign everyone out. Only the
+-- token's SHA-256 is stored; password_fp ties a session to the password it
+-- was issued under.
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash  TEXT    PRIMARY KEY,
+    password_fp TEXT    NOT NULL,
+    expires     INTEGER NOT NULL
+);
 "#;

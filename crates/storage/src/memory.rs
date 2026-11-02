@@ -32,8 +32,8 @@ use ferrite_core::recording::RecordScope;
 use ferrite_core::types::{QueryEntry, QueryStatus, TimeseriesBucket};
 
 use crate::{
-    ClientStats, LegacyConfigRows, QueryFilter, SizeTrim, Storage, StoredDevice, SummaryStats,
-    align_bucket,
+    ClientStats, LegacyConfigRows, QueryFilter, SizeTrim, Storage, StoredDevice, StoredSession,
+    SummaryStats, align_bucket,
 };
 
 /// Rough live size of one retained entry: the struct, plus its heap strings
@@ -91,6 +91,8 @@ struct Inner {
     devices: BTreeMap<String, (Option<String>, i64)>,
     /// Last-known IP → MAC binding.
     ip_bindings: BTreeMap<String, Binding>,
+    /// Login sessions by token hash. Lost on restart, like everything here.
+    sessions: BTreeMap<String, StoredSession>,
     /// Highest id ever stored, kept across trims so ids stay monotonic.
     max_id: u64,
     max_entries: usize,
@@ -514,6 +516,25 @@ impl Storage for MemoryStorage {
     async fn delete_all_devices(&self) -> Result<()> {
         self.inner.write().devices.clear();
         Ok(())
+    }
+
+    async fn save_session(&self, session: &StoredSession) -> Result<()> {
+        self.inner
+            .write()
+            .sessions
+            .insert(session.token_hash.clone(), session.clone());
+        Ok(())
+    }
+
+    async fn delete_session(&self, token_hash: &str) -> Result<()> {
+        self.inner.write().sessions.remove(token_hash);
+        Ok(())
+    }
+
+    async fn load_sessions(&self, now: i64) -> Result<Vec<StoredSession>> {
+        let mut inner = self.inner.write();
+        inner.sessions.retain(|_, s| s.expires > now);
+        Ok(inner.sessions.values().cloned().collect())
     }
 
     async fn touch_ip_bindings(&self, ips: &[String]) -> Result<()> {

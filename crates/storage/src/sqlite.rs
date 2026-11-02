@@ -8,8 +8,8 @@ use tokio_rusqlite::Connection;
 
 use crate::schema::SCHEMA;
 use crate::{
-    ClientStats, LegacyConfigRows, QueryFilter, SizeTrim, Storage, StoredDevice, SummaryStats,
-    align_bucket,
+    ClientStats, LegacyConfigRows, QueryFilter, SizeTrim, Storage, StoredDevice, StoredSession,
+    SummaryStats, align_bucket,
 };
 use ferrite_core::error::{FeriteError, Result};
 use ferrite_core::recording::RecordScope;
@@ -656,6 +656,55 @@ impl Storage for SqliteStorage {
             .call(|c| {
                 c.execute("DELETE FROM devices", [])?;
                 Ok(())
+            })
+            .await
+            .map_err(FeriteError::TokioDatabase)
+    }
+
+    async fn save_session(&self, session: &StoredSession) -> Result<()> {
+        let s = session.clone();
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO sessions (token_hash, password_fp, expires) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(token_hash) DO UPDATE SET
+                         password_fp = excluded.password_fp,
+                         expires     = excluded.expires",
+                    rusqlite::params![s.token_hash, s.password_fp, s.expires],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(FeriteError::TokioDatabase)
+    }
+
+    async fn delete_session(&self, token_hash: &str) -> Result<()> {
+        let hash = token_hash.to_string();
+        self.conn
+            .call(move |c| {
+                c.execute("DELETE FROM sessions WHERE token_hash = ?1", [hash])?;
+                Ok(())
+            })
+            .await
+            .map_err(FeriteError::TokioDatabase)
+    }
+
+    async fn load_sessions(&self, now: i64) -> Result<Vec<StoredSession>> {
+        self.conn
+            .call(move |c| {
+                c.execute("DELETE FROM sessions WHERE expires <= ?1", [now])?;
+                let mut stmt =
+                    c.prepare("SELECT token_hash, password_fp, expires FROM sessions")?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok(StoredSession {
+                            token_hash: row.get(0)?,
+                            password_fp: row.get(1)?,
+                            expires: row.get(2)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
             })
             .await
             .map_err(FeriteError::TokioDatabase)

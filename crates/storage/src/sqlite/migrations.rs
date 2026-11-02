@@ -4,7 +4,7 @@ use super::table_exists;
 use crate::ROLLUP_BUCKET_SECS;
 
 /// Latest schema version. Bump when adding a migration step below.
-pub(super) const SCHEMA_VERSION: i64 = 10;
+pub(super) const SCHEMA_VERSION: i64 = 11;
 
 /// Apply versioned migrations on top of the baseline `SCHEMA`.
 ///
@@ -30,6 +30,7 @@ pub(super) fn run_migrations(c: &mut rusqlite::Connection) -> rusqlite::Result<(
             8 => migrate_v8_drop_unused_domain_bucket_index(&tx)?,
             9 => migrate_v9_drop_unread_client_rollups(&tx)?,
             10 => migrate_v10_device_first_seen(&tx)?,
+            11 => migrate_v11_sessions(&tx)?,
             _ => unreachable!("no migration step for v{next}"),
         }
         // PRAGMA can't be parameter-bound; the value is our own constant.
@@ -213,6 +214,17 @@ fn migrate_v10_device_first_seen(tx: &rusqlite::Transaction) -> rusqlite::Result
     tx.execute_batch(
         "INSERT OR IGNORE INTO devices (mac, hostname, last_seen, first_seen)
          SELECT mac, NULL, MAX(last_seen), 0 FROM ip_bindings GROUP BY mac",
+    )
+}
+
+/// v11: web-panel login sessions are kept in the database.
+fn migrate_v11_sessions(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sessions (
+             token_hash  TEXT    PRIMARY KEY,
+             password_fp TEXT    NOT NULL,
+             expires     INTEGER NOT NULL
+         )",
     )
 }
 
