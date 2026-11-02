@@ -5,14 +5,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
-use regex::Regex;
 
 use crate::ListPolarity;
 use crate::cache::BlocklistCache;
 use crate::loader::FstMap;
-use crate::names::{
-    has_suffix, is_registrable_or_deeper, matched_key, normalise, wildcard_to_regex,
-};
+use crate::manual::ManualList;
+use crate::names::{has_suffix, is_registrable_or_deeper, matched_key, normalise};
 use crate::profiles::{CompiledProfile, compile_profiles};
 use crate::subscriptions::Subscriptions;
 use ferrite_core::config::{AllowlistConfig, BlocklistConfig};
@@ -88,11 +86,10 @@ pub struct Blocklist {
     /// above are derived from this plus the per-list disk caches.
     profiles_config: RwLock<Vec<ferrite_core::config::BlocklistProfileConfig>>,
     client_bypass: ArcSwap<HashSet<String>>,
-    whitelist: RwLock<HashSet<String>>,
-    /// Wildcard entries for the whitelist, e.g. `*.safe.example.com`.
-    whitelist_wildcards: RwLock<Vec<(String, Regex)>>,
-    blacklist: RwLock<HashSet<String>>,
-    blacklist_wildcards: RwLock<Vec<(String, Regex)>>,
+    /// Manual allow entries — the `[allowlist] domains` tier.
+    whitelist: ManualList,
+    /// Manual block entries — `[blocklist] domains`.
+    blacklist: ManualList,
     cache: BlocklistCache,
     /// Configured `[[zones]]` suffixes (normalised), exempt from profile
     /// default-deny alongside the built-in local suffixes. Set once at startup
@@ -112,41 +109,12 @@ impl Blocklist {
         // Manual allowlist entries. `config.whitelist` is the deprecated
         // location — `Config::normalize` migrates it, but seed from both so a
         // directly-constructed BlocklistConfig keeps its old semantics.
-        let manual_allow = || config.whitelist.iter().chain(allowlist.domains.iter());
-
-        let whitelist: HashSet<String> = manual_allow()
-            .filter(|s| !s.contains('*'))
-            .map(|s| normalise(s))
-            .collect();
-
-        let whitelist_wildcards: Vec<(String, Regex)> = manual_allow()
-            .filter(|s| s.contains('*'))
-            .filter_map(|s| {
-                let norm = normalise(s);
-                wildcard_to_regex(&norm).ok().map(|re| (norm, re))
-            })
-            .collect();
-
+        let whitelist = ManualList::from_entries(config.whitelist.iter().chain(&allowlist.domains));
         // Manual block entries. `config.wildcard_block` is the deprecated
         // location — `Config::normalize` migrates it into `domains`, but seed
         // from both so a directly-constructed BlocklistConfig keeps working.
-        let manual_block = || config.domains.iter().chain(config.wildcard_block.iter());
-
-        let blacklist: HashSet<String> = manual_block()
-            .filter(|s| !s.contains('*'))
-            .map(|s| normalise(s))
-            .collect();
-
-        let blacklist_wildcards: Vec<(String, Regex)> = manual_block()
-            .filter(|s| s.contains('*'))
-            .filter_map(|s| {
-                let norm = normalise(s);
-                wildcard_to_regex(&norm)
-                    .map_err(|e| tracing::warn!("skipping invalid wildcard '{}': {}", s, e))
-                    .ok()
-                    .map(|re| (norm, re))
-            })
-            .collect();
+        let blacklist =
+            ManualList::from_entries(config.domains.iter().chain(&config.wildcard_block));
 
         // Per-list caches and the merged allowlist sit beside the merged blocklist.
         let dir = fst_path.parent().unwrap_or(Path::new("")).to_path_buf();
@@ -172,10 +140,8 @@ impl Blocklist {
             profiles: ArcSwap::from_pointee(Vec::new()),
             profiles_config: RwLock::new(config.profiles),
             client_bypass: ArcSwap::from_pointee(client_bypass),
-            whitelist: RwLock::new(whitelist),
-            whitelist_wildcards: RwLock::new(whitelist_wildcards),
-            blacklist: RwLock::new(blacklist),
-            blacklist_wildcards: RwLock::new(blacklist_wildcards),
+            whitelist,
+            blacklist,
             cache: BlocklistCache::new(config.decision_cache_size),
             local_zones: RwLock::new(Vec::new()),
             refresh_lock: tokio::sync::Mutex::new(()),
@@ -419,28 +385,10 @@ impl Blocklist {
     /// Shared by the default path and every profile so their semantics can't
     /// drift.
     fn check_blocked_in(&self, domain: &str, fst: &FstMap) -> bool {
-        {
-            // Manual blacklist: exact match, then walk up the hierarchy so a
-            // blacklist entry for `evil.com` also blocks `www.evil.com` —
-            // symmetric with the FST walk below and the whitelist walk.
-            let blacklist = self.blacklist.read();
-            if blacklist.contains(domain) {
-                return true;
-            }
-            let mut rest = domain;
-            while let Some(dot) = rest.find('.') {
-                rest = &rest[dot + 1..];
-                if blacklist.contains(rest) && is_registrable_or_deeper(rest) {
-                    return true;
-                }
-            }
-        }
-        if self
-            .blacklist_wildcards
-            .read()
-            .iter()
-            .any(|(_, re)| re.is_match(domain))
-        {
+        // Manual blacklist: exact match, then walk up the hierarchy so a
+        // blacklist entry for `evil.com` also blocks `www.evil.com` —
+        // symmetric with the FST walk below and the whitelist walk.
+        if self.blacklist.contains(domain) {
             return true;
         }
 
@@ -580,33 +528,7 @@ impl Blocklist {
         domain: &str,
         profile: Option<&CompiledProfile>,
     ) -> bool {
-        {
-            let whitelist = self.whitelist.read();
-            if whitelist.contains(domain) {
-                return true;
-            }
-            // Walk up the hierarchy: `www.example.com` → check `example.com`.
-            // The public-suffix guard stops the walk at the registrable-domain
-            // boundary, matching the guard in `check_blocked` (so whitelisting a
-            // multi-label suffix like `co.uk` doesn't exempt an entire ccTLD).
-            let mut rest = domain;
-            while let Some(dot) = rest.find('.') {
-                rest = &rest[dot + 1..];
-                // Set lookup before the public-suffix guard: both must hold, and
-                // this one is a hash (free on the empty set every unconfigured
-                // install has) where the guard is a trie walk. This runs
-                // uncached on every single query, unlike the FST tier below it.
-                if whitelist.contains(rest) && is_registrable_or_deeper(rest) {
-                    return true;
-                }
-            }
-        }
-        if self
-            .whitelist_wildcards
-            .read()
-            .iter()
-            .any(|(_, re)| re.is_match(domain))
-        {
+        if self.whitelist.contains(domain) {
             return true;
         }
         // Subscribed allowlists: same exact + hierarchy walk against the merged
@@ -634,25 +556,20 @@ impl Blocklist {
         let mut sources = Vec::new();
 
         // Manual blacklist (exact + hierarchy walk).
-        {
-            let blacklist = self.blacklist.read();
-            if let Some(key) = matched_key(&domain, |k| blacklist.contains(k)) {
-                sources.push(BlockSource {
-                    kind: "blacklist".into(),
-                    name: "manual blacklist".into(),
-                    matched: key,
-                });
-            }
+        if let Some(key) = self.blacklist.exact_match(&domain) {
+            sources.push(BlockSource {
+                kind: "blacklist".into(),
+                name: "manual blacklist".into(),
+                matched: key,
+            });
         }
         // Manual blacklist wildcards.
-        for (pat, re) in self.blacklist_wildcards.read().iter() {
-            if re.is_match(&domain) {
-                sources.push(BlockSource {
-                    kind: "wildcard".into(),
-                    name: pat.clone(),
-                    matched: domain.clone(),
-                });
-            }
+        for pat in self.blacklist.matching_patterns(&domain) {
+            sources.push(BlockSource {
+                kind: "wildcard".into(),
+                name: pat,
+                matched: domain.clone(),
+            });
         }
         // Subscription lists: scan each enabled list's own on-disk FST so the
         // match attributes to a specific list (the merged hot-path FST can't).
@@ -692,24 +609,19 @@ impl Blocklist {
     /// merged hot-path FST can't), like the block-source attribution in
     /// [`Self::explain`].
     fn whitelist_match(&self, domain: &str) -> Option<MatchInfo> {
-        {
-            let whitelist = self.whitelist.read();
-            if let Some(key) = matched_key(domain, |k| whitelist.contains(k)) {
-                return Some(MatchInfo {
-                    entry: key.clone(),
-                    matched: key,
-                    list: None,
-                });
-            }
+        if let Some(key) = self.whitelist.exact_match(domain) {
+            return Some(MatchInfo {
+                entry: key.clone(),
+                matched: key,
+                list: None,
+            });
         }
-        for (pat, re) in self.whitelist_wildcards.read().iter() {
-            if re.is_match(domain) {
-                return Some(MatchInfo {
-                    entry: pat.clone(),
-                    matched: domain.to_string(),
-                    list: None,
-                });
-            }
+        if let Some(pat) = self.whitelist.matching_patterns(domain).into_iter().next() {
+            return Some(MatchInfo {
+                entry: pat,
+                matched: domain.to_string(),
+                list: None,
+            });
         }
         if let Some((name, key)) = self.allow.attribute(domain).next() {
             return Some(MatchInfo {
@@ -745,14 +657,8 @@ impl Blocklist {
     }
 
     pub fn add_whitelist(&self, domain: &str) -> Result<()> {
-        let d = normalise(domain);
-        if d.contains('*') {
-            let re = wildcard_to_regex(&d)?;
-            self.whitelist_wildcards.write().push((d, re));
-        } else {
-            self.whitelist.write().insert(d);
-        }
-        // A whitelist/blacklist entry now matches subdomains via the hierarchy
+        self.whitelist.add(domain)?;
+        // A whitelist/blacklist entry matches subdomains via the hierarchy
         // walk, so an exact-key invalidation can't cover the cached block/allow
         // decisions it affects — clear the whole decision cache.
         self.clear_decision_caches();
@@ -760,61 +666,27 @@ impl Blocklist {
     }
 
     pub fn remove_whitelist(&self, domain: &str) {
-        let d = normalise(domain);
-        if d.contains('*') {
-            self.whitelist_wildcards
-                .write()
-                .retain(|(pat, _)| pat != &d);
-        } else {
-            self.whitelist.write().remove(&d);
-        }
+        self.whitelist.remove(domain);
         self.clear_decision_caches();
     }
 
     pub fn add_blacklist(&self, domain: &str) -> Result<()> {
-        let d = normalise(domain);
-        if d.contains('*') {
-            let re = wildcard_to_regex(&d)?;
-            self.blacklist_wildcards.write().push((d, re));
-        } else {
-            self.blacklist.write().insert(d);
-        }
+        self.blacklist.add(domain)?;
         self.clear_decision_caches();
         Ok(())
     }
 
     pub fn remove_blacklist(&self, domain: &str) {
-        let d = normalise(domain);
-        if d.contains('*') {
-            self.blacklist_wildcards
-                .write()
-                .retain(|(pat, _)| pat != &d);
-        } else {
-            self.blacklist.write().remove(&d);
-        }
+        self.blacklist.remove(domain);
         self.clear_decision_caches();
     }
 
     pub fn list_whitelist(&self) -> Vec<String> {
-        let mut result: Vec<String> = self.whitelist.read().iter().cloned().collect();
-        result.extend(
-            self.whitelist_wildcards
-                .read()
-                .iter()
-                .map(|(p, _)| p.clone()),
-        );
-        result
+        self.whitelist.entries()
     }
 
     pub fn list_blacklist(&self) -> Vec<String> {
-        let mut result: Vec<String> = self.blacklist.read().iter().cloned().collect();
-        result.extend(
-            self.blacklist_wildcards
-                .read()
-                .iter()
-                .map(|(p, _)| p.clone()),
-        );
-        result
+        self.blacklist.entries()
     }
 
     // ── Subscriptions ────────────────────────────────────────────────────────

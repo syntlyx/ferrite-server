@@ -31,6 +31,9 @@ pub(crate) fn matched_key(domain: &str, contains: impl Fn(&str) -> bool) -> Opti
 /// Exact match on `domain`, else a parent in the hierarchy (stopping at the
 /// registrable boundary) — the shared walk used by the blacklist, whitelist, and
 /// profile overrides so a rule for `evil.com` also matches `www.evil.com`.
+///
+/// The public-suffix guard stops the walk at the registrable-domain boundary,
+/// so an entry for a multi-label suffix like `co.uk` can't cover a whole ccTLD.
 pub(crate) fn domain_in_set(domain: &str, set: &HashSet<String>) -> bool {
     if set.contains(domain) {
         return true;
@@ -38,7 +41,11 @@ pub(crate) fn domain_in_set(domain: &str, set: &HashSet<String>) -> bool {
     let mut rest = domain;
     while let Some(dot) = rest.find('.') {
         rest = &rest[dot + 1..];
-        if is_registrable_or_deeper(rest) && set.contains(rest) {
+        // Set lookup before the public-suffix guard: both must hold, and this
+        // one is a hash (free on the empty set every unconfigured install has)
+        // where the guard is a trie walk. The manual sets run uncached on every
+        // single query.
+        if set.contains(rest) && is_registrable_or_deeper(rest) {
             return true;
         }
     }

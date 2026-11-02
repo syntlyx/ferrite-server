@@ -2,6 +2,7 @@ pub mod cache;
 pub mod domains;
 pub mod engine;
 pub mod loader;
+mod manual;
 mod names;
 pub mod parser;
 mod profiles;
