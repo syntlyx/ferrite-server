@@ -604,11 +604,16 @@ GET → {
       "clients": ["aa:bb:cc:dd:ee:ff"],
       "block": [], "allow": ["ntp.example.com"],
       "services": ["tiktok"],                 // catalog services blocked for these devices
-      "default_deny": true                    // block everything not explicitly allowed
+      "default_deny": true,                   // block everything not explicitly allowed
+      "schedule": [                           // when it applies; [] = always
+        { "days": ["sun", "mon", "tue", "wed", "thu"], "from": "21:00", "to": "07:00" }
+      ]
     }
   ],
   "available_lists": ["StevenBlack"],
-  "available_allowlists": ["anudeepND Whitelist"]
+  "available_allowlists": ["anudeepND Whitelist"],
+  "active": { "iot": true },                  // saved profiles on by their schedule right now
+  "clock": { "minute_of_week": 1265, "utc_offset": "+02:00" }
 }
 ```
 
@@ -618,6 +623,22 @@ hostnames, `.lan`/`.local`/`.home`/`.internal`/`.localdomain`, and configured
 
 A profile's `services` work like its `block` entries: they beat the global
 whitelist and lose to the profile's own `allow`. Unknown service ids → `400`.
+
+**Schedules.** A profile with `schedule` windows applies only inside them, in
+the box's local time (`clock.utc_offset`). A device in several profiles gets
+the first one, in array order, that lists it and is on right now; outside every
+window it falls back to the network-wide rules. So a scheduled default-deny
+"Bedtime" placed above an always-on "Kids" replaces it at night and hands back
+in the morning.
+
+- `days`: `mon`…`sun`, the days a window *starts* on; empty = every day.
+- `from` / `to`: `HH:MM`, `to` may be `24:00`. A `to` earlier than `from` runs
+  past midnight (`21:00`–`07:00` started on Monday ends Tuesday morning); equal
+  times cover the whole day.
+- An invalid window → `400`. A hand-edited config with one keeps that profile
+  off until it is fixed, and the log says why.
+- `clock.minute_of_week` counts from Monday 00:00 (`1265` = Monday 21:05). The
+  server updates it every few seconds, so a window's edge lands within that.
 
 ---
 
