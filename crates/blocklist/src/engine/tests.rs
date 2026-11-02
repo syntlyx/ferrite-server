@@ -1846,3 +1846,64 @@ fn a_profile_whose_schedule_does_not_compile_stays_off() {
         assert!(blocklist.profile_for("10.0.0.2", None).is_none());
     }
 }
+
+#[test]
+fn regex_entries_match_anywhere_case_insensitively_and_keep_their_escapes() {
+    let blocklist = Blocklist::new(
+        BlocklistConfig {
+            enabled: true,
+            decision_cache_size: 128,
+            lists: vec![],
+            // From the config file, as typed — `\D` must not become `\d`.
+            domains: vec![r"/^\D+\.digits\.test$/".to_string()],
+            wildcard_block: vec![],
+            services: vec![],
+            safe_search: false,
+            youtube_restricted: Default::default(),
+            block_response: Default::default(),
+            block_ipv4: None,
+            block_ipv6: None,
+            whitelist: vec![],
+            client_bypass: vec![],
+            profiles: vec![],
+        },
+        AllowlistConfig::default(),
+        temp_fst_path("ferrite-blocklist-regex"),
+    );
+    assert!(blocklist.should_block_for("abc.digits.test", None));
+    assert!(!blocklist.should_block_for("a1.digits.test", None));
+
+    blocklist.add_blacklist(r"/^ads?[0-9]+\./").unwrap();
+    assert!(blocklist.should_block_for("ads12.example.com", None));
+    assert!(blocklist.should_block_for("AD3.example.com", None));
+    assert!(!blocklist.should_block_for("bads1.example.com", None));
+    // Unanchored matches anywhere in the name.
+    blocklist.add_blacklist("/telemetry/").unwrap();
+    assert!(blocklist.should_block_for("eu.telemetry.vendor.io", None));
+
+    // Why-blocked names the regex entry.
+    let e = blocklist.explain("ads7.cdn.test");
+    assert!(e.blocked);
+    assert!(
+        e.sources
+            .iter()
+            .any(|s| s.kind == "regex" && s.name == r"/^ads?[0-9]+\./")
+    );
+
+    // Listed as typed, and removable by the same text.
+    assert!(
+        blocklist
+            .list_blacklist()
+            .contains(&r"/^ads?[0-9]+\./".to_string())
+    );
+    blocklist.remove_blacklist(r"/^ads?[0-9]+\./");
+    assert!(!blocklist.should_block_for("ads12.example.com", None));
+
+    // Refused: what can't compile, and what would match every name.
+    assert!(blocklist.add_blacklist("/(/").is_err());
+    assert!(blocklist.add_blacklist("/.*/").is_err());
+    assert!(blocklist.add_blacklist("/[a-z]/").is_err());
+    assert!(crate::validate_entry("/^x/").is_ok());
+    assert!(crate::validate_entry("/.+/").is_err());
+    assert!(crate::validate_entry("plain.example").is_ok());
+}

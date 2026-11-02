@@ -10,7 +10,7 @@ use regex::Regex;
 use crate::cache::BlocklistCache;
 use crate::engine::normalize_client_keys;
 use crate::loader::{self, FstMap, empty_fst};
-use crate::names::{domain_in_set, normalise, wildcard_to_regex};
+use crate::names::{domain_in_set, is_pattern, normalise, pattern_to_regex};
 use crate::refresh;
 use crate::safesearch::SafeSearch;
 use crate::subscriptions::{FstInputs, MergedSet, meta_path};
@@ -97,8 +97,8 @@ fn split_patterns(patterns: &[String]) -> (HashSet<String>, Vec<Regex>) {
         if norm.is_empty() {
             continue;
         }
-        if norm.contains('*') {
-            if let Ok(re) = wildcard_to_regex(&norm) {
+        if is_pattern(&norm) {
+            if let Ok(re) = pattern_to_regex(&norm) {
                 wild.push(re);
             }
         } else {

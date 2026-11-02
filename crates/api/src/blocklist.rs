@@ -140,7 +140,7 @@ fn remove_config_domain(state: &AppState, polarity: Polarity, domain: &str) {
 /// Evict all cached DNS responses for `domain` (every qtype). A wildcard entry
 /// can affect arbitrary names, so it flushes the whole cache.
 fn evict_domain_cache(state: &AppState, domain: &str) {
-    if domain.contains('*') {
+    if ferrite_blocklist::is_pattern(domain) {
         state.inner.dns_cache.clear();
         return;
     }

@@ -706,10 +706,15 @@ impl Blocklist {
                 matched: key,
             });
         }
-        // Manual blacklist wildcards.
+        // Manual blacklist patterns: wildcards and regexes.
         for pat in self.blacklist.matching_patterns(&domain) {
+            let kind = if crate::names::regex_body(&pat).is_some() {
+                "regex"
+            } else {
+                "wildcard"
+            };
             sources.push(BlockSource {
-                kind: "wildcard".into(),
+                kind: kind.into(),
                 name: pat,
                 matched: domain.clone(),
             });

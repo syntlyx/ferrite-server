@@ -603,6 +603,18 @@ Deletes the entry wherever it came from, including one written by hand in `confi
 { "domain": "evil.com", "status": "blacklisted", "persisted": true }
 ```
 
+An entry is one of three things, for both lists and for a profile's own
+`block` / `allow`:
+
+- a name — `evil.com` — which covers its subdomains too;
+- a wildcard — `*.evil.com` — the subdomains only;
+- a regex between slashes — `/^ads?[0-9]+\./` — matched anywhere in the name
+  (anchor it with `^` / `$`), case-insensitively, and kept as typed. A regex
+  that won't compile, or that matches every name (`/.*/`, `/[a-z]/`), is `400`.
+  `GET /api/blocklist/check` reports a regex match with `kind: "regex"`.
+
+To delete a regex, percent-encode it in the path — the slashes included.
+
 ### `DELETE /api/blocklist/blacklist/:domain`
 
 ```

@@ -16,7 +16,8 @@ and keeps everything it learns on that box.
 **Filtering for the whole network.** Subscribe to blocklists and allowlists in
 hosts, Adblock or plain-domain format (a curated catalog is built in, or paste
 any URL); they compile into one compact lookup. Add your own block and allow
-entries, block whole services network-wide, and turn on SafeSearch and YouTube
+entries — names, wildcards or regular expressions — block whole services
+network-wide, and turn on SafeSearch and YouTube
 Restricted Mode. Every verdict can be explained: which list, rule or service
 matched, and what exempted it.
 
@@ -266,7 +267,7 @@ rules are the allow entries. Manage everything live in the UI.
 ```toml
 [blocklist]
 enabled = true
-domains = ["*.doubleclick.net", "ads.example.com"]   # always blocked (manual entries)
+domains = ["*.doubleclick.net", "ads.example.com", '/^ads?[0-9]+\./']   # always blocked: names, wildcards, /regex/
 client_bypass   = ["192.168.1.50", "aa:bb:cc:dd:ee:ff"]   # these clients skip filtering
 
 [[blocklist.lists]]

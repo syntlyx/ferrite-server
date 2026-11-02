@@ -14,7 +14,7 @@ mod subscriptions;
 
 pub use domains::DomainSet;
 pub use engine::Blocklist;
-pub use names::{normalise_domain, wildcard_to_regex};
+pub use names::{is_pattern, normalise_domain, validate_entry, wildcard_to_regex};
 pub use parser::AdblockStats;
 pub use profiles::CompiledProfile;
 pub use safesearch::SafeSearch;

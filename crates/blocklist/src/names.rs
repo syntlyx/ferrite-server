@@ -53,10 +53,68 @@ pub(crate) fn domain_in_set(domain: &str, set: &HashSet<String>) -> bool {
 }
 
 pub(crate) fn normalise(domain: &str) -> String {
+    // A `/regex/` entry keeps its case: lowercasing would turn `\D` into
+    // `\d`. It matches case-insensitively instead.
+    if regex_body(domain).is_some() {
+        return domain.trim().to_string();
+    }
     domain
         .to_ascii_lowercase()
         .trim_end_matches('.')
         .to_string()
+}
+
+/// The pattern inside a `/regex/` entry, if this is one.
+pub(crate) fn regex_body(entry: &str) -> Option<&str> {
+    let e = entry.trim();
+    (e.len() > 2 && e.starts_with('/') && e.ends_with('/')).then(|| &e[1..e.len() - 1])
+}
+
+/// Is this manual entry a pattern — a `*` wildcard or a `/regex/` — rather
+/// than a name matched with its subdomains?
+pub fn is_pattern(entry: &str) -> bool {
+    entry.contains('*') || regex_body(entry).is_some()
+}
+
+/// Check a manual entry the way adding it would: a pattern must compile (and
+/// not match every name); a plain name always passes.
+pub fn validate_entry(entry: &str) -> Result<()> {
+    let norm = normalise(entry);
+    if is_pattern(&norm) {
+        pattern_to_regex(&norm)?;
+    }
+    Ok(())
+}
+
+/// Names no sensible entry matches all of. A pattern that does would block —
+/// or allow — every name there is, which is never what was meant.
+const UNRELATED_NAMES: [&str; 4] = [
+    "example.com",
+    "a.b.c.d.example.org",
+    "zz9-ferrite-probe.invalid",
+    "x.y",
+];
+
+/// Compile a pattern entry: `*.example.com` as an anchored wildcard, or
+/// `/regex/` as a regular expression matched anywhere in the name (anchor it
+/// with `^` / `$`), case-insensitively. A regex that matches every name is
+/// refused, and so is one too large to compile within a modest budget.
+pub(crate) fn pattern_to_regex(entry: &str) -> Result<Regex> {
+    let Some(body) = regex_body(entry) else {
+        return wildcard_to_regex(entry);
+    };
+    let re = regex::RegexBuilder::new(body)
+        .case_insensitive(true)
+        .size_limit(256 * 1024)
+        .dfa_size_limit(1024 * 1024)
+        .build()
+        .map_err(|e| FeriteError::Config(format!("invalid regex '{entry}': {e}")))?;
+    if re.is_match("") || UNRELATED_NAMES.iter().all(|n| re.is_match(n)) {
+        return Err(FeriteError::Config(format!(
+            "regex '{entry}' would match every name"
+        )));
+    }
+    Ok(re)
 }
 
 /// Canonical domain key used by the blocklist engine and the DNS hot path:

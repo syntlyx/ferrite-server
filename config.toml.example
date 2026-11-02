@@ -280,9 +280,12 @@ decision_cache_size = 50000
 # NOTE: `wildcard_block` was the old name and held wildcards only. Old configs
 # still load — entries are migrated into `domains` automatically and rewritten
 # in the new shape on the next config save.
+# A regex between slashes matches anywhere in the name, case-insensitively —
+# write it in single quotes so TOML leaves the backslashes alone.
 domains = [
     # "*.doubleclick.net",
     # "ads.example.com",
+    # '/^ads?[0-9]+\./',
 ]
 
 # Services from the built-in catalog, blocked for every device: "youtube",

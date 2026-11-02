@@ -148,6 +148,10 @@ fn validate(
                 )));
             }
         }
+        for entry in p.block.iter().chain(&p.allow) {
+            ferrite_blocklist::validate_entry(entry)
+                .map_err(|e| bad(&format!("profile '{}': {e}", p.id)))?;
+        }
         p.services = crate::services::known_ids(&p.services, &format!("profile '{}'", p.id))?;
         for w in &mut p.schedule {
             w.normalize();

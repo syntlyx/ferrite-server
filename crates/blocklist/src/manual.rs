@@ -7,12 +7,13 @@ use std::collections::HashSet;
 use parking_lot::RwLock;
 use regex::Regex;
 
-use crate::names::{domain_in_set, matched_key, normalise, wildcard_to_regex};
+use crate::names::{domain_in_set, is_pattern, matched_key, normalise, pattern_to_regex};
 use ferrite_core::error::Result;
 
 pub(crate) struct ManualList {
     exact: RwLock<HashSet<String>>,
-    /// Wildcard entries, e.g. `*.safe.example.com`, with their compiled regex.
+    /// Pattern entries — wildcards such as `*.safe.example.com` and
+    /// `/regex/` ones — with their compiled regex.
     wildcards: RwLock<Vec<(String, Regex)>>,
 }
 
@@ -24,10 +25,10 @@ impl ManualList {
         let mut wildcards = Vec::new();
         for entry in entries {
             let norm = normalise(entry);
-            if norm.contains('*') {
-                match wildcard_to_regex(&norm) {
+            if is_pattern(&norm) {
+                match pattern_to_regex(&norm) {
                     Ok(re) => wildcards.push((norm, re)),
-                    Err(e) => tracing::warn!("skipping invalid wildcard '{}': {}", entry, e),
+                    Err(e) => tracing::warn!("skipping invalid pattern '{}': {}", entry, e),
                 }
             } else {
                 exact.insert(norm);
@@ -70,9 +71,13 @@ impl ManualList {
 
     pub(crate) fn add(&self, domain: &str) -> Result<()> {
         let d = normalise(domain);
-        if d.contains('*') {
-            let re = wildcard_to_regex(&d)?;
-            self.wildcards.write().push((d, re));
+        if is_pattern(&d) {
+            let re = pattern_to_regex(&d)?;
+            let mut wildcards = self.wildcards.write();
+            // Adding the same pattern twice would only double the work.
+            if !wildcards.iter().any(|(p, _)| p == &d) {
+                wildcards.push((d, re));
+            }
         } else {
             self.exact.write().insert(d);
         }
@@ -81,14 +86,14 @@ impl ManualList {
 
     pub(crate) fn remove(&self, domain: &str) {
         let d = normalise(domain);
-        if d.contains('*') {
+        if is_pattern(&d) {
             self.wildcards.write().retain(|(pat, _)| pat != &d);
         } else {
             self.exact.write().remove(&d);
         }
     }
 
-    /// Every entry: exact names first, then wildcard patterns.
+    /// Every entry: exact names first, then patterns.
     pub(crate) fn entries(&self) -> Vec<String> {
         let mut result: Vec<String> = self.exact.read().iter().cloned().collect();
         result.extend(self.wildcards.read().iter().map(|(p, _)| p.clone()));
