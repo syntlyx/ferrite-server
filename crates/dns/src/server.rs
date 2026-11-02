@@ -29,6 +29,17 @@ pub async fn run(ctx: Arc<DnsCtx>) -> anyhow::Result<()> {
 
     // Cache janitor.
     tokio::spawn(crate::cache::janitor(Arc::clone(&ctx.dns_cache)));
+    // Rate-limit buckets of clients that went quiet.
+    {
+        let gate = Arc::clone(&ctx.client_gate);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                gate.sweep();
+            }
+        });
+    }
 
     tokio::try_join!(udp_loop(udp, Arc::clone(&ctx)), tcp_loop(tcp, ctx))?;
 

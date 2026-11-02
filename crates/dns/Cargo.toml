@@ -14,6 +14,7 @@ ferrite-upstream.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 chrono.workspace = true
+dashmap.workspace = true
 hickory-proto.workspace = true
 hickory-resolver.workspace = true
 lru.workspace = true

@@ -77,6 +77,32 @@ pub async fn get_metrics(State(state): State<AppState>) -> impl IntoResponse {
         live.dropped(),
     );
 
+    let gate = &state.inner.client_gate;
+    family(
+        &mut out,
+        "ferrite_dns_rate_limited_total",
+        "Queries answered REFUSED because their client was over the rate limit.",
+        "counter",
+    );
+    sample(
+        &mut out,
+        "ferrite_dns_rate_limited_total",
+        &[],
+        gate.refused(),
+    );
+    family(
+        &mut out,
+        "ferrite_dns_client_denied_total",
+        "Queries dropped because their client is not allowed to use this resolver.",
+        "counter",
+    );
+    sample(
+        &mut out,
+        "ferrite_dns_client_denied_total",
+        &[],
+        gate.dropped(),
+    );
+
     family(
         &mut out,
         "ferrite_dns_cache_entries",

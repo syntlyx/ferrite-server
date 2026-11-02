@@ -140,6 +140,7 @@ impl Harness {
             client_ttl: Arc::new(AtomicU32::new(self.client_ttl)),
             record_switches: RecordSwitches::new(RecordScope::ALL),
             query_semaphore: Arc::new(Semaphore::new(256)),
+            client_gate: Arc::new(crate::gate::ClientGate::new(&DnsConfig::default())),
             query_tx: self.query_tx.clone(),
         }
     }
@@ -755,6 +756,54 @@ async fn blocked_answer_carries_an_soa_bounding_negative_caching() {
     // The negative-cache lifetime is min(record TTL, SOA MINIMUM) — both are
     // the harness ceiling, so a device can't hold the refusal any longer.
     assert_eq!(soa, (h.client_ttl, h.client_ttl));
+
+    cleanup_sqlite(&h.db_path);
+}
+
+/// The gate runs first: an outsider gets nothing back, a client over its
+/// rate limit gets REFUSED, and neither reaches the query log.
+#[tokio::test]
+async fn the_client_gate_drops_outsiders_and_refuses_the_too_fast() {
+    use crate::gate::ClientGate;
+
+    let mut h = Harness::new("dns-client-gate").await;
+    let mut ctx = h.ctx();
+    ctx.client_gate = Arc::new(ClientGate::new(&DnsConfig {
+        rate_limit: 1,
+        allowed_clients: vec!["192.0.2.0/24".into()],
+        ..DnsConfig::default()
+    }));
+    let ctx = Arc::new(ctx);
+    h.blocklist.add_blacklist("ads.test").unwrap();
+    let ask = || query("ads.test", RecordType::A).to_bytes().unwrap();
+
+    let outsider = SocketAddr::from(([203, 0, 113, 9], 53_000));
+    assert!(
+        handle_query(ask(), outsider, Arc::clone(&ctx))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let inside = SocketAddr::from(([192, 0, 2, 10], 53_000));
+    let first = handle_query(ask(), inside, Arc::clone(&ctx)).await.unwrap();
+    assert_eq!(
+        Message::from_bytes(&first).unwrap().metadata.response_code,
+        ResponseCode::NXDomain
+    );
+    let second = handle_query(ask(), inside, Arc::clone(&ctx)).await.unwrap();
+    assert_eq!(
+        Message::from_bytes(&second).unwrap().metadata.response_code,
+        ResponseCode::Refused
+    );
+
+    // Only the one answered query was logged.
+    assert!(h.rx.try_recv().is_ok());
+    assert!(h.rx.try_recv().is_err());
+    assert_eq!(
+        (ctx.client_gate.dropped(), ctx.client_gate.refused()),
+        (1, 1)
+    );
 
     cleanup_sqlite(&h.db_path);
 }

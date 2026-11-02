@@ -74,6 +74,60 @@ pub fn normalize_client_key(s: &str) -> Option<String> {
     parse_mac(s).map(|mac| format_mac(&mac))
 }
 
+/// An address range: `192.168.1.0/24`, `fd00::/8`, or a single address (a
+/// bare IP is its own /32 or /128). IPv4-mapped IPv6 addresses are compared as
+/// the IPv4 they carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpNetwork {
+    addr: IpAddr,
+    prefix: u8,
+}
+
+impl IpNetwork {
+    /// Parse `addr[/prefix]`; `None` for anything else. Host bits below the
+    /// prefix are allowed and ignored (`192.168.1.7/24` is the /24).
+    pub fn parse(s: &str) -> Option<IpNetwork> {
+        let s = s.trim();
+        let (addr, prefix) = match s.split_once('/') {
+            Some((a, p)) => (a.trim(), Some(p.trim().parse::<u8>().ok()?)),
+            None => (s, None),
+        };
+        let addr = unmap_v4(parse_ip(addr)?);
+        let max = if addr.is_ipv4() { 32 } else { 128 };
+        let prefix = prefix.unwrap_or(max);
+        (prefix <= max).then_some(IpNetwork { addr, prefix })
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.addr, unmap_v4(ip)) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                let mask = u32::MAX
+                    .checked_shl(32 - u32::from(self.prefix))
+                    .unwrap_or(0);
+                u32::from(net) & mask == u32::from(ip) & mask
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                let mask = u128::MAX
+                    .checked_shl(128 - u32::from(self.prefix))
+                    .unwrap_or(0);
+                u128::from(net) & mask == u128::from(ip) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Display for IpNetwork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let max = if self.addr.is_ipv4() { 32 } else { 128 };
+        if self.prefix == max {
+            write!(f, "{}", self.addr)
+        } else {
+            write!(f, "{}/{}", self.addr, self.prefix)
+        }
+    }
+}
+
 /// Convert IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to plain IPv4.
 pub fn unmap_v4(ip: IpAddr) -> IpAddr {
     if let IpAddr::V6(v6) = ip
@@ -96,6 +150,35 @@ pub fn local_ipv4_for_internet() -> Option<Ipv4Addr> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn networks_parse_and_match() {
+        let lan = IpNetwork::parse("192.168.1.7/24").unwrap();
+        assert!(lan.contains("192.168.1.200".parse().unwrap()));
+        assert!(lan.contains("::ffff:192.168.1.5".parse().unwrap()));
+        assert!(!lan.contains("192.168.2.1".parse().unwrap()));
+        assert!(!lan.contains("fd00::1".parse().unwrap()));
+        assert_eq!(lan.to_string(), "192.168.1.7/24");
+
+        let host = IpNetwork::parse(" 10.0.0.5 ").unwrap();
+        assert!(host.contains("10.0.0.5".parse().unwrap()));
+        assert!(!host.contains("10.0.0.6".parse().unwrap()));
+        assert_eq!(host.to_string(), "10.0.0.5");
+
+        let ula = IpNetwork::parse("fd00::/8").unwrap();
+        assert!(ula.contains("fdab::1".parse().unwrap()));
+        assert!(!ula.contains("2001:db8::1".parse().unwrap()));
+
+        assert!(
+            IpNetwork::parse("0.0.0.0/0")
+                .unwrap()
+                .contains("8.8.8.8".parse().unwrap())
+        );
+        assert!(IpNetwork::parse("10.0.0.0/33").is_none());
+        assert!(IpNetwork::parse("not-an-ip").is_none());
+        assert!(IpNetwork::parse("10.0.0.0/x").is_none());
+    }
+
     use super::*;
 
     #[test]

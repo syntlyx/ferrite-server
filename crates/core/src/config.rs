@@ -179,6 +179,18 @@ pub struct DnsConfig {
     /// How long past its expiry an entry may still be served, in seconds.
     #[serde(default = "default_stale_max_age")]
     pub stale_max_age: u64,
+    /// Most queries one client may send per minute; past it the client is
+    /// answered REFUSED until it slows down. A burst of the whole minute's
+    /// budget is fine. `0` = no limit (the default). Loopback is never limited.
+    pub rate_limit: u32,
+    /// Answer only these clients — IPs or CIDR ranges such as
+    /// `192.168.1.0/24`. Empty = everyone. Loopback is always answered.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allowed_clients: Vec<String>,
+    /// Never answer these clients — their queries are dropped without a word.
+    /// Wins over `allowed_clients`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub denied_clients: Vec<String>,
 }
 
 /// Twelve hours: a night of a dead upstream, without answers growing old.
@@ -187,6 +199,25 @@ fn default_stale_max_age() -> u64 {
 }
 
 impl DnsConfig {
+    /// Trim the client lists and drop what isn't an address or a range — with
+    /// a warning, since an unreadable `allowed_clients` entry would otherwise
+    /// lock its client out without a trace.
+    pub fn normalize(&mut self) {
+        for (what, list) in [
+            ("allowed_clients", &mut self.allowed_clients),
+            ("denied_clients", &mut self.denied_clients),
+        ] {
+            list.retain_mut(|entry| {
+                *entry = entry.trim().to_string();
+                let ok = crate::net::IpNetwork::parse(entry).is_some();
+                if !ok && !entry.is_empty() {
+                    tracing::warn!("dns.{what}: ignoring '{entry}' — not an IP or a CIDR range");
+                }
+                ok
+            });
+        }
+    }
+
     /// The cache's stale window: `stale_max_age` when serving stale, else 0.
     pub fn stale_window(&self) -> u64 {
         if self.serve_stale {
@@ -845,6 +876,9 @@ impl Default for DnsConfig {
             dnssec: true,
             serve_stale: false,
             stale_max_age: default_stale_max_age(),
+            rate_limit: 0,
+            allowed_clients: vec![],
+            denied_clients: vec![],
         }
     }
 }
@@ -1075,6 +1109,7 @@ impl Config {
     pub fn normalize(&mut self) {
         self.api.normalize();
         self.panel.normalize();
+        self.dns.normalize();
         self.blocklist.normalize();
         self.migrate_whitelist();
         self.migrate_wildcard_block();

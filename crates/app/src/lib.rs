@@ -61,6 +61,8 @@ pub struct AppStateInner {
     pub record_switches: Arc<RecordSwitches>,
     /// Limits in-flight DNS queries to prevent memory exhaustion under slow upstream.
     pub query_semaphore: Arc<Semaphore>,
+    /// Client access lists and the per-client rate limit. Hot-patchable.
+    pub client_gate: Arc<ferrite_dns::gate::ClientGate>,
 }
 
 /// Cheaply-cloneable application state handle, backed by `Arc<AppStateInner>`.
@@ -207,6 +209,7 @@ impl AppState {
             client_ttl: Arc::clone(&self.inner.client_ttl),
             record_switches: Arc::clone(&self.inner.record_switches),
             query_semaphore: Arc::clone(&self.inner.query_semaphore),
+            client_gate: Arc::clone(&self.inner.client_gate),
             query_tx: self.query_tx.clone(),
         }
     }
@@ -490,6 +493,7 @@ impl AppState {
             panel_hosts: panel_hosts(config),
             log_ignore: Arc::new(RwLock::new(config.dns.log_ignore.clone())),
             client_ttl: Arc::new(AtomicU32::new(config.dns.client_ttl)),
+            client_gate: Arc::new(ferrite_dns::gate::ClientGate::new(&config.dns)),
             record_switches,
             query_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
         });

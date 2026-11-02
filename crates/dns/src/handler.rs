@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::cache::{DnsCache, STALE_ANSWER_TTL};
 use crate::ctx::DnsCtx;
+use crate::gate::Verdict;
 use crate::query::LazyQuery;
 use crate::safesearch;
 use crate::types::DnsResponse;
@@ -100,6 +101,16 @@ pub fn decide(raw: &[u8], src: SocketAddr, ctx: &Arc<DnsCtx>) -> Decision {
     // answer of ferrite's own (see `LazyQuery`) — the paths that just look the
     // name up and forward or serve bytes never decode anything.
     let query = LazyQuery::new(raw);
+
+    // ── Step 0: who is asking ─────────────────────────────────────────────
+    // A client outside the access lists gets nothing back — an answer of any
+    // kind would make ferrite an amplifier for whoever spoofs it. One over
+    // the rate limit gets REFUSED, which a well-behaved stub backs off from.
+    match ctx.client_gate.check(src.ip()) {
+        Verdict::Pass => {}
+        Verdict::Drop => return Decision::Drop,
+        Verdict::Refuse => return Decision::Answer(build_error(&query, ResponseCode::Refused)),
+    }
 
     if wire::opcode(raw) != Some(OPCODE_QUERY) {
         return Decision::Answer(build_servfail(&query));

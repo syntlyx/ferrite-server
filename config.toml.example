@@ -35,6 +35,14 @@ max_ttl = 3600
 # serve_stale = true
 # stale_max_age = 43200
 
+# Who may use this resolver, and how fast. A client over rate_limit (queries
+# per minute; a burst of the whole minute is fine) is answered REFUSED until it
+# slows down; 0 = no limit. allowed_clients / denied_clients take IPs and CIDR
+# ranges; a client outside them gets no answer at all. Loopback always passes.
+# rate_limit = 1000
+# allowed_clients = ["192.168.1.0/24", "fd00::/8"]
+# denied_clients  = ["192.168.1.66"]
+
 # Domains to suppress from the query log entirely (still resolved normally).
 # Exact names or wildcard suffixes. Useful for noisy local/private zones.
 # `fe.te` is ferrite's built-in panel domain and is ignored by default.

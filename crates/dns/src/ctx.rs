@@ -43,6 +43,8 @@ pub struct DnsCtx {
     pub record_switches: Arc<RecordSwitches>,
     /// Limits in-flight queries to prevent memory exhaustion under slow upstream.
     pub query_semaphore: Arc<Semaphore>,
+    /// Who may ask, and how fast — checked before anything else.
+    pub client_gate: Arc<crate::gate::ClientGate>,
     /// Sender side of the query pipeline (handler → stats writer).
     pub query_tx: mpsc::Sender<QueryEntry>,
 }

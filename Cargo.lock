@@ -883,6 +883,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "chrono",
+ "dashmap",
  "ferrite-blocklist",
  "ferrite-clients",
  "ferrite-core",

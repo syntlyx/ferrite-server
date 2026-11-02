@@ -14,7 +14,7 @@ use ferrite_app::AppState;
 use ferrite_core::config::{BlockAnswer, BlockResponse, UpstreamConfig, ZoneConfig};
 use ferrite_core::error::FeriteError;
 use ferrite_core::fsinfo;
-use ferrite_core::net::normalize_client_key;
+use ferrite_core::net::{IpNetwork, normalize_client_key};
 use ferrite_dns::cache::{MAX_STALE_AGE, MAX_TTL, MIN_TTL};
 
 /// GET /api/settings — return the current live configuration.
@@ -70,7 +70,8 @@ mod nullable {
 ///
 /// Hot-patchable (no restart): `api_key`, `password`, `dns_min_ttl`, `dns_max_ttl`,
 ///                             `dns_client_ttl`, `dns_serve_stale`,
-///                             `dns_stale_max_age`,
+///                             `dns_stale_max_age`, `dns_rate_limit`,
+///                             `dns_allowed_clients`, `dns_denied_clients`,
 ///                             `dns_log_ignore`, `web_dir`, `log_retention_days`,
 ///                             `log_max_mb`,
 ///                             `log_queries`, `keep_stats`,
@@ -97,6 +98,12 @@ pub struct SettingsPatch {
     pub dns_serve_stale: Option<bool>,
     /// Seconds an expired entry may still be served (60 … a week).
     pub dns_stale_max_age: Option<u64>,
+    /// Queries per client per minute; `0` = no limit.
+    pub dns_rate_limit: Option<u32>,
+    /// IPs / CIDR ranges allowed to query; empty = everyone.
+    pub dns_allowed_clients: Option<Vec<String>>,
+    /// IPs / CIDR ranges never answered.
+    pub dns_denied_clients: Option<Vec<String>>,
     pub dns_log_ignore: Option<Vec<String>>,
     #[serde(default, deserialize_with = "nullable::deserialize")]
     pub web_dir: Option<Option<PathBuf>>,
@@ -191,6 +198,8 @@ pub async fn update_settings(
     let mut keep_stats_to_apply: Option<bool> = None;
     let mut block_answer_to_apply: Option<BlockAnswer> = None;
     let mut stale_window_to_apply: Option<u64> = None;
+    let mut rate_limit_to_apply: Option<u32> = None;
+    let mut acl_to_apply: Option<(Vec<String>, Vec<String>)> = None;
 
     {
         let mut cfg = state.live_config.write();
@@ -212,6 +221,21 @@ pub async fn update_settings(
                 .blocklist_block_ipv6
                 .unwrap_or(cfg.blocklist.block_ipv6),
         });
+        let client_lists = [
+            ("dns_allowed_clients", &patch.dns_allowed_clients),
+            ("dns_denied_clients", &patch.dns_denied_clients),
+        ];
+        for (field, list) in client_lists {
+            if let Some(bad) = list
+                .iter()
+                .flatten()
+                .find(|e| !e.trim().is_empty() && IpNetwork::parse(e).is_none())
+            {
+                return Err(ApiError(FeriteError::Config(format!(
+                    "{field}: '{bad}' is not an IP address or a CIDR range"
+                ))));
+            }
+        }
         if let Some(age) = patch.dns_stale_max_age
             && !(60..=MAX_STALE_AGE).contains(&age)
         {
@@ -366,6 +390,32 @@ pub async fn update_settings(
             }
             stale_window_to_apply = Some(cfg.dns.stale_window());
             hot_changed.push("dns_serve_stale");
+        }
+
+        if let Some(limit) = patch.dns_rate_limit {
+            cfg.dns.rate_limit = limit;
+            rate_limit_to_apply = Some(limit);
+            hot_changed.push("dns_rate_limit");
+        }
+
+        if patch.dns_allowed_clients.is_some() || patch.dns_denied_clients.is_some() {
+            let tidy = |list: &Vec<String>| -> Vec<String> {
+                list.iter()
+                    .map(|e| e.trim().to_string())
+                    .filter(|e| !e.is_empty())
+                    .collect()
+            };
+            if let Some(list) = &patch.dns_allowed_clients {
+                cfg.dns.allowed_clients = tidy(list);
+            }
+            if let Some(list) = &patch.dns_denied_clients {
+                cfg.dns.denied_clients = tidy(list);
+            }
+            acl_to_apply = Some((
+                cfg.dns.allowed_clients.clone(),
+                cfg.dns.denied_clients.clone(),
+            ));
+            hot_changed.push("dns_client_access");
         }
 
         if let Some(answer) = block_answer {
@@ -597,6 +647,14 @@ pub async fn update_settings(
 
     if let Some(window) = stale_window_to_apply {
         state.inner.dns_cache.set_stale_window(window);
+    }
+
+    if let Some(limit) = rate_limit_to_apply {
+        state.inner.client_gate.set_rate_limit(limit);
+    }
+
+    if let Some((allowed, denied)) = acl_to_apply {
+        state.inner.client_gate.set_acl(&allowed, &denied);
     }
 
     // RUST_LOG, when set, owns the filter — don't let the toggle fight it.

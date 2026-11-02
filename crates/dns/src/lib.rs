@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod ctx;
 pub mod custom;
+pub mod gate;
 pub mod handler;
 pub mod intercept;
 pub mod query;

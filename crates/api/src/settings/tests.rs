@@ -669,3 +669,47 @@ async fn block_response_applies_live_and_custom_ip_needs_an_address() {
     drop(state);
     test_support::cleanup_sqlite(&db_path);
 }
+
+#[tokio::test]
+async fn client_access_and_rate_limit_apply_live_and_reject_junk() {
+    let (state, db_path, _config_path) =
+        test_support::app_state_with_config_path("settings-client-gate").await;
+
+    let err = update_settings(
+        State(state.clone()),
+        axum::http::HeaderMap::new(),
+        Json(SettingsPatch {
+            dns_allowed_clients: Some(vec!["192.168.1.0/24".into(), "lan".into()]),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.0.to_string().contains("'lan'"));
+    assert!(state.live_config.read().dns.allowed_clients.is_empty());
+
+    let Json(_) = update_settings(
+        State(state.clone()),
+        axum::http::HeaderMap::new(),
+        Json(SettingsPatch {
+            dns_rate_limit: Some(600),
+            dns_allowed_clients: Some(vec![" 192.168.1.0/24 ".into(), "".into()]),
+            dns_denied_clients: Some(vec!["192.168.1.66".into()]),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let dns = state.live_config.read().dns.clone();
+    assert_eq!(dns.rate_limit, 600);
+    assert_eq!(dns.allowed_clients, vec!["192.168.1.0/24".to_string()]);
+    let gate = &state.inner.client_gate;
+    assert_eq!(gate.rate_limit(), 600);
+    use ferrite_dns::gate::Verdict;
+    assert_eq!(gate.check("192.168.1.9".parse().unwrap()), Verdict::Pass);
+    assert_eq!(gate.check("192.168.1.66".parse().unwrap()), Verdict::Drop);
+    assert_eq!(gate.check("10.0.0.1".parse().unwrap()), Verdict::Drop);
+
+    drop(state);
+    test_support::cleanup_sqlite(&db_path);
+}
