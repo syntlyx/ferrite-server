@@ -460,3 +460,37 @@ domains = [
 # [mcp]
 # enabled       = true
 # allow_changes = false
+
+# ── DHCP (hand out addresses, with ferrite as everyone's DNS) ────────────────
+# For routers that won't let you change the DNS they hand out. A network takes
+# one DHCP server: switch off the router's when you switch this on. Blank
+# values are detected — this box's address, the router, the subnet. Every
+# lease names its device in ferrite and answers as <name>.<domain>. Applies
+# without a restart; never synced to a secondary.
+#
+# [dhcp]
+# enabled     = true
+# pool_start  = "192.168.1.100"
+# pool_end    = "192.168.1.199"
+# subnet_mask = "255.255.255.0"
+# gateway     = "192.168.1.1"     # blank: the router this box uses
+# dns         = []                # blank: this box
+# domain      = "lan"
+# lease_secs  = 86400
+#
+# [[dhcp.reservations]]
+# mac  = "aa:bb:cc:dd:ee:ff"
+# ip   = "192.168.1.20"
+# name = "nas"
+
+# ── IPv6 DNS announcements ────────────────────────────────────────────────────
+# Router advertisements naming this box the DNS server, so IPv6 devices don't
+# go around it through the router's IPv6 DNS. DNS only: ferrite never offers
+# itself as the router. Needs CAP_NET_RAW. Blank values are detected.
+#
+# [ra]
+# enabled        = true
+# interface      = "eth0"
+# rdnss          = ["fd00::10"]
+# rdnss_lifetime = 1800
+# interval_secs  = 200
