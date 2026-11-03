@@ -67,4 +67,10 @@ impl BlocklistCache {
     pub fn clear(&self) {
         self.inner.lock().clear();
     }
+
+    /// Change the capacity while serving; shrinking drops the coldest first.
+    pub fn resize(&self, capacity: usize) {
+        let cap = NonZeroUsize::new(capacity.max(1)).unwrap();
+        self.inner.lock().resize(cap);
+    }
 }

@@ -55,7 +55,9 @@ pub(super) async fn dispatch(mut stream: TcpStream, state: AppState, router: Rou
     // A non-panel host is routed by the proxy (when enabled); everything else —
     // panel hosts, no-Host requests, proxy disabled — is served the panel.
     match host {
-        Some(h) if state.inner.proxy.is_enabled() && !state.inner.panel_hosts.contains(&h) => {
+        Some(h)
+            if state.inner.proxy.is_enabled() && !state.inner.panel_hosts.load().contains(&h) =>
+        {
             ferrite_proxy::forward_http(state.proxy_ctx(), stream, buf, h).await;
         }
         _ => serve_panel(stream, buf, router).await,

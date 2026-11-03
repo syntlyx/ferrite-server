@@ -946,6 +946,11 @@ impl Blocklist {
     }
 
     /// Decision-cache entry count (memory introspection).
+    /// Resize the network-wide decision cache while serving.
+    pub fn set_decision_cache_size(&self, entries: usize) {
+        self.cache.resize(entries);
+    }
+
     pub fn decision_cache_entries(&self) -> usize {
         self.cache.entries()
     }

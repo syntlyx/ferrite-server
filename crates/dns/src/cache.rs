@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use lru::LruCache;
@@ -96,8 +96,8 @@ impl Inner {
 /// by total bytes.
 pub struct DnsCache {
     inner: RwLock<Inner>,
-    /// Byte budget across all entries; `usize::MAX` = unbounded.
-    max_bytes: usize,
+    /// Byte budget across all entries; `usize::MAX` = unbounded. Hot-patchable.
+    max_bytes: AtomicUsize,
     ttl_bounds: RwLock<TtlBounds>,
     /// How long past expiry an entry is still kept and served (seconds);
     /// `0` turns the optimistic cache off. Hot-patchable.
@@ -105,6 +105,15 @@ pub struct DnsCache {
     /// Keys being refreshed in the background, so a burst of stale hits on
     /// one name sends one upstream query, not one per hit.
     refreshing: Mutex<HashSet<String>>,
+}
+
+/// `0` means no byte bound.
+fn byte_budget(max_bytes: usize) -> usize {
+    if max_bytes == 0 {
+        usize::MAX
+    } else {
+        max_bytes
+    }
 }
 
 impl DnsCache {
@@ -116,11 +125,7 @@ impl DnsCache {
                 lru: LruCache::new(cap),
                 total_bytes: 0,
             }),
-            max_bytes: if max_bytes == 0 {
-                usize::MAX
-            } else {
-                max_bytes
-            },
+            max_bytes: AtomicUsize::new(byte_budget(max_bytes)),
             ttl_bounds: RwLock::new(normalize_ttl_bounds(min_ttl, max_ttl)),
             stale_window: AtomicU64::new(0),
             refreshing: Mutex::new(HashSet::new()),
@@ -291,7 +296,9 @@ impl DnsCache {
             response,
             expires_at: Instant::now() + Duration::from_secs(clamped),
         };
-        self.inner.write().put(key, entry, self.max_bytes);
+        self.inner
+            .write()
+            .put(key, entry, self.max_bytes.load(Ordering::Relaxed));
     }
 
     /// Update the TTL clamp used for future cache inserts.
@@ -373,6 +380,46 @@ impl DnsCache {
         guard.total_bytes = 0;
     }
 
+    /// Change how many entries and how many bytes the cache holds, while it
+    /// serves. Shrinking drops the coldest entries first; the hot ones stay.
+    /// `max_bytes == 0` lifts the byte bound.
+    pub fn resize(&self, capacity: usize, max_bytes: usize) {
+        let budget = byte_budget(max_bytes);
+        self.max_bytes.store(budget, Ordering::Relaxed);
+        let mut guard = self.inner.write();
+        let inner = &mut *guard;
+        let cap = NonZeroUsize::new(capacity.max(1)).unwrap();
+        while inner.lru.len() > cap.get() {
+            match inner.lru.pop_lru() {
+                Some((k, v)) => inner.total_bytes -= entry_cost(&k, &v),
+                None => break,
+            }
+        }
+        inner.lru.resize(cap);
+        while inner.total_bytes > budget && inner.lru.len() > 1 {
+            match inner.lru.pop_lru() {
+                Some((k, v)) => inner.total_bytes -= entry_cost(&k, &v),
+                None => break,
+            }
+        }
+    }
+
+    /// Drop every cached answer for `name` (all record types, signed or not),
+    /// so a local record that changed is asked afresh.
+    pub fn forget_name(&self, name: &str) {
+        let prefix = format!("{}/", name.trim_end_matches('.').to_ascii_lowercase());
+        let mut guard = self.inner.write();
+        let keys: Vec<String> = guard
+            .lru
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in keys {
+            guard.pop(&k);
+        }
+    }
+
     /// Export all non-expired entries for snapshotting.
     pub fn snapshot(&self) -> Vec<(String, DnsResponse, std::time::Instant)> {
         let now = std::time::Instant::now();
@@ -405,7 +452,7 @@ impl DnsCache {
                 response: DnsResponse { bytes, ttl },
                 expires_at,
             };
-            guard.put(key, entry, self.max_bytes);
+            guard.put(key, entry, self.max_bytes.load(Ordering::Relaxed));
         }
     }
 }
@@ -455,6 +502,59 @@ mod tests {
                 bytes: bytes::Bytes::from_static(b"x"),
                 ttl: 0,
             },
+        );
+    }
+
+    fn put(cache: &DnsCache, name: &str, qtype: u16) {
+        cache.insert(
+            name,
+            qtype,
+            false,
+            DnsResponse {
+                bytes: bytes::Bytes::from_static(b"answer"),
+                ttl: 300,
+            },
+        );
+    }
+
+    #[test]
+    fn resize_keeps_the_hottest_entries() {
+        let cache = DnsCache::new(8, 0, 0, 3600);
+        for n in 0..8 {
+            put(&cache, &format!("n{n}.test"), 1);
+        }
+        // Reads peek and leave the order alone; a fresh insert is what makes
+        // an entry recent, so store n0 again.
+        put(&cache, "n0.test", 1);
+        cache.resize(2, 0);
+        assert!(
+            cache.get_with_remaining("n0.test", 1, false).is_some(),
+            "hot entry kept"
+        );
+        assert!(
+            cache.get_with_remaining("n1.test", 1, false).is_none(),
+            "cold entry dropped"
+        );
+        // Growing again leaves room for more.
+        cache.resize(16, 0);
+        for n in 0..10 {
+            put(&cache, &format!("m{n}.test"), 1);
+        }
+        assert!(cache.get_with_remaining("m0.test", 1, false).is_some());
+    }
+
+    #[test]
+    fn forget_name_drops_every_type_of_that_name_only() {
+        let cache = DnsCache::new(16, 0, 0, 3600);
+        put(&cache, "fe.te", 1);
+        put(&cache, "fe.te", 28);
+        put(&cache, "x.fe.te", 1);
+        cache.forget_name("FE.te.");
+        assert!(cache.get_with_remaining("fe.te", 1, false).is_none());
+        assert!(cache.get_with_remaining("fe.te", 28, false).is_none());
+        assert!(
+            cache.get_with_remaining("x.fe.te", 1, false).is_some(),
+            "a subdomain is another name"
         );
     }
 

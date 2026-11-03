@@ -3,7 +3,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use std::sync::Arc;
+
 use axum::{Json, extract::State, http::HeaderMap};
+use ferrite_upstream::{UpstreamPool, ZoneRouter};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -83,13 +86,12 @@ pub(crate) mod nullable {
 ///                             `blocklist_block_response`, `blocklist_block_ipv4`,
 ///                             `blocklist_block_ipv6`, `debug_logging`,
 ///                             `dns_strip_ecs`, `dns_dnssec`, `dns_firefox_canary`,
-///                             `dns_block_private_relay`, `dns_strip_ech`.
-/// Restart-required:           `storage_backend`, `storage_path`,
-///                             `blocklist_cache_dir`,
-///                             `dns_bind_addr`, `dns_cache_size`, `dns_cache_max_mb`,
-///                             `api_bind_addr`,
-///                             `blocklist_decision_cache_size`, `upstream`, `zones`,
+///                             `dns_block_private_relay`, `dns_strip_ech`,
+///                             `upstream`, `zones`, `dns_cache_size`,
+///                             `dns_cache_max_mb`, `blocklist_decision_cache_size`,
 ///                             `panel_enabled`, `panel_domain`, `panel_ipv4`, `panel_url`.
+/// Restart-required:           `storage_backend`, `storage_path`,
+///                             `blocklist_cache_dir`, `dns_bind_addr`, `api_bind_addr`.
 #[derive(Debug, Deserialize, Default)]
 pub struct SettingsPatch {
     // ── Hot-patchable ────────────────────────────────────────────────────────
@@ -207,6 +209,13 @@ pub async fn update_settings(
     let mut blocklist_client_bypass_to_apply: Option<Vec<String>> = None;
     let mut debug_logging_to_apply: Option<bool> = None;
     let mut dns_switches_changed = false;
+    // Rebuilt upstream pool, validated inside the lock, swapped in after it.
+    let mut routes_to_apply: Option<Arc<UpstreamPool>> = None;
+    let mut dns_cache_changed = false;
+    let mut decision_cache_to_apply: Option<usize> = None;
+    let mut panel_changed = false;
+    // The panel shortcut as it was, so its old name can leave the cache.
+    let previous_cfg = state.live_config.read().clone();
     let mut log_queries_to_apply: Option<bool> = None;
     let mut keep_stats_to_apply: Option<bool> = None;
     let mut block_answer_to_apply: Option<BlockAnswer> = None;
@@ -492,12 +501,14 @@ pub async fn update_settings(
 
         if let Some(size) = patch.dns_cache_size {
             cfg.dns.cache_size = size;
-            restart_changed.push("dns_cache_size");
+            hot_changed.push("dns_cache_size");
+            dns_cache_changed = true;
         }
 
         if let Some(mb) = patch.dns_cache_max_mb {
             cfg.dns.cache_max_mb = mb;
-            restart_changed.push("dns_cache_max_mb");
+            hot_changed.push("dns_cache_max_mb");
+            dns_cache_changed = true;
         }
 
         // The per-query switches: stored here, handed to the pipeline below.
@@ -531,7 +542,8 @@ pub async fn update_settings(
                 )));
             }
             cfg.blocklist.decision_cache_size = size;
-            restart_changed.push("blocklist_decision_cache_size");
+            hot_changed.push("blocklist_decision_cache_size");
+            decision_cache_to_apply = Some(size);
         }
 
         if let Some(ref addr) = patch.api_bind_addr {
@@ -544,24 +556,38 @@ pub async fn update_settings(
             restart_changed.push("api_bind_addr");
         }
 
-        if let Some(upstreams) = patch.upstream {
-            if upstreams.is_empty() {
+        // Upstreams and zones are built in full here, so a bad one is refused
+        // before anything changes; the running pool is swapped after the lock.
+        if patch.upstream.is_some() || patch.zones.is_some() {
+            let upstream = patch
+                .upstream
+                .clone()
+                .unwrap_or_else(|| cfg.upstream.clone());
+            let zones = patch.zones.clone().unwrap_or_else(|| cfg.zones.clone());
+            if upstream.is_empty() {
                 return Err(ApiError(FeriteError::Config(
                     "upstream list cannot be empty".into(),
                 )));
             }
-            cfg.upstream = upstreams;
-            restart_changed.push("upstream");
-        }
-
-        if let Some(zones) = patch.zones {
+            let pool =
+                UpstreamPool::from_config(&upstream, Arc::clone(&state.inner.upstream_proxy))
+                    .map_err(ApiError)?;
+            ZoneRouter::new(&zones, Arc::clone(&pool)).map_err(ApiError)?;
+            if patch.upstream.is_some() {
+                hot_changed.push("upstream");
+            }
+            if patch.zones.is_some() {
+                hot_changed.push("zones");
+            }
+            cfg.upstream = upstream;
             cfg.zones = zones;
-            restart_changed.push("zones");
+            routes_to_apply = Some(pool);
         }
 
         if let Some(enabled) = patch.panel_enabled {
             cfg.panel.enabled = enabled;
-            restart_changed.push("panel_enabled");
+            hot_changed.push("panel_enabled");
+            panel_changed = true;
         }
 
         if let Some(ref domain) = patch.panel_domain {
@@ -572,12 +598,14 @@ pub async fn update_settings(
                 )));
             }
             cfg.panel.domain = domain.to_ascii_lowercase();
-            restart_changed.push("panel_domain");
+            hot_changed.push("panel_domain");
+            panel_changed = true;
         }
 
         if let Some(ipv4) = patch.panel_ipv4 {
             cfg.panel.ipv4 = ipv4;
-            restart_changed.push("panel_ipv4");
+            hot_changed.push("panel_ipv4");
+            panel_changed = true;
         }
 
         if let Some(url) = patch.panel_url {
@@ -593,7 +621,7 @@ pub async fn update_settings(
                 }
                 None => None,
             };
-            restart_changed.push("panel_url");
+            hot_changed.push("panel_url");
         }
     }
 
@@ -603,6 +631,32 @@ pub async fn update_settings(
 
     if let Some((min, max)) = ttl_bounds_to_apply {
         state.inner.dns_cache.set_ttl_bounds(min, max);
+    }
+
+    if let Some(pool) = routes_to_apply {
+        let zones = state.live_config.read().zones.clone();
+        state
+            .inner
+            .upstream_pool
+            .replace(&zones, pool)
+            .map_err(ApiError)?;
+    }
+
+    if dns_cache_changed {
+        let dns = state.live_config.read().dns.clone();
+        state
+            .inner
+            .dns_cache
+            .resize(dns.cache_size, dns.cache_max_mb.saturating_mul(1024 * 1024));
+    }
+
+    if let Some(entries) = decision_cache_to_apply {
+        state.inner.blocklist.set_decision_cache_size(entries);
+    }
+
+    if panel_changed {
+        let cfg = state.live_config.read().clone();
+        state.apply_panel(&previous_cfg, &cfg);
     }
 
     if dns_switches_changed {

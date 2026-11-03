@@ -713,3 +713,57 @@ async fn client_access_and_rate_limit_apply_live_and_reject_junk() {
     drop(state);
     test_support::cleanup_sqlite(&db_path);
 }
+
+/// Upstreams, zones, cache sizes and the panel shortcut apply without a
+/// restart; a zone that doesn't parse is refused and changes nothing.
+#[tokio::test]
+async fn upstreams_zones_caches_and_panel_apply_live() {
+    use ferrite_core::config::{UpstreamConfig, ZoneConfig};
+    let (state, db_path, _config_path) =
+        test_support::app_state_with_config_path("settings-live-upstreams").await;
+
+    let err = update_settings(
+        State(state.clone()),
+        axum::http::HeaderMap::new(),
+        Json(SettingsPatch {
+            zones: Some(vec![ZoneConfig {
+                name: "lan".into(),
+                upstream: "not-an-address".into(),
+            }]),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.0.to_string().contains("lan"));
+    assert!(state.live_config.read().zones.is_empty(), "nothing changed");
+
+    let Json(resp) = update_settings(
+        State(state.clone()),
+        axum::http::HeaderMap::new(),
+        Json(SettingsPatch {
+            upstream: Some(vec![UpstreamConfig::Plain {
+                address: "192.0.2.53".into(),
+                port: 53,
+                egress: None,
+            }]),
+            zones: Some(vec![ZoneConfig {
+                name: "lan".into(),
+                upstream: "192.168.1.1:53".into(),
+            }]),
+            dns_cache_size: Some(64),
+            blocklist_decision_cache_size: Some(128),
+            panel_domain: Some("panel.home".into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp["restart_required"], json!(false), "{resp}");
+    assert_eq!(state.live_config.read().zones.len(), 1);
+    assert!(state.inner.panel_hosts.load().contains("panel.home"));
+    assert!(!state.inner.panel_hosts.load().contains("fe.te"));
+
+    drop(state);
+    test_support::cleanup_sqlite(&db_path);
+}

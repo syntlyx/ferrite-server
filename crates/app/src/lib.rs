@@ -52,7 +52,11 @@ pub struct AppStateInner {
     pub proxy: Arc<ferrite_proxy::ProxyState>,
     /// Host names that resolve to the local admin panel. The shared HTTP listener
     /// serves the panel for these and hands everything else to the proxy.
-    pub panel_hosts: std::collections::HashSet<String>,
+    /// Swapped when the panel shortcut changes ([`AppState::apply_panel`]).
+    pub panel_hosts: arc_swap::ArcSwap<std::collections::HashSet<String>>,
+    /// The late-bound proxy handle the upstream pool tunnels through; kept so
+    /// the pool can be rebuilt live when the upstreams change.
+    pub upstream_proxy: ferrite_upstream::ProxyHandle,
     /// Hot-patchable list of domain patterns to suppress from the query log.
     pub log_ignore: Arc<RwLock<Vec<String>>>,
     /// Hot-patchable ceiling on the TTL handed to client devices (seconds).
@@ -195,6 +199,17 @@ impl AppState {
             cache: Arc::clone(&self.update_check_cache),
             live_config: Arc::clone(&self.live_config),
         }
+    }
+
+    /// Point the panel shortcut at `config`'s settings while running: the
+    /// built-in DNS record, the host names the shared HTTP listener serves the
+    /// panel for, and any cached answer for the old or new name.
+    pub fn apply_panel(&self, previous: &Config, config: &Config) {
+        let records = builtin_panel_records(config);
+        self.inner.custom_records.load_builtin(&records);
+        self.inner.panel_hosts.store(Arc::new(panel_hosts(config)));
+        self.inner.dns_cache.forget_name(&panel_domain(previous));
+        self.inner.dns_cache.forget_name(&panel_domain(config));
     }
 
     /// The slice of state the DNS pipeline consumes (UDP/TCP servers + the
@@ -485,6 +500,7 @@ impl AppState {
         // a few lines above.)
         let connector = Arc::clone(&proxy);
         let _ = proxy_handle.set(connector);
+        let upstream_proxy = Arc::clone(&proxy_handle);
 
         // Query channel
         let (query_tx, query_rx) = mpsc::channel(QUERY_CHANNEL_CAPACITY);
@@ -501,7 +517,8 @@ impl AppState {
             custom_records,
             client_registry,
             proxy,
-            panel_hosts: panel_hosts(config),
+            panel_hosts: arc_swap::ArcSwap::from_pointee(panel_hosts(config)),
+            upstream_proxy,
             log_ignore: Arc::new(RwLock::new(config.dns.log_ignore.clone())),
             client_ttl: Arc::new(AtomicU32::new(config.dns.client_ttl)),
             dns_switches: ferrite_dns::switches::DnsSwitches::new(&config.dns),
