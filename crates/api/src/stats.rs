@@ -21,6 +21,8 @@ use ferrite_core::types::{QueryEntry, QueryStatus};
 pub struct TopClientEntry {
     pub name: String,
     pub total: u64,
+    /// How many of `total` were blocked.
+    pub blocked: u64,
     pub ips: Vec<String>,
     pub macs: Vec<String>,
 }
@@ -72,6 +74,7 @@ pub async fn get_summary(State(state): State<AppState>) -> Result<Json<SummaryRe
     let top_clients = {
         struct Agg {
             total: u64,
+            blocked: u64,
             ips: Vec<String>,
             macs: Vec<String>,
         }
@@ -82,10 +85,12 @@ pub async fn get_summary(State(state): State<AppState>) -> Result<Json<SummaryRe
             let name = info.name.unwrap_or_else(|| device.clone());
             let agg = by_name.entry(name).or_insert(Agg {
                 total: 0,
+                blocked: 0,
                 ips: vec![],
                 macs: vec![],
             });
             agg.total += count;
+            agg.blocked += live.client_blocked.get(&device);
             for ip in info.ips {
                 push_unique(&mut agg.ips, ip);
             }
@@ -98,6 +103,7 @@ pub async fn get_summary(State(state): State<AppState>) -> Result<Json<SummaryRe
             .map(|(name, agg)| TopClientEntry {
                 name,
                 total: agg.total,
+                blocked: agg.blocked,
                 ips: agg.ips,
                 macs: agg.macs,
             })
@@ -206,6 +212,7 @@ pub async fn get_top_clients(
         .await?;
     struct Agg {
         total: u64,
+        blocked: u64,
         ips: Vec<String>,
         macs: Vec<String>,
     }
@@ -216,10 +223,12 @@ pub async fn get_top_clients(
         let name = info.name.unwrap_or_else(|| cs.device.clone());
         let agg = by_name.entry(name).or_insert(Agg {
             total: 0,
+            blocked: 0,
             ips: vec![],
             macs: vec![],
         });
         agg.total += cs.total;
+        agg.blocked += cs.blocked;
         for ip in info.ips {
             push_unique(&mut agg.ips, ip);
         }
@@ -232,6 +241,7 @@ pub async fn get_top_clients(
         .map(|(name, agg)| TopClientEntry {
             name,
             total: agg.total,
+            blocked: agg.blocked,
             ips: agg.ips,
             macs: agg.macs,
         })

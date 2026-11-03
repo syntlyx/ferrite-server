@@ -63,6 +63,11 @@ impl TopNCounter {
         out
     }
 
+    /// The count for one key; 0 when it isn't tracked.
+    pub fn get(&self, key: &str) -> u64 {
+        self.counts.lock().get(key).copied().unwrap_or(0)
+    }
+
     /// Seed with pre-computed counts from persistent storage (called once at startup).
     pub fn seed(&self, entries: &[(String, u64)]) {
         let mut map = self.counts.lock();

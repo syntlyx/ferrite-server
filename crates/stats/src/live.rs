@@ -28,6 +28,9 @@ pub struct LiveStats {
     pub top_blocked: TopNCounter,
     /// Top clients by IP.
     pub top_clients: TopNCounter,
+    /// Blocked queries per client, keyed like `top_clients`, so the summary
+    /// can say how much of each busy device's traffic was stopped.
+    pub client_blocked: TopNCounter,
     /// Ring buffer of recent queries — source for both the live query log
     /// and the recent_domains / recent_blocked slices in the summary.
     pub recent_queries: QueryRingBuffer,
@@ -48,6 +51,7 @@ impl LiveStats {
             top_domains: TopNCounter::new(10_000),
             top_blocked: TopNCounter::new(10_000),
             top_clients: TopNCounter::new(1_000),
+            client_blocked: TopNCounter::new(1_000),
             recent_queries: QueryRingBuffer::new(2_000),
             timeseries: InMemoryTimeseries::new(),
         })
@@ -108,6 +112,9 @@ impl LiveStats {
                 &entry.device
             };
             self.top_clients.increment(device_key);
+            if status == QueryStatus::Blocked {
+                self.client_blocked.increment(device_key);
+            }
             self.timeseries
                 .increment(entry.timestamp.timestamp() as u64, status);
         }
@@ -135,6 +142,7 @@ impl LiveStats {
         self.top_domains.clear();
         self.top_blocked.clear();
         self.top_clients.clear();
+        self.client_blocked.clear();
         self.timeseries.clear();
     }
 
@@ -218,6 +226,27 @@ mod tests {
         assert_eq!(live.top_clients.top(10)[0].0, "aa:bb:cc:dd:ee:ff");
         assert_eq!(live.recent_queries.recent(10).len(), 1);
         assert!(live.timeseries.buckets_24h().iter().any(|b| b.total > 0));
+    }
+
+    /// A device's blocked count rises with its blocked queries only, and goes
+    /// with the rest of the statistics when they are forgotten.
+    #[test]
+    fn blocked_queries_count_per_device() {
+        let live = LiveStats::new();
+        let switches = ferrite_core::recording::RecordSwitches::new(RecordScope::ALL);
+        let device = "aa:bb:cc:dd:ee:ff";
+        live.push_entry(&entry("ads.test"), &switches);
+        live.push_entry(
+            &QueryEntry {
+                status: QueryStatus::Upstream,
+                ..entry("ok.test")
+            },
+            &switches,
+        );
+        assert_eq!(live.top_clients.get(device), 2);
+        assert_eq!(live.client_blocked.get(device), 1);
+        live.forget_history();
+        assert_eq!(live.client_blocked.get(device), 0);
     }
 
     #[test]

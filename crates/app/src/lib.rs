@@ -376,9 +376,12 @@ impl AppState {
             match storage.top_clients(all_time_from_ts, now_ts, 500).await {
                 Ok(rows) => {
                     tracing::info!("seeded top_clients with {} entries", rows.len());
+                    let blocked: Vec<(String, u64)> =
+                        rows.iter().map(|c| (c.device.clone(), c.blocked)).collect();
                     let pairs: Vec<(String, u64)> =
                         rows.into_iter().map(|c| (c.device, c.total)).collect();
                     live_stats.top_clients.seed(&pairs);
+                    live_stats.client_blocked.seed(&blocked);
                 }
                 Err(e) => tracing::warn!("failed to seed top_clients: {}", e),
             }
