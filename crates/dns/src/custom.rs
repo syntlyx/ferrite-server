@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use hickory_proto::op::{Message, OpCode, ResponseCode};
-use hickory_proto::rr::rdata::{A, AAAA, CNAME};
+use hickory_proto::rr::rdata::{A, AAAA, CNAME, PTR};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinEncodable;
 use parking_lot::RwLock;
@@ -32,6 +32,9 @@ pub struct CustomRecord {
 pub struct CustomRecords {
     records: RwLock<Vec<CustomRecord>>,
     builtin_records: RwLock<Vec<CustomRecord>>,
+    /// Names from ferrite's own DHCP leases, forward and reverse. Last in line:
+    /// anything the operator wrote, or the panel shortcut, wins over them.
+    lease_records: RwLock<Vec<CustomRecord>>,
 }
 
 impl CustomRecords {
@@ -39,6 +42,7 @@ impl CustomRecords {
         Arc::new(Self {
             records: RwLock::new(Vec::new()),
             builtin_records: RwLock::new(Vec::new()),
+            lease_records: RwLock::new(Vec::new()),
         })
     }
 
@@ -64,6 +68,37 @@ impl CustomRecords {
                 Err(e) => tracing::warn!("invalid built-in record {:?}: {}", cfg.domain, e),
             }
         }
+    }
+
+    /// Answer for the devices ferrite's DHCP server leased to: `name` → `ip`
+    /// (an A record) and `ip` → `name` (a PTR), for every pair. Replaces the
+    /// previous set; names are already fully qualified (`laptop.lan`).
+    pub fn load_leases(&self, leases: &[(String, Ipv4Addr)], ttl: u32) {
+        let mut out = Vec::with_capacity(leases.len() * 2);
+        for (name, ip) in leases {
+            let domain = normalise(name);
+            let Ok(target) = Name::from_str(&format!("{domain}.")) else {
+                continue;
+            };
+            let [a, b, c, d] = ip.octets();
+            out.push(CustomRecord {
+                domain: domain.clone(),
+                is_wildcard: false,
+                wildcard_suffix: String::new(),
+                record_type: RecordType::A,
+                rdata: RData::A(A(*ip)),
+                ttl,
+            });
+            out.push(CustomRecord {
+                domain: format!("{d}.{c}.{b}.{a}.in-addr.arpa"),
+                is_wildcard: false,
+                wildcard_suffix: String::new(),
+                record_type: RecordType::PTR,
+                rdata: RData::PTR(PTR(target)),
+                ttl,
+            });
+        }
+        *self.lease_records.write() = out;
     }
 
     /// Add a record at runtime.
@@ -119,9 +154,15 @@ impl CustomRecords {
             }
         }
 
-        let builtin_records = self.builtin_records.read();
-        let record = find_record(&builtin_records, name, want_type)?;
+        {
+            let builtin_records = self.builtin_records.read();
+            if let Some(record) = find_record(&builtin_records, name, want_type) {
+                return build_response(query.message()?, name, record);
+            }
+        }
 
+        let lease_records = self.lease_records.read();
+        let record = find_record(&lease_records, name, want_type)?;
         build_response(query.message()?, name, record)
     }
 }
@@ -300,6 +341,53 @@ mod tests {
         assert_eq!(
             resp.map(|r| answer_a(&r)),
             Some("192.168.1.10".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn lease_names_answer_forward_and_reverse_and_yield_to_the_operator() {
+        let records = CustomRecords::new();
+        records.load_leases(
+            &[("laptop.lan".into(), "192.168.1.50".parse().unwrap())],
+            60,
+        );
+
+        let a = records
+            .lookup(
+                &LazyQuery::new(&query("laptop.lan", RecordType::A)),
+                "laptop.lan",
+                1,
+            )
+            .unwrap();
+        assert_eq!(answer_a(&a), "192.168.1.50".parse::<Ipv4Addr>().unwrap());
+
+        let rev = "50.1.168.192.in-addr.arpa";
+        let ptr = records
+            .lookup(&LazyQuery::new(&query(rev, RecordType::PTR)), rev, 12)
+            .unwrap();
+        let msg = Message::from_bytes(&ptr.bytes).unwrap();
+        match &msg.answers[0].data {
+            RData::PTR(name) => assert_eq!(name.0.to_string(), "laptop.lan."),
+            other => panic!("expected PTR, got {other:?}"),
+        }
+
+        // A record the operator wrote for the same name wins.
+        records.add(&cfg("laptop.lan", "A", "10.0.0.9")).unwrap();
+        let a = records
+            .lookup(
+                &LazyQuery::new(&query("laptop.lan", RecordType::A)),
+                "laptop.lan",
+                1,
+            )
+            .unwrap();
+        assert_eq!(answer_a(&a), "10.0.0.9".parse::<Ipv4Addr>().unwrap());
+
+        // And a new lease set replaces the old one.
+        records.load_leases(&[], 60);
+        assert!(
+            records
+                .lookup(&LazyQuery::new(&query(rev, RecordType::PTR)), rev, 12)
+                .is_none()
         );
     }
 

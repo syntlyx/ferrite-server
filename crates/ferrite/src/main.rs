@@ -246,6 +246,21 @@ async fn run() -> anyhow::Result<()> {
     // Following a primary ferrite, when `[sync]` names one.
     tokio::spawn(ferrite_api::sync::run(state.clone()));
 
+    // DHCP server and IPv6 DNS announcer — both off unless switched on; the
+    // settings API reconfigures them live after this.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let (dhcp, ra) = {
+                let cfg = state.live_config.read();
+                (cfg.dhcp.clone(), cfg.ra.clone())
+            };
+            if dhcp.enabled || ra.enabled {
+                state.inner.dhcp.apply(&dhcp, &ra).await;
+            }
+        });
+    }
+
     // ── Selective routing / proxy ─────────────────────────────────────────────
     // Detached (not in the try_join! below) so a listener bind failure — :80/:443
     // already in use, or no privilege to bind them — degrades gracefully instead

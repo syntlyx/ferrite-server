@@ -3,6 +3,7 @@ pub mod backup;
 pub mod blocklist;
 pub mod clients;
 pub mod custom_records;
+pub mod dhcp;
 pub mod error;
 pub mod import;
 mod ingress;
@@ -124,6 +125,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/config/export", get(backup::export_config))
         .route("/config/import", post(backup::import_config))
         // Follow a primary ferrite
+        .route("/dhcp", get(dhcp::get_dhcp).put(dhcp::put_dhcp))
+        .route("/dhcp/leases", get(dhcp::get_leases))
         .route("/sync", get(sync::get_sync).put(sync::put_sync))
         .route("/sync/now", post(sync::sync_now))
         // Bring a Pi-hole or AdGuard Home setup over (a Teleporter archive

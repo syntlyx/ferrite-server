@@ -170,8 +170,113 @@ fn parse_default_gateway(table: &str) -> Option<Ipv4Addr> {
     })
 }
 
+/// The interface the default IPv4 route leaves by, e.g. `eth0`.
+pub fn default_route_interface() -> Option<String> {
+    let table = std::fs::read_to_string("/proc/net/route").ok()?;
+    parse_default_interface(&table)
+}
+
+fn parse_default_interface(table: &str) -> Option<String> {
+    table.lines().skip(1).find_map(|line| {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        let (iface, dest, flags) = (cols.first()?, cols.get(1)?, cols.get(3)?);
+        let up = u32::from_str_radix(flags, 16).ok()? & 0x1 == 0x1;
+        (*dest == "00000000" && up).then(|| iface.to_string())
+    })
+}
+
+/// The mask of the directly attached subnet `ip` sits in, from the kernel's
+/// routing table: the on-link route (no gateway) whose network holds `ip`.
+pub fn ipv4_subnet_mask(ip: Ipv4Addr) -> Option<Ipv4Addr> {
+    let table = std::fs::read_to_string("/proc/net/route").ok()?;
+    parse_subnet_mask(&table, ip)
+}
+
+fn parse_subnet_mask(table: &str, ip: Ipv4Addr) -> Option<Ipv4Addr> {
+    let hex = |s: &str| {
+        u32::from_str_radix(s, 16)
+            .ok()
+            .map(|v| Ipv4Addr::from(v.to_le_bytes()))
+    };
+    table.lines().skip(1).find_map(|line| {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        let (dest, gw, mask) = (hex(cols.get(1)?)?, hex(cols.get(2)?)?, hex(cols.get(7)?)?);
+        let (ip, dest, mask_bits) = (u32::from(ip), u32::from(dest), u32::from(mask));
+        (gw.is_unspecified() && mask_bits != 0 && ip & mask_bits == dest).then_some(mask)
+    })
+}
+
+/// The interface's stable IPv6 addresses — global and unique-local (ULA),
+/// not link-local, not temporary (privacy) and not deprecated — read from
+/// `/proc/net/if_inet6`. ULA first: it survives a change of the ISP's prefix.
+pub fn interface_ipv6(iface: &str) -> Vec<std::net::Ipv6Addr> {
+    std::fs::read_to_string("/proc/net/if_inet6")
+        .map(|t| parse_if_inet6(&t, iface))
+        .unwrap_or_default()
+}
+
+fn parse_if_inet6(table: &str, iface: &str) -> Vec<std::net::Ipv6Addr> {
+    // IFA_F_TEMPORARY, IFA_F_DEPRECATED, IFA_F_TENTATIVE.
+    const SKIP: u32 = 0x01 | 0x20 | 0x40;
+    let mut out: Vec<std::net::Ipv6Addr> = table
+        .lines()
+        .filter_map(|line| {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() < 6 || cols[5] != iface {
+                return None;
+            }
+            let scope = u32::from_str_radix(cols[3], 16).ok()?;
+            let flags = u32::from_str_radix(cols[4], 16).ok()?;
+            if scope != 0 || flags & SKIP != 0 {
+                return None;
+            }
+            u128::from_str_radix(cols[0], 16)
+                .ok()
+                .map(std::net::Ipv6Addr::from)
+        })
+        .collect();
+    out.sort_by_key(|a| a.segments()[0] & 0xfe00 != 0xfc00);
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn interface_and_mask_come_from_the_route_table() {
+        let table = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+                     eth0\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n\
+                     eth0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n";
+        assert_eq!(
+            super::parse_default_interface(table).as_deref(),
+            Some("eth0")
+        );
+        assert_eq!(
+            super::parse_subnet_mask(table, "192.168.1.7".parse().unwrap()),
+            Some(std::net::Ipv4Addr::new(255, 255, 255, 0))
+        );
+        assert_eq!(
+            super::parse_subnet_mask(table, "10.0.0.7".parse().unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn stable_ipv6_addresses_ula_first() {
+        let table = "fe800000000000000211223344556677 02 40 20 80 eth0\n\
+                     2a0204000000000000000000000000aa 02 40 00 00 eth0\n\
+                     2a0204000000000000000000000000bb 02 40 00 01 eth0\n\
+                     fd000000000000000000000000000001 02 40 00 80 eth0\n\
+                     fd000000000000000000000000000002 03 40 00 80 wlan0\n";
+        let got = super::parse_if_inet6(table, "eth0");
+        assert_eq!(
+            got,
+            vec![
+                "fd00::1".parse::<std::net::Ipv6Addr>().unwrap(),
+                "2a02:400::aa".parse().unwrap()
+            ]
+        );
+    }
+
     #[test]
     fn default_gateway_comes_from_the_route_table() {
         let table = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\

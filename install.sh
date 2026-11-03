@@ -537,8 +537,10 @@ TimeoutStopSec=30
 # CAP_NET_BIND_SERVICE: bind port 53 without running as root.
 # CAP_NET_ADMIN: kernel-WireGuard tunnels (netlink wg netdev + policy routing);
 # without it wireguard egresses fall back to the userspace backend.
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+# CAP_NET_RAW: IPv6 router advertisements announcing ferrite as the DNS server
+# (off unless switched on in the panel).
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
 
 # Hardening
 NoNewPrivileges=true
@@ -598,7 +600,7 @@ description="Ferrite DNS ad-blocker"
 supervisor=supervise-daemon
 command="${SERVICE_BIN}"
 command_user="${SERVICE_USER}:${SERVICE_GROUP}"
-capabilities="^cap_net_bind_service,^cap_net_admin"
+capabilities="^cap_net_bind_service,^cap_net_admin,^cap_net_raw"
 respawn_delay=5
 respawn_max=3
 respawn_period=60

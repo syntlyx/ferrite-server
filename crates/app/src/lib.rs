@@ -2,6 +2,7 @@
 //! warm-restart snapshot, and the per-subsystem context builders that hand each
 //! task exactly the state it needs.
 
+pub mod dhcp;
 pub mod sessions;
 pub mod snapshot;
 pub mod sync_status;
@@ -74,6 +75,8 @@ pub struct AppStateInner {
     pub sync_status: Arc<parking_lot::Mutex<sync_status::SyncStatus>>,
     /// Wakes the sync loop early — after its settings change, or "sync now".
     pub sync_wake: Arc<Notify>,
+    /// The DHCP server and IPv6 DNS announcer, reconfigured live.
+    pub dhcp: Arc<dhcp::DhcpService>,
 }
 
 /// Cheaply-cloneable application state handle, backed by `Arc<AppStateInner>`.
@@ -507,6 +510,12 @@ impl AppState {
 
         let snapshot_path = data_dir.join("state.bin");
 
+        let dhcp = dhcp::DhcpService::new(
+            Arc::clone(&storage),
+            Arc::clone(&client_registry),
+            Arc::clone(&custom_records),
+        );
+
         let inner = Arc::new(AppStateInner {
             config: config.clone(),
             dns_cache,
@@ -525,6 +534,7 @@ impl AppState {
             client_gate: Arc::new(ferrite_dns::gate::ClientGate::new(&config.dns)),
             sync_status: Arc::new(parking_lot::Mutex::new(sync_status::SyncStatus::load())),
             sync_wake: Arc::new(Notify::new()),
+            dhcp,
             record_switches,
             query_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
         });

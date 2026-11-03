@@ -812,6 +812,7 @@ dependencies = [
  "ferrite-blocklist",
  "ferrite-clients",
  "ferrite-core",
+ "ferrite-dhcp",
  "ferrite-dns",
  "ferrite-proxy",
  "ferrite-stats",

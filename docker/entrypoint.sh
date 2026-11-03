@@ -239,10 +239,15 @@ if [ "$(id -u)" -eq 0 ]; then
     # So cap_net_admin (kernel-WireGuard tunnels: --cap-add=NET_ADMIN, plus the
     # wireguard module on the host) is added only when the bounding set has it
     # (bit 12 of CapBnd); without it tunnels use the userspace backend.
+    # cap_net_raw (bit 13, in Docker's default set) lets ferrite send IPv6
+    # router advertisements naming itself the DNS server, when switched on.
     caps="cap_net_bind_service"
     capbnd="$(awk '/^CapBnd:/ {print $2}' /proc/self/status 2>/dev/null)"
     if [ -n "${capbnd}" ] && [ "$(( 0x${capbnd} >> 12 & 1 ))" -eq 1 ]; then
-        caps="cap_net_admin,cap_net_bind_service"
+        caps="cap_net_admin,${caps}"
+    fi
+    if [ -n "${capbnd}" ] && [ "$(( 0x${capbnd} >> 13 & 1 ))" -eq 1 ]; then
+        caps="${caps},cap_net_raw"
     fi
     setcap "${caps}=+ep" "${SERVER_BIN}" 2>/dev/null || \
         warn "could not set ${caps} on ${SERVER_BIN}; port 53 may require --cap-add=NET_BIND_SERVICE"
