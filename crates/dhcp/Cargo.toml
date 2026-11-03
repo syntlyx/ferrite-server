@@ -1,0 +1,15 @@
+[package]
+name = "ferrite-dhcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Wire codec, options, lease allocator and the decision logic are pure — they
+# build and test on any host. The socket server (server.rs) adds tokio/socket2.
+thiserror.workspace = true
+tokio.workspace = true
+socket2.workspace = true
+libc.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true

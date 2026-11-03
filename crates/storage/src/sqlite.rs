@@ -9,7 +9,7 @@ use tokio_rusqlite::Connection;
 use crate::schema::SCHEMA;
 use crate::{
     ClientStats, DeviceActivity, DeviceDomain, LegacyConfigRows, QueryFilter, SizeTrim, Storage,
-    StoredDevice, StoredSession, SummaryStats, align_bucket,
+    StoredDevice, StoredLease, StoredSession, SummaryStats, align_bucket,
 };
 use ferrite_core::error::{FeriteError, Result};
 use ferrite_core::recording::RecordScope;
@@ -847,6 +847,67 @@ impl Storage for SqliteStorage {
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 Ok(rows)
+            })
+            .await
+            .map_err(FeriteError::TokioDatabase)
+    }
+
+    async fn upsert_dhcp_lease(&self, lease: &StoredLease) -> Result<()> {
+        let l = lease.clone();
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO dhcp_leases (ip, mac, hostname, expires_at)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(ip) DO UPDATE SET
+                         mac        = excluded.mac,
+                         hostname   = excluded.hostname,
+                         expires_at = excluded.expires_at",
+                    rusqlite::params![l.ip, l.mac, l.hostname, l.expires_at],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(FeriteError::TokioDatabase)
+    }
+
+    async fn delete_dhcp_lease(&self, ip: &str) -> Result<()> {
+        let ip = ip.to_string();
+        self.conn
+            .call(move |c| {
+                c.execute("DELETE FROM dhcp_leases WHERE ip = ?1", [ip])?;
+                Ok(())
+            })
+            .await
+            .map_err(FeriteError::TokioDatabase)
+    }
+
+    async fn load_dhcp_leases(&self) -> Result<Vec<StoredLease>> {
+        self.conn
+            .call(|c| {
+                let mut stmt =
+                    c.prepare("SELECT ip, mac, hostname, expires_at FROM dhcp_leases")?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok(StoredLease {
+                            ip: row.get(0)?,
+                            mac: row.get(1)?,
+                            hostname: row.get(2)?,
+                            expires_at: row.get(3)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .map_err(FeriteError::TokioDatabase)
+    }
+
+    async fn delete_expired_dhcp_leases(&self, now: i64) -> Result<()> {
+        self.conn
+            .call(move |c| {
+                c.execute("DELETE FROM dhcp_leases WHERE expires_at <= ?1", [now])?;
+                Ok(())
             })
             .await
             .map_err(FeriteError::TokioDatabase)

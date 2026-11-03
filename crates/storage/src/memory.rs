@@ -33,7 +33,7 @@ use ferrite_core::types::{QueryEntry, QueryStatus, TimeseriesBucket};
 
 use crate::{
     ClientStats, DeviceActivity, DeviceDomain, LegacyConfigRows, QueryFilter, SizeTrim, Storage,
-    StoredDevice, StoredSession, SummaryStats, align_bucket,
+    StoredDevice, StoredLease, StoredSession, SummaryStats, align_bucket,
 };
 
 /// Rough live size of one retained entry: the struct, plus its heap strings
@@ -91,6 +91,8 @@ struct Inner {
     devices: BTreeMap<String, (Option<String>, i64)>,
     /// Last-known IP → MAC binding.
     ip_bindings: BTreeMap<String, Binding>,
+    /// DHCP leases by address. Lost on restart, like everything here.
+    dhcp_leases: BTreeMap<String, StoredLease>,
     /// Login sessions by token hash. Lost on restart, like everything here.
     sessions: BTreeMap<String, StoredSession>,
     /// Highest id ever stored, kept across trims so ids stay monotonic.
@@ -550,6 +552,31 @@ impl Storage for MemoryStorage {
                 first_seen: *first_seen,
             })
             .collect())
+    }
+
+    async fn upsert_dhcp_lease(&self, lease: &StoredLease) -> Result<()> {
+        self.inner
+            .write()
+            .dhcp_leases
+            .insert(lease.ip.clone(), lease.clone());
+        Ok(())
+    }
+
+    async fn delete_dhcp_lease(&self, ip: &str) -> Result<()> {
+        self.inner.write().dhcp_leases.remove(ip);
+        Ok(())
+    }
+
+    async fn load_dhcp_leases(&self) -> Result<Vec<StoredLease>> {
+        Ok(self.inner.read().dhcp_leases.values().cloned().collect())
+    }
+
+    async fn delete_expired_dhcp_leases(&self, now: i64) -> Result<()> {
+        self.inner
+            .write()
+            .dhcp_leases
+            .retain(|_, l| l.expires_at > now);
+        Ok(())
     }
 
     async fn load_ip_bindings(&self) -> Result<Vec<(String, String)>> {

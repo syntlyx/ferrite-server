@@ -148,8 +148,41 @@ pub fn local_ipv4_for_internet() -> Option<Ipv4Addr> {
     }
 }
 
+/// The box's default IPv4 gateway, read from the kernel's routing table
+/// (`/proc/net/route` on Linux; `None` elsewhere or when there is none).
+pub fn default_ipv4_gateway() -> Option<Ipv4Addr> {
+    let table = std::fs::read_to_string("/proc/net/route").ok()?;
+    parse_default_gateway(&table)
+}
+
+/// The gateway of the first default route in a `/proc/net/route` table.
+/// Addresses there are hex in host (little-endian) byte order.
+fn parse_default_gateway(table: &str) -> Option<Ipv4Addr> {
+    table.lines().skip(1).find_map(|line| {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        let (dest, gw, flags) = (cols.get(1)?, cols.get(2)?, cols.get(3)?);
+        let up_and_gateway = u32::from_str_radix(flags, 16).ok()? & 0x3 == 0x3;
+        if *dest != "00000000" || !up_and_gateway {
+            return None;
+        }
+        let gw = u32::from_str_radix(gw, 16).ok()?;
+        (gw != 0).then(|| Ipv4Addr::from(gw.to_le_bytes()))
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn default_gateway_comes_from_the_route_table() {
+        let table = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+                     eth0\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n\
+                     eth0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n";
+        assert_eq!(
+            super::parse_default_gateway(table),
+            Some(std::net::Ipv4Addr::new(192, 168, 1, 1))
+        );
+        assert_eq!(super::parse_default_gateway("Iface\tDestination\n"), None);
+    }
 
     #[test]
     fn networks_parse_and_match() {

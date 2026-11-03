@@ -805,6 +805,7 @@ dependencies = [
 name = "ferrite-app"
 version = "0.1.10"
 dependencies = [
+ "arc-swap",
  "bytes",
  "chrono",
  "dashmap",
@@ -884,6 +885,18 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "ferrite-dhcp"
+version = "0.1.10"
+dependencies = [
+ "libc",
+ "parking_lot",
+ "socket2",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -995,6 +1008,7 @@ dependencies = [
 name = "ferrite-upstream"
 version = "0.1.10"
 dependencies = [
+ "arc-swap",
  "base64 0.22.1",
  "ferrite-core",
  "hickory-proto",

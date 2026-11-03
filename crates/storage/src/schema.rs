@@ -112,6 +112,17 @@ CREATE TABLE IF NOT EXISTS ip_bindings (
 CREATE INDEX IF NOT EXISTS idx_ip_bindings_mac ON ip_bindings (mac);
 
 -- ---------------------------------------------------------------
+-- Leases from ferrite's own DHCP server (when it runs one), so a restart
+-- doesn't hand out an address a device still holds.
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS dhcp_leases (
+    ip          TEXT    PRIMARY KEY,            -- leased IPv4 address
+    mac         TEXT    NOT NULL,               -- 'aa:bb:cc:dd:ee:ff'
+    hostname    TEXT,                           -- what the device called itself
+    expires_at  INTEGER NOT NULL                -- unix seconds
+);
+
+-- ---------------------------------------------------------------
 -- Web-panel login sessions, so a restart doesn't sign everyone out. Only the
 -- token's SHA-256 is stored; password_fp ties a session to the password it
 -- was issued under.

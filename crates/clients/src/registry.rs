@@ -339,6 +339,32 @@ impl ClientRegistry {
         });
     }
 
+    /// A lease ferrite's own DHCP server just handed out. ferrite chose the
+    /// address, so this is the strongest IP→MAC binding there is, stronger
+    /// than the neighbour scan; and the name the device gave itself becomes
+    /// its name, below a manual alias, which still wins. Persisted like the
+    /// scan's findings (and, like them, only while recording is on).
+    pub async fn record_dhcp_lease(
+        &self,
+        mac: [u8; 6],
+        ip: std::net::Ipv4Addr,
+        hostname: Option<String>,
+    ) {
+        let ip = IpAddr::V4(ip);
+        self.note_mac(ip, mac).await;
+        let moved = self.ip_to_mac.get(&ip).map(|e| *e) != Some(mac);
+        self.bind_ip(ip, mac);
+        if moved {
+            self.persist_binding(ip, mac).await;
+        }
+        let name = hostname
+            .map(|h| h.trim().trim_end_matches('.').to_string())
+            .filter(|h| !h.is_empty());
+        if let Some(name) = name {
+            self.cache_mac(mac, &name).await;
+        }
+    }
+
     // ── IP ↔ MAC bindings ──────────────────────────────────────────────────────
 
     /// Record that `ip` currently belongs to `mac`, in both directions. An
@@ -674,6 +700,30 @@ mod tests {
 
     /// The first scan is the baseline; after it a never-seen MAC is announced
     /// once, recorded with its first sighting, and remembered across a restart.
+    #[tokio::test]
+    async fn a_dhcp_lease_names_the_device_unless_an_alias_does() {
+        let db = temp_db("clients-dhcp-lease");
+        let reg = registry(&db).await;
+        let mac = [0x02, 0, 0, 0, 0, 0x11];
+        let ip = std::net::Ipv4Addr::new(192, 168, 1, 50);
+
+        reg.record_dhcp_lease(mac, ip, Some("phone".into())).await;
+        assert_eq!(
+            reg.get_mac(IpAddr::V4(ip)).as_deref(),
+            Some("02:00:00:00:00:11")
+        );
+        assert_eq!(reg.get_name(IpAddr::V4(ip)).as_deref(), Some("phone"));
+
+        reg.set_mac_alias(mac, "Kitchen tablet".into());
+        reg.record_dhcp_lease(mac, ip, Some("android-1234".into()))
+            .await;
+        assert_eq!(
+            reg.get_name(IpAddr::V4(ip)).as_deref(),
+            Some("Kitchen tablet")
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
     #[tokio::test]
     async fn a_new_mac_is_announced_once_after_the_startup_baseline() {
         let db = temp_db("clients-new-device");

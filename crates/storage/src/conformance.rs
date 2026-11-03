@@ -621,3 +621,51 @@ async fn sessions_save_update_lapse_and_delete_the_same() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn dhcp_leases_upsert_load_release_and_expire() {
+    use crate::StoredLease;
+    for_each_backend("conf-dhcp", |s| async move {
+        let lease = |ip: &str, mac: &str, host: Option<&str>, expires_at: i64| StoredLease {
+            ip: ip.into(),
+            mac: mac.into(),
+            hostname: host.map(Into::into),
+            expires_at,
+        };
+        s.upsert_dhcp_lease(&lease(
+            "192.168.1.50",
+            "02:00:00:00:00:01",
+            Some("phone"),
+            100,
+        ))
+        .await
+        .unwrap();
+        s.upsert_dhcp_lease(&lease("192.168.1.51", "02:00:00:00:00:02", None, 300))
+            .await
+            .unwrap();
+        // Renewed by the same device, and again for another one.
+        s.upsert_dhcp_lease(&lease(
+            "192.168.1.50",
+            "02:00:00:00:00:01",
+            Some("phone"),
+            200,
+        ))
+        .await
+        .unwrap();
+
+        let mut all = s.load_dhcp_leases().await.unwrap();
+        all.sort_by(|a, b| a.ip.cmp(&b.ip));
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].expires_at, 200, "an upsert refreshes the lease");
+        assert_eq!(all[0].hostname.as_deref(), Some("phone"));
+
+        s.delete_expired_dhcp_leases(250).await.unwrap();
+        let left = s.load_dhcp_leases().await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].ip, "192.168.1.51");
+
+        s.delete_dhcp_lease("192.168.1.51").await.unwrap();
+        assert!(s.load_dhcp_leases().await.unwrap().is_empty());
+    })
+    .await;
+}

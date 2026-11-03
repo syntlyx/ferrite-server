@@ -49,6 +49,17 @@ pub struct StoredDevice {
     pub first_seen: i64,
 }
 
+/// An active lease from ferrite's own DHCP server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredLease {
+    pub ip: String,
+    pub mac: String,
+    /// What the device called itself (DHCP option 12), if anything.
+    pub hostname: Option<String>,
+    /// Unix seconds.
+    pub expires_at: i64,
+}
+
 /// A web-panel login session as stored. Never the token itself — only its
 /// SHA-256, so the database can't be used to sign in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +229,20 @@ pub trait Storage: Send + Sync {
 
     /// Load all IP → MAC bindings: returns (ip, mac) pairs.
     async fn load_ip_bindings(&self) -> Result<Vec<(String, String)>>;
+
+    // ── DHCP leases ──────────────────────────────────────────────────────────
+    // Kept so a restart doesn't hand out an address a device still holds.
+    // They are the DHCP server's working state, like a router's lease file,
+    // not a record of the network, so the privacy switches leave them alone.
+
+    /// Store (or refresh) a lease, keyed by its address.
+    async fn upsert_dhcp_lease(&self, lease: &StoredLease) -> Result<()>;
+    /// Drop the lease on `ip`: released, or now another device's.
+    async fn delete_dhcp_lease(&self, ip: &str) -> Result<()>;
+    /// Every stored lease, expired ones included; callers filter by time.
+    async fn load_dhcp_leases(&self) -> Result<Vec<StoredLease>>;
+    /// Drop leases that ended at or before `now` (unix seconds).
+    async fn delete_expired_dhcp_leases(&self, now: i64) -> Result<()>;
 
     /// Drop every learned IP → MAC binding. Leaves `devices` (MAC → hostname)
     /// and manual aliases intact; used when the query log is cleared.

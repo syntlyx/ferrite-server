@@ -62,6 +62,15 @@ pub struct Config {
     /// configuration, so two resolvers on one network answer alike.
     #[serde(default, skip_serializing_if = "SyncConfig::is_off")]
     pub sync: SyncConfig,
+    /// Hand out addresses on the LAN, so devices get ferrite as their DNS
+    /// server without touching the router. Off by default; written to the
+    /// file only once set up.
+    #[serde(default, skip_serializing_if = "DhcpConfig::is_unset")]
+    pub dhcp: DhcpConfig,
+    /// Announce ferrite as the IPv6 DNS server (Router Advertisement RDNSS),
+    /// so IPv6 devices stop asking the router. Off by default.
+    #[serde(default, skip_serializing_if = "RaConfig::is_unset")]
+    pub ra: RaConfig,
     /// Verbose debug-level logging for the `ferrite` target. **Off by default**:
     /// every DNS query and proxied connection emits a record, and each one costs
     /// two allocations, a process-wide ring-buffer lock and a stdout write — real
@@ -993,6 +1002,8 @@ impl Default for Config {
             notifications: NotificationsConfig::default(),
             mcp: McpConfig::default(),
             sync: SyncConfig::default(),
+            dhcp: DhcpConfig::default(),
+            ra: RaConfig::default(),
             debug_logging: false,
             web_dir: None,
         }
@@ -1010,6 +1021,114 @@ pub struct McpConfig {
     /// Offer the tools that change things — block or allow a domain, pause
     /// filtering, block a service. Off: an assistant can look, not touch.
     pub allow_changes: bool,
+}
+
+/// The built-in DHCPv4 server. Off by default. With it on, ferrite hands out
+/// addresses itself and names itself as the DNS server, so the router's DHCP
+/// has to be switched off. Applies without a restart.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DhcpConfig {
+    pub enabled: bool,
+    /// ferrite's address on the served subnet: the DHCP server id, and the
+    /// default for `gateway` and `dns`. Detected when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_ip: Option<Ipv4Addr>,
+    pub subnet_mask: Ipv4Addr,
+    /// First and last address of the dynamic pool, inclusive. Both required
+    /// when `enabled`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_start: Option<Ipv4Addr>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_end: Option<Ipv4Addr>,
+    /// The router handed to clients (option 3). Usually your router's address;
+    /// defaults to `server_ip` only for a box that routes itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<Ipv4Addr>,
+    /// DNS servers handed to clients (option 6). Empty = ferrite itself.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dns: Vec<Ipv4Addr>,
+    /// Search domain handed to clients (option 15), e.g. `lan`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// How long a lease lasts, in seconds.
+    pub lease_secs: u32,
+    /// Addresses always given to the same device.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reservations: Vec<DhcpReservation>,
+}
+
+impl Default for DhcpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_ip: None,
+            subnet_mask: Ipv4Addr::new(255, 255, 255, 0),
+            pool_start: None,
+            pool_end: None,
+            gateway: None,
+            dns: Vec::new(),
+            domain: None,
+            lease_secs: 86_400,
+            reservations: Vec::new(),
+        }
+    }
+}
+
+impl DhcpConfig {
+    /// Nothing set up: left out of the config file.
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// A static DHCP reservation: the device with this MAC always gets `ip`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DhcpReservation {
+    /// `aa:bb:cc:dd:ee:ff` (or `-` separated).
+    pub mac: String,
+    pub ip: Ipv4Addr,
+    /// What to call it in the panel; optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// IPv6 Router Advertisements announcing ferrite as the DNS server (RDNSS).
+/// DNS only: ferrite never claims to be the router (router lifetime 0, no
+/// prefixes). Needs `CAP_NET_RAW`. Off by default; applies without a restart.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RaConfig {
+    pub enabled: bool,
+    /// The interface to announce on, e.g. `eth0`. Required when enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
+    /// ferrite's IPv6 addresses to announce. Required when enabled.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rdnss: Vec<Ipv6Addr>,
+    /// How long devices may use the announced servers, in seconds.
+    pub rdnss_lifetime: u32,
+    /// Seconds between unsolicited announcements.
+    pub interval_secs: u64,
+}
+
+impl Default for RaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interface: None,
+            rdnss: Vec::new(),
+            rdnss_lifetime: 1800,
+            interval_secs: 200,
+        }
+    }
+}
+
+impl RaConfig {
+    /// Nothing set up: left out of the config file.
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// `[sync]`: make this box a secondary that follows a primary ferrite. Every
