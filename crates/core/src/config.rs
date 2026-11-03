@@ -174,6 +174,21 @@ pub struct DnsConfig {
     /// channel (DoT/DoH/tunnel) — ferrite does not validate locally yet. On by default.
     #[serde(default = "default_true")]
     pub dnssec: bool,
+    /// Answer NXDOMAIN for `use-application-dns.net`, Firefox's canary: on a
+    /// network that does, Firefox doesn't switch itself to DNS over HTTPS and
+    /// so keeps asking this resolver. DoH a user turned on by hand stays on.
+    /// On by default.
+    #[serde(default = "default_true")]
+    pub firefox_canary: bool,
+    /// Answer NXDOMAIN for `mask.icloud.com` and `mask-h2.icloud.com`, Apple's
+    /// sign that this network doesn't allow iCloud Private Relay. Apple devices
+    /// then resolve through ferrite instead of around it. Off by default:
+    /// Private Relay is the device owner's privacy choice.
+    pub block_private_relay: bool,
+    /// Strip Encrypted Client Hello (`ech`) from HTTPS/SVCB answers, so
+    /// browsers keep the hostname readable in the TLS handshake. Off by default.
+    /// Not to be confused with `strip_ecs`.
+    pub strip_ech: bool,
     /// Optimistic cache: answer from an entry that has expired — with a
     /// 30-second TTL — and refresh it in the background, instead of making the
     /// client wait on the upstream. A name keeps resolving while the upstream
@@ -878,6 +893,9 @@ impl Default for DnsConfig {
             ],
             strip_ecs: true,
             dnssec: true,
+            firefox_canary: true,
+            block_private_relay: false,
+            strip_ech: false,
             serve_stale: false,
             stale_max_age: default_stale_max_age(),
             rate_limit: 0,

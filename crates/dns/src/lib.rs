@@ -1,3 +1,4 @@
+pub mod anti_doh;
 pub mod cache;
 pub mod ctx;
 pub mod custom;
@@ -8,6 +9,7 @@ pub mod query;
 pub mod resolver;
 mod safesearch;
 pub mod server;
+pub mod switches;
 pub mod types;
 #[cfg(target_os = "linux")]
 pub mod udp_batch;

@@ -81,11 +81,13 @@ pub(crate) mod nullable {
 ///                             `log_queries`, `keep_stats`,
 ///                             `blocklist_enabled`, `blocklist_client_bypass`,
 ///                             `blocklist_block_response`, `blocklist_block_ipv4`,
-///                             `blocklist_block_ipv6`, `debug_logging`.
+///                             `blocklist_block_ipv6`, `debug_logging`,
+///                             `dns_strip_ecs`, `dns_dnssec`, `dns_firefox_canary`,
+///                             `dns_block_private_relay`, `dns_strip_ech`.
 /// Restart-required:           `storage_backend`, `storage_path`,
 ///                             `blocklist_cache_dir`,
 ///                             `dns_bind_addr`, `dns_cache_size`, `dns_cache_max_mb`,
-///                             `dns_strip_ecs`, `dns_dnssec`, `api_bind_addr`,
+///                             `api_bind_addr`,
 ///                             `blocklist_decision_cache_size`, `upstream`, `zones`,
 ///                             `panel_enabled`, `panel_domain`, `panel_ipv4`, `panel_url`.
 #[derive(Debug, Deserialize, Default)]
@@ -151,6 +153,12 @@ pub struct SettingsPatch {
     pub dns_cache_max_mb: Option<usize>,
     pub dns_strip_ecs: Option<bool>,
     pub dns_dnssec: Option<bool>,
+    /// Answer Firefox's DoH canary with NXDOMAIN; see `DnsConfig::firefox_canary`.
+    pub dns_firefox_canary: Option<bool>,
+    /// Turn iCloud Private Relay off for this network; see `DnsConfig::block_private_relay`.
+    pub dns_block_private_relay: Option<bool>,
+    /// Strip ECH from HTTPS/SVCB answers; see `DnsConfig::strip_ech`.
+    pub dns_strip_ech: Option<bool>,
     pub blocklist_decision_cache_size: Option<usize>,
     pub api_bind_addr: Option<String>,
     pub upstream: Option<Vec<UpstreamConfig>>,
@@ -198,6 +206,7 @@ pub async fn update_settings(
     let mut blocklist_enabled_to_apply: Option<bool> = None;
     let mut blocklist_client_bypass_to_apply: Option<Vec<String>> = None;
     let mut debug_logging_to_apply: Option<bool> = None;
+    let mut dns_switches_changed = false;
     let mut log_queries_to_apply: Option<bool> = None;
     let mut keep_stats_to_apply: Option<bool> = None;
     let mut block_answer_to_apply: Option<BlockAnswer> = None;
@@ -491,14 +500,28 @@ pub async fn update_settings(
             restart_changed.push("dns_cache_max_mb");
         }
 
-        if let Some(v) = patch.dns_strip_ecs {
-            cfg.dns.strip_ecs = v;
-            restart_changed.push("dns_strip_ecs");
-        }
-
-        if let Some(v) = patch.dns_dnssec {
-            cfg.dns.dnssec = v;
-            restart_changed.push("dns_dnssec");
+        // The per-query switches: stored here, handed to the pipeline below.
+        let dns = &mut cfg.dns;
+        for (value, field, key) in [
+            (patch.dns_strip_ecs, &mut dns.strip_ecs, "dns_strip_ecs"),
+            (patch.dns_dnssec, &mut dns.dnssec, "dns_dnssec"),
+            (
+                patch.dns_firefox_canary,
+                &mut dns.firefox_canary,
+                "dns_firefox_canary",
+            ),
+            (
+                patch.dns_block_private_relay,
+                &mut dns.block_private_relay,
+                "dns_block_private_relay",
+            ),
+            (patch.dns_strip_ech, &mut dns.strip_ech, "dns_strip_ech"),
+        ] {
+            if let Some(v) = value {
+                *field = v;
+                hot_changed.push(key);
+                dns_switches_changed = true;
+            }
         }
 
         if let Some(size) = patch.blocklist_decision_cache_size {
@@ -580,6 +603,11 @@ pub async fn update_settings(
 
     if let Some((min, max)) = ttl_bounds_to_apply {
         state.inner.dns_cache.set_ttl_bounds(min, max);
+    }
+
+    if dns_switches_changed {
+        let dns = state.live_config.read().dns.clone();
+        state.inner.dns_switches.apply(&dns);
     }
 
     if let Some(ttl) = client_ttl_to_apply {

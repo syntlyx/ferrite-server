@@ -43,6 +43,24 @@ max_ttl = 3600
 # allowed_clients = ["192.168.1.0/24", "fd00::/8"]
 # denied_clients  = ["192.168.1.66"]
 
+# Keeping devices on this resolver. All three apply without a restart.
+#
+# Firefox asks use-application-dns.net before switching itself to DNS over
+# HTTPS (and past every filter on the network); NXDOMAIN keeps it here. DoH a
+# user turned on by hand stays on. On by default.
+# firefox_canary = true
+#
+# Apple devices ask mask.icloud.com before using iCloud Private Relay, which
+# takes Safari's lookups around ferrite. NXDOMAIN turns Private Relay off on
+# this network. Off by default: it is the device owner's privacy choice.
+# block_private_relay = false
+#
+# Strip Encrypted Client Hello (ECH) from HTTPS/SVCB answers, so browsers keep
+# the hostname readable in the TLS handshake. Off by default. (Not strip_ecs.)
+# Blocking DoH servers themselves is a job for a list such as HaGeZi's
+# doh-vpn-proxy-bypass.
+# strip_ech = false
+
 # Domains to suppress from the query log entirely (still resolved normally).
 # Exact names or wildcard suffixes. Useful for noisy local/private zones.
 # `fe.te` is ferrite's built-in panel domain and is ignored by default.

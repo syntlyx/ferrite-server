@@ -57,6 +57,8 @@ pub struct AppStateInner {
     pub log_ignore: Arc<RwLock<Vec<String>>>,
     /// Hot-patchable ceiling on the TTL handed to client devices (seconds).
     pub client_ttl: Arc<AtomicU32>,
+    /// The DNS switches read per query; the settings API flips them live.
+    pub dns_switches: Arc<ferrite_dns::switches::DnsSwitches>,
     /// Hot-patchable privacy switches: whether queries are logged and whether
     /// statistics are kept. Shared with the DNS handler and the stats writer.
     pub record_switches: Arc<RecordSwitches>,
@@ -212,6 +214,7 @@ impl AppState {
             live_stats: Arc::clone(&self.inner.live_stats),
             log_ignore: Arc::clone(&self.inner.log_ignore),
             client_ttl: Arc::clone(&self.inner.client_ttl),
+            switches: Arc::clone(&self.inner.dns_switches),
             record_switches: Arc::clone(&self.inner.record_switches),
             query_semaphore: Arc::clone(&self.inner.query_semaphore),
             client_gate: Arc::clone(&self.inner.client_gate),
@@ -501,6 +504,7 @@ impl AppState {
             panel_hosts: panel_hosts(config),
             log_ignore: Arc::new(RwLock::new(config.dns.log_ignore.clone())),
             client_ttl: Arc::new(AtomicU32::new(config.dns.client_ttl)),
+            dns_switches: ferrite_dns::switches::DnsSwitches::new(&config.dns),
             client_gate: Arc::new(ferrite_dns::gate::ClientGate::new(&config.dns)),
             sync_status: Arc::new(parking_lot::Mutex::new(sync_status::SyncStatus::load())),
             sync_wake: Arc::new(Notify::new()),

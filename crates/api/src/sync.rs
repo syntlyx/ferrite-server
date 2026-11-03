@@ -174,6 +174,9 @@ pub(crate) fn plan(
                 to.log_ignore = from.log_ignore.clone();
                 to.strip_ecs = from.strip_ecs;
                 to.dnssec = from.dnssec;
+                to.firefox_canary = from.firefox_canary;
+                to.block_private_relay = from.block_private_relay;
+                to.strip_ech = from.strip_ech;
                 to.serve_stale = from.serve_stale;
                 to.stale_max_age = from.stale_max_age;
                 to.rate_limit = from.rate_limit;
@@ -212,6 +215,9 @@ fn part(c: &Config, s: SyncSection) -> String {
                 d.log_ignore,
                 d.strip_ecs,
                 d.dnssec,
+                d.firefox_canary,
+                d.block_private_relay,
+                d.strip_ech,
                 d.serve_stale,
                 d.stale_max_age,
                 d.rate_limit,

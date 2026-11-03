@@ -10,6 +10,7 @@ use hickory_proto::rr::{RData, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use tokio::sync::mpsc;
 
+use crate::anti_doh;
 use crate::cache::{DnsCache, STALE_ANSWER_TTL};
 use crate::ctx::DnsCtx;
 use crate::gate::Verdict;
@@ -167,7 +168,7 @@ pub fn decide(raw: &[u8], src: SocketAddr, ctx: &Arc<DnsCtx>) -> Decision {
     // the UDP limit → truncation → TCP retry on every query, which is what made
     // DNSSEC feel slow. This flag also keys the cache so a DO client never gets
     // a stale unsigned answer (nor a non-DO client the bulky signed one).
-    let want_dnssec = ctx.dns_config.dnssec && dnssec_ok(&query);
+    let want_dnssec = ctx.switches.dnssec() && dnssec_ok(&query);
     let log_ignored = is_log_ignored(&name, &ctx.log_ignore.read());
     // The ceiling on what this client is told to cache. Applied to every exit
     // path below, so no answer leaves with a longer lifetime than the window in
@@ -199,6 +200,28 @@ pub fn decide(raw: &[u8], src: SocketAddr, ctx: &Arc<DnsCtx>) -> Decision {
             patch_id(&custom_resp.bytes, query.id()),
             client_ttl,
         ));
+    }
+
+    // ── Step 1b: Canaries ─────────────────────────────────────────────────
+    // Firefox and Apple devices ask a well-known name before going around the
+    // network's resolver; NXDOMAIN keeps them on it. Answered for every client
+    // and whatever the filtering state: a paused filter shouldn't send Firefox
+    // off to its own DoH until the next network change.
+    if let Some(reason) = anti_doh::canary(&name, &ctx.switches) {
+        if !log_ignored {
+            emit(ctx, QueryStatus::Blocked, |status| {
+                make_entry(
+                    name,
+                    qtype,
+                    client_text.unwrap_or_else(|| ip_to_string(client_addr)),
+                    status,
+                    start.elapsed().as_millis() as u32,
+                    Some(reason.into()),
+                    3,
+                )
+            });
+        }
+        return Decision::Answer(build_nxdomain(&query, client_ttl));
     }
 
     // ── Step 2: Blocklist (skipped when globally disabled or client bypasses filtering) ──
@@ -416,7 +439,7 @@ pub async fn resolve_upstream(raw: &[u8], pending: Pending, ctx: &DnsCtx) -> Vec
     // Harden the outbound query: drop EDNS Client Subnet (so the resolver never
     // learns the client's subnet) and set the upstream DO bit to `want_dnssec`
     // (honor this client's request, or strip it when the feature is off).
-    let upstream_query = sanitize_query(raw, ctx.dns_config.strip_ecs, want_dnssec);
+    let upstream_query = sanitize_query(raw, ctx.switches.strip_ecs(), want_dnssec);
     let (response_bytes, rcode, upstream_label) =
         match ctx.upstream_pool.resolve_raw(upstream_query).await {
             // Only trust a response we can actually decode. Unparseable bytes
@@ -434,6 +457,9 @@ pub async fn resolve_upstream(raw: &[u8], pending: Pending, ctx: &DnsCtx) -> Vec
                 (build_servfail(&query), 2u8, None)
             }
         };
+
+    // Without ECH in the answer, the browser keeps the hostname readable.
+    let response_bytes = without_ech(response_bytes, qtype, ctx);
 
     // ── Step 6: CNAME inspection ───────────────────────────────────────────
     // Walk the answer section. If any CNAME target is blocked (and the queried
@@ -523,7 +549,7 @@ async fn resolve_safe_host(
     let id = LazyQuery::new(raw).id();
     let upstream = match safesearch::target_query(id, target, qtype) {
         Some(q) => {
-            let q = sanitize_query(&q, ctx.dns_config.strip_ecs, false);
+            let q = sanitize_query(&q, ctx.switches.strip_ecs(), false);
             ctx.upstream_pool.resolve_raw(q).await
         }
         None => return build_servfail(&LazyQuery::new(raw)),
@@ -673,13 +699,14 @@ fn refresh_stale(ctx: &Arc<DnsCtx>, raw: &[u8], name: &str, qtype: u16, want_dns
     if !ctx.dns_cache.begin_refresh(&key) {
         return;
     }
-    let upstream_query = sanitize_query(raw, ctx.dns_config.strip_ecs, want_dnssec);
+    let upstream_query = sanitize_query(raw, ctx.switches.strip_ecs(), want_dnssec);
     let ctx = Arc::clone(ctx);
     let name = name.to_string();
     tokio::spawn(async move {
         let _permit = permit;
         match ctx.upstream_pool.resolve_raw(upstream_query).await {
             Ok((bytes, _)) if wire::rcode(&bytes) == Some(0) => {
+                let bytes = without_ech(bytes, qtype, &ctx);
                 if let Some(ttl) = wire::cache_ttl(&bytes) {
                     ctx.dns_cache.insert(
                         &name,
@@ -1071,6 +1098,17 @@ fn is_log_ignored(name: &str, patterns: &[String]) -> bool {
 /// query; an oversized one (e.g. 4096) risks IP fragmentation on the path to the
 /// upstream, which is both unreliable and a cache-poisoning vector.
 const UPSTREAM_UDP_PAYLOAD: u16 = 1232;
+
+/// An upstream answer with Encrypted Client Hello taken out, when `strip_ech`
+/// is on and the answer is an HTTPS (65) or SVCB (64) record set; any other
+/// answer, or one with no `ech` in it, comes back untouched.
+fn without_ech(bytes: Vec<u8>, qtype: u16, ctx: &DnsCtx) -> Vec<u8> {
+    if matches!(qtype, 64 | 65) && ctx.switches.strip_ech() {
+        anti_doh::strip_ech(&bytes).unwrap_or(bytes)
+    } else {
+        bytes
+    }
+}
 
 /// Harden a client query before it leaves ferrite: with `strip_ecs`, drop the
 /// EDNS Client Subnet option (so the upstream resolver never learns the client's

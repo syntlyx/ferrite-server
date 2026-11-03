@@ -20,8 +20,12 @@ use ferrite_upstream::ZoneRouter;
 /// Everything the DNS servers and the per-query pipeline need. Built once at
 /// startup by the composition root; shared as one `Arc` per query task.
 pub struct DnsCtx {
-    /// Static DNS settings (bind address, DNSSEC, ECS stripping).
+    /// DNS settings as loaded (bind address and the like). What the pipeline
+    /// reads per query and the panel can change lives in `switches`.
     pub dns_config: DnsConfig,
+    /// The per-query switches (DNSSEC, ECS and ECH stripping, canaries),
+    /// shared with the settings API so a change applies at once.
+    pub switches: Arc<crate::switches::DnsSwitches>,
     pub dns_cache: Arc<DnsCache>,
     pub blocklist: Arc<Blocklist>,
     pub custom_records: Arc<CustomRecords>,

@@ -129,6 +129,7 @@ impl Harness {
     fn ctx(&self) -> DnsCtx {
         DnsCtx {
             dns_config: DnsConfig::default(),
+            switches: crate::switches::DnsSwitches::new(&DnsConfig::default()),
             dns_cache: Arc::clone(&self.dns_cache),
             blocklist: Arc::clone(&self.blocklist),
             custom_records: Arc::clone(&self.custom_records),
@@ -1407,5 +1408,73 @@ async fn safe_search_answers_with_a_cname_to_the_safe_host() {
     .unwrap();
     assert_eq!(blocked.metadata.response_code, ResponseCode::NXDomain);
 
+    cleanup_sqlite(&h.db_path);
+}
+
+/// The answer's RCODE, for a decision that settled in memory.
+fn answered_rcode(decision: Decision) -> Option<ResponseCode> {
+    match decision {
+        Decision::Answer(bytes) => {
+            Some(Message::from_bytes(&bytes).unwrap().metadata.response_code)
+        }
+        _ => None,
+    }
+}
+
+/// Firefox's DoH canary is answered NXDOMAIN out of the box, and logged as
+/// blocked with the canary as the reason.
+#[tokio::test]
+async fn firefox_canary_is_answered_nxdomain_by_default() {
+    let mut h = Harness::new("dns-firefox-canary").await;
+    let ctx = Arc::new(h.ctx());
+    let src = SocketAddr::from(([192, 0, 2, 10], 53_000));
+
+    let decision = decide(
+        &raw_query("use-application-dns.net", RecordType::A),
+        src,
+        &ctx,
+    );
+    assert_eq!(answered_rcode(decision), Some(ResponseCode::NXDomain));
+
+    let entry = h.rx.recv().await.unwrap();
+    assert_eq!(entry.status, QueryStatus::Blocked);
+    assert_eq!(entry.upstream.as_deref(), Some("canary:firefox-doh"));
+    cleanup_sqlite(&h.db_path);
+}
+
+/// Private Relay's canaries go upstream until the switch is on, and the
+/// switch reaches the very next query, with no restart.
+#[tokio::test]
+async fn private_relay_switch_applies_live() {
+    let h = Harness::new("dns-private-relay").await;
+    let ctx = Arc::new(h.ctx());
+    let src = SocketAddr::from(([192, 0, 2, 10], 53_000));
+    let ask = || decide(&raw_query("mask.icloud.com", RecordType::A), src, &ctx);
+
+    assert!(matches!(ask(), Decision::Upstream(_)), "off by default");
+
+    ctx.switches.apply(&DnsConfig {
+        block_private_relay: true,
+        ..DnsConfig::default()
+    });
+    assert_eq!(answered_rcode(ask()), Some(ResponseCode::NXDomain));
+    cleanup_sqlite(&h.db_path);
+}
+
+/// A paused filter still answers the canary: Firefox would otherwise switch to
+/// its own DoH and stay there until the next network change.
+#[tokio::test]
+async fn canary_is_answered_while_filtering_is_off() {
+    let h = Harness::new("dns-canary-paused").await;
+    h.blocklist.set_blocking_enabled(false);
+    let ctx = Arc::new(h.ctx());
+    let src = SocketAddr::from(([192, 0, 2, 10], 53_000));
+
+    let decision = decide(
+        &raw_query("use-application-dns.net", RecordType::AAAA),
+        src,
+        &ctx,
+    );
+    assert_eq!(answered_rcode(decision), Some(ResponseCode::NXDomain));
     cleanup_sqlite(&h.db_path);
 }
