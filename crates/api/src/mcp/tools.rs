@@ -438,6 +438,7 @@ async fn top_domains(s: AppState, args: &Value) -> Result<Value, String> {
         limit: Some(int_arg(args, "limit", 15, 50) as usize),
         hours: Some(int_arg(args, "hours", 24, 168)),
         all_time: Some(false),
+        by: None,
     };
     let blocked = str_arg(args, "kind") == Some("blocked");
     let Json(v) = if blocked {

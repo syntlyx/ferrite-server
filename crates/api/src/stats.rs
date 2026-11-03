@@ -48,6 +48,8 @@ pub struct SummaryResponse {
     pub top_domains: Vec<(String, u64)>,
     pub top_blocked: Vec<(String, u64)>,
     pub top_clients: Vec<TopClientEntry>,
+    /// The devices with the most blocked queries, most first.
+    pub top_blocked_clients: Vec<TopClientEntry>,
     pub recent_domains: Vec<EnrichedEntry>,
     pub recent_blocked: Vec<EnrichedEntry>,
     pub timeseries: Vec<TimeseriesBucket>,
@@ -60,6 +62,8 @@ pub struct TopStatsParams {
     pub hours: Option<u64>,
     /// Use all retained history instead of a rolling hour window.
     pub all_time: Option<bool>,
+    /// `blocked` orders clients by blocked queries instead of all queries.
+    pub by: Option<String>,
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -68,50 +72,30 @@ pub struct TopStatsParams {
 pub async fn get_summary(State(state): State<AppState>) -> Result<Json<SummaryResponse>, ApiError> {
     let live = &state.inner.live_stats;
 
-    let top_domains = live.top_domains.top(10);
-    let top_blocked = live.top_blocked.top(10);
+    let top_domains = live.top_domains.top(TOP_N);
+    let top_blocked = live.top_blocked.top(TOP_N);
 
-    let top_clients = {
-        struct Agg {
-            total: u64,
-            blocked: u64,
-            ips: Vec<String>,
-            macs: Vec<String>,
-        }
-        let mut by_name: HashMap<String, Agg> = HashMap::new();
-        for (device, count) in live.top_clients.top(50) {
-            ClientRegistry::trigger_resolve_device(&state.inner.client_registry, &device);
-            let info = state.inner.client_registry.describe_device(&device);
-            let name = info.name.unwrap_or_else(|| device.clone());
-            let agg = by_name.entry(name).or_insert(Agg {
-                total: 0,
-                blocked: 0,
-                ips: vec![],
-                macs: vec![],
-            });
-            agg.total += count;
-            agg.blocked += live.client_blocked.get(&device);
-            for ip in info.ips {
-                push_unique(&mut agg.ips, ip);
-            }
-            for mac in info.macs {
-                push_unique(&mut agg.macs, mac);
-            }
-        }
-        let mut merged: Vec<TopClientEntry> = by_name
+    let top_clients = merge_clients(
+        &state,
+        live.top_clients.top(50).into_iter().map(|(device, total)| {
+            let blocked = live.client_blocked.get(&device);
+            (device, total, blocked)
+        }),
+        false,
+        TOP_N,
+    );
+    let top_blocked_clients = merge_clients(
+        &state,
+        live.client_blocked
+            .top(50)
             .into_iter()
-            .map(|(name, agg)| TopClientEntry {
-                name,
-                total: agg.total,
-                blocked: agg.blocked,
-                ips: agg.ips,
-                macs: agg.macs,
-            })
-            .collect();
-        merged.sort_unstable_by_key(|b| std::cmp::Reverse(b.total));
-        merged.truncate(10);
-        merged
-    };
+            .map(|(device, blocked)| {
+                let total = live.top_clients.get(&device);
+                (device, total, blocked)
+            }),
+        true,
+        TOP_N,
+    );
 
     let enrich = |entries: Vec<QueryEntry>| -> Vec<EnrichedEntry> {
         entries
@@ -145,6 +129,7 @@ pub async fn get_summary(State(state): State<AppState>) -> Result<Json<SummaryRe
         top_domains,
         top_blocked,
         top_clients,
+        top_blocked_clients,
         recent_domains,
         recent_blocked,
         timeseries: live.timeseries.buckets_24h(),
@@ -210,6 +195,36 @@ pub async fn get_top_clients(
         .storage
         .top_clients(from, now, limit * 5)
         .await?;
+    let by_blocked = params.by.as_deref() == Some("blocked");
+    let merged = merge_clients(
+        &state,
+        clients
+            .into_iter()
+            .map(|cs| (cs.device, cs.total, cs.blocked)),
+        by_blocked,
+        limit,
+    );
+
+    Ok(Json(
+        serde_json::json!({ "clients": merged, "from_ts": from, "to_ts": now }),
+    ))
+}
+
+// ── Shared helpers ────────────────────────────────────────────────────────────
+
+/// How many rows each live top list carries — enough to fill a dashboard card.
+const TOP_N: usize = 20;
+
+/// Per-device `(device, total, blocked)` rows folded into one entry per name —
+/// a device seen under several identities (its IP before its MAC was learned)
+/// counts once — then ordered by all queries or by blocked ones, most first.
+/// A list ordered by blocked leaves out devices with nothing blocked.
+fn merge_clients(
+    state: &AppState,
+    rows: impl IntoIterator<Item = (String, u64, u64)>,
+    by_blocked: bool,
+    limit: usize,
+) -> Vec<TopClientEntry> {
     struct Agg {
         total: u64,
         blocked: u64,
@@ -217,18 +232,18 @@ pub async fn get_top_clients(
         macs: Vec<String>,
     }
     let mut by_name: HashMap<String, Agg> = HashMap::new();
-    for cs in clients {
-        ClientRegistry::trigger_resolve_device(&state.inner.client_registry, &cs.device);
-        let info = state.inner.client_registry.describe_device(&cs.device);
-        let name = info.name.unwrap_or_else(|| cs.device.clone());
+    for (device, total, blocked) in rows {
+        ClientRegistry::trigger_resolve_device(&state.inner.client_registry, &device);
+        let info = state.inner.client_registry.describe_device(&device);
+        let name = info.name.unwrap_or_else(|| device.clone());
         let agg = by_name.entry(name).or_insert(Agg {
             total: 0,
             blocked: 0,
             ips: vec![],
             macs: vec![],
         });
-        agg.total += cs.total;
-        agg.blocked += cs.blocked;
+        agg.total += total;
+        agg.blocked += blocked;
         for ip in info.ips {
             push_unique(&mut agg.ips, ip);
         }
@@ -238,6 +253,7 @@ pub async fn get_top_clients(
     }
     let mut merged: Vec<TopClientEntry> = by_name
         .into_iter()
+        .filter(|(_, agg)| !by_blocked || agg.blocked > 0)
         .map(|(name, agg)| TopClientEntry {
             name,
             total: agg.total,
@@ -246,15 +262,14 @@ pub async fn get_top_clients(
             macs: agg.macs,
         })
         .collect();
-    merged.sort_unstable_by_key(|b| std::cmp::Reverse(b.total));
+    if by_blocked {
+        merged.sort_unstable_by_key(|b| std::cmp::Reverse(b.blocked));
+    } else {
+        merged.sort_unstable_by_key(|b| std::cmp::Reverse(b.total));
+    }
     merged.truncate(limit);
-
-    Ok(Json(
-        serde_json::json!({ "clients": merged, "from_ts": from, "to_ts": now }),
-    ))
+    merged
 }
-
-// ── Shared helpers ────────────────────────────────────────────────────────────
 
 fn time_window(params: &TopStatsParams) -> (i64, i64, usize) {
     let now = SystemTime::now()
@@ -365,6 +380,87 @@ mod tests {
                 "{name} still served stored history with statistics off"
             );
         }
+
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
+    }
+
+    /// Clients ordered by blocked queries put the most-blocked device first even
+    /// when another asks for more overall, and leave out devices with none.
+    #[tokio::test]
+    async fn top_clients_by_blocked() {
+        let (state, db_path) = test_support::app_state("api-stats-by-blocked").await;
+        let ts = chrono::Utc::now().timestamp();
+        let entry = |id: u64, device: &str, ip: &str, status: QueryStatus| QueryEntry {
+            id,
+            timestamp: chrono::DateTime::from_timestamp(ts, 0).unwrap(),
+            domain: "x.example".to_string(),
+            query_type: 1,
+            client_ip: ip.to_string(),
+            device: device.to_string(),
+            status,
+            latency_ms: 1,
+            upstream: None,
+            rcode: 0,
+        };
+        let mut rows = Vec::new();
+        // busy: 5 queries, 1 blocked. tracker: 3 queries, 3 blocked. quiet: 2, none.
+        for i in 0..5 {
+            let status = if i == 0 {
+                QueryStatus::Blocked
+            } else {
+                QueryStatus::Upstream
+            };
+            rows.push(entry(i, "aa:aa:aa:aa:aa:01", "192.0.2.1", status));
+        }
+        for i in 5..8 {
+            rows.push(entry(
+                i,
+                "aa:aa:aa:aa:aa:02",
+                "192.0.2.2",
+                QueryStatus::Blocked,
+            ));
+        }
+        for i in 8..10 {
+            rows.push(entry(
+                i,
+                "aa:aa:aa:aa:aa:03",
+                "192.0.2.3",
+                QueryStatus::Upstream,
+            ));
+        }
+        state
+            .inner
+            .storage
+            .write_batch(rows, RecordScope::ALL)
+            .await
+            .unwrap();
+
+        let query = |by: Option<&str>| {
+            Query(TopStatsParams {
+                all_time: Some(true),
+                by: by.map(str::to_string),
+                ..Default::default()
+            })
+        };
+        let totals = |v: &Value| -> Vec<(u64, u64)> {
+            v["clients"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| (c["total"].as_u64().unwrap(), c["blocked"].as_u64().unwrap()))
+                .collect()
+        };
+
+        let Json(all) = get_top_clients(State(state.clone()), query(None))
+            .await
+            .unwrap();
+        assert_eq!(totals(&all), vec![(5, 1), (3, 3), (2, 0)]);
+
+        let Json(blocked) = get_top_clients(State(state.clone()), query(Some("blocked")))
+            .await
+            .unwrap();
+        assert_eq!(totals(&blocked), vec![(3, 3), (5, 1)]);
 
         drop(state);
         test_support::cleanup_sqlite(&db_path);
