@@ -52,13 +52,7 @@ pub async fn update_server(State(state): State<AppState>) -> Result<Json<Value>,
 }
 
 fn restart_after_response(state: AppState) {
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        if let Err(e) = state.save_snapshot().await {
-            tracing::error!("snapshot save before server update restart failed: {}", e);
-        }
-        std::process::exit(0);
-    });
+    state.restart_in_place();
 }
 
 /// POST /api/update/web — download and replace the web UI assets

@@ -185,6 +185,39 @@ impl AppState {
         }
     }
 
+    /// What has to reach the disk before this process ends: the batch of
+    /// queries in flight, then the warm-restart snapshot. Bounded, so a stuck
+    /// writer can't hold an exit up.
+    pub async fn wind_down(&self) {
+        self.flush_notify.notify_one();
+        tokio::select! {
+            _ = self.flush_done.notified() => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                tracing::warn!("stats flush timed out, proceeding with snapshot anyway");
+            }
+        }
+        let state = self.clone();
+        let save = tokio::spawn(async move { state.save_snapshot().await });
+        match tokio::time::timeout(std::time::Duration::from_secs(10), save).await {
+            Ok(Ok(Ok(()))) => tracing::info!("snapshot saved"),
+            Ok(Ok(Err(e))) => tracing::error!("failed to save snapshot: {}", e),
+            Ok(Err(e)) => tracing::error!("snapshot task panicked: {}", e),
+            Err(_) => tracing::warn!("snapshot save timed out after 10s"),
+        }
+    }
+
+    /// Become a fresh process in a moment — once the answer that asked for it
+    /// has gone out — keeping the DNS and panel sockets open throughout (see
+    /// [`ferrite_core::handover`]).
+    pub fn restart_in_place(&self) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            state.wind_down().await;
+            ferrite_core::handover::restart();
+        });
+    }
+
     /// The slice of state the stats writer consumes (everything but the
     /// pipeline receiver, which `main` takes out of `query_rx` once).
     pub fn writer_ctx(&self) -> ferrite_stats::writer::WriterCtx {

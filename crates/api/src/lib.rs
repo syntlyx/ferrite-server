@@ -211,7 +211,11 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
 
     let router = build_router(state.clone());
 
-    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    let listener = match ferrite_core::handover::take_tcp("api", bind_addr) {
+        Some(l) => tokio::net::TcpListener::from_std(l)?,
+        None => tokio::net::TcpListener::bind(bind_addr).await?,
+    };
+    ferrite_core::handover::hold("api", &listener);
     tracing::info!("panel/API listener on http://{}", bind_addr);
 
     // Per-connection demux: peek the Host and serve the panel or route via the

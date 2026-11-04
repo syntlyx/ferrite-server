@@ -788,15 +788,8 @@ pub async fn update_settings(
 /// restart is coming, then it happens.
 #[cfg(not(test))]
 pub(crate) fn schedule_restart(state: &AppState) {
-    tracing::info!("restart-required settings changed, saving snapshot and exiting");
-    let snap_state = state.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        if let Err(e) = snap_state.save_snapshot().await {
-            tracing::error!("snapshot save before restart failed: {}", e);
-        }
-        std::process::exit(0);
-    });
+    tracing::info!("settings that take a new process changed: restarting in place");
+    state.restart_in_place();
 }
 
 /// Under test this does nothing, because the real one ends in

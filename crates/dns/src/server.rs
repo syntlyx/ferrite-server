@@ -17,13 +17,23 @@ const MAX_TCP_PAYLOAD: usize = 65535;
 pub async fn run(ctx: Arc<DnsCtx>) -> anyhow::Result<()> {
     let bind_addr = ctx.dns_config.bind_addr;
 
-    let udp = UdpSocket::bind(bind_addr)
-        .await
-        .map_err(|e| FeriteError::Dns(format!("UDP bind {}: {}", bind_addr, e)))?;
-
-    let tcp = TcpListener::bind(bind_addr)
-        .await
-        .map_err(|e| FeriteError::Dns(format!("TCP bind {}: {}", bind_addr, e)))?;
+    // After a restart in place the sockets are already open — the queries
+    // that came in meanwhile are waiting in them.
+    use ferrite_core::handover;
+    let udp = match handover::take_udp("dns-udp", bind_addr) {
+        Some(sock) => UdpSocket::from_std(sock)?,
+        None => UdpSocket::bind(bind_addr)
+            .await
+            .map_err(|e| FeriteError::Dns(format!("UDP bind {}: {}", bind_addr, e)))?,
+    };
+    let tcp = match handover::take_tcp("dns-tcp", bind_addr) {
+        Some(listener) => TcpListener::from_std(listener)?,
+        None => TcpListener::bind(bind_addr)
+            .await
+            .map_err(|e| FeriteError::Dns(format!("TCP bind {}: {}", bind_addr, e)))?,
+    };
+    handover::hold("dns-udp", &udp);
+    handover::hold("dns-tcp", &tcp);
 
     tracing::info!("DNS server listening on {}", bind_addr);
 

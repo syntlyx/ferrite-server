@@ -19,6 +19,9 @@ fn main() -> anyhow::Result<()> {
         Some("setup") => return setup::cmd_setup(),
         _ => {}
     }
+    // Before anything could replace the binary, and before a socket is bound:
+    // a restart in place hands its sockets over through here.
+    ferrite_core::handover::init();
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -190,24 +193,8 @@ async fn run() -> anyhow::Result<()> {
         tokio::spawn(async move {
             wait_for_shutdown_signal().await;
             tracing::info!("shutdown signal received, flushing stats…");
-            // Signal the stats writer to flush its in-flight batch immediately.
-            state_for_shutdown.flush_notify.notify_one();
-            // Wait for the writer to confirm it has finished — with a safety timeout
-            // in case the writer task crashed before we got here.
-            tokio::select! {
-                _ = state_for_shutdown.flush_done.notified() => {}
-                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-                    tracing::warn!("stats flush timed out, proceeding with snapshot anyway");
-                }
-            }
-            tracing::info!("saving snapshot…");
-            let save_task = tokio::spawn(async move { state_for_shutdown.save_snapshot().await });
-            match tokio::time::timeout(std::time::Duration::from_secs(10), save_task).await {
-                Ok(Ok(Ok(()))) => tracing::info!("snapshot saved, exiting"),
-                Ok(Ok(Err(e))) => tracing::error!("failed to save snapshot: {}", e),
-                Ok(Err(e)) => tracing::error!("snapshot task panicked: {}", e),
-                Err(_) => tracing::warn!("snapshot save timed out after 10s, exiting anyway"),
-            }
+            state_for_shutdown.wind_down().await;
+            tracing::info!("exiting");
             std::process::exit(0);
         });
     }

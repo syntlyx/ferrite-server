@@ -7,6 +7,7 @@
 pub mod config;
 pub mod error;
 pub mod fsinfo;
+pub mod handover;
 pub mod logbuf;
 pub mod memstats;
 pub mod net;

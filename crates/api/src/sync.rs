@@ -4,10 +4,10 @@
 //! A secondary reads the primary's configuration — `GET /api/config/export`,
 //! with the primary's API key — every `interval` seconds and takes the chosen
 //! sections. When that changes anything here it writes the config and
-//! restarts to apply it: about a second, with the DNS cache carried across by
-//! the warm-restart snapshot, so clients barely notice (and those that do ask
-//! the primary meanwhile). Nothing on the primary needs turning on but an API
-//! key.
+//! restarts in place to apply it (see `ferrite_core::handover`): the DNS
+//! socket stays open across the restart, the cache is carried by the
+//! warm-restart snapshot, and no query is dropped. Nothing on the primary
+//! needs turning on but an API key.
 //!
 //! What stays local, always: listeners, storage, the panel, passwords and
 //! keys, notifications, MCP — and this box's own `[sync]`.
