@@ -233,11 +233,13 @@ impl SecureDns {
     ) {
         let _guard = self.apply_lock.lock().await;
         self.gate.set_devices(&cfg.devices);
-        // Only the device list changed, and what runs is fine: nothing to
-        // restart. Anything that failed gets another go.
+        self.gate.set_proxies(&cfg.proxies);
+        // Only the device or proxy list changed, and what runs is fine:
+        // nothing to restart. Anything that failed gets another go.
         let key = (
             SecureDnsConfig {
                 devices: Vec::new(),
+                proxies: Vec::new(),
                 ..cfg.clone()
             },
             tunnels_port,
@@ -436,6 +438,13 @@ impl SecureDns {
             .load()
             .as_ref()
             .is_some_and(|s| is_ours(sni, &s.serving.hostname))
+    }
+
+    /// Whether a TLS connection that names no host is ours: one from a
+    /// trusted proxy, which by default doesn't name the box it passes a
+    /// request on to (nginx, and so Nginx Proxy Manager).
+    pub fn claims_unnamed(&self, peer: SocketAddr) -> bool {
+        self.shared.load().is_some() && self.gate.trusts(peer.ip())
     }
 
     /// Serve a connection Tunnels' listener accepted; `peeked` is what it

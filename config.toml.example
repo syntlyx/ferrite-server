@@ -519,6 +519,11 @@ domains = [
 # certificate = "letsencrypt"   # or "files"
 # dot_port    = 853
 # doh_port    = 443             # 0 = off
+# devices     = ["pixel", "iphone"]   # answered away from home
+# A reverse proxy passing DNS over HTTPS on (Nginx Proxy Manager…): its
+# address, so the client it names in X-Real-IP counts, not the proxy.
+# DNS over TLS has to reach ferrite directly.
+# proxies     = ["192.168.1.5"]
 #
 # [secure_dns.acme]
 # cloudflare_token = "…"

@@ -1,14 +1,16 @@
 //! DNS over HTTPS (RFC 8484): `GET /dns-query?dns=<base64url>` or `POST
 //! /dns-query` with an `application/dns-message` body, over HTTP/1.1 or
-//! HTTP/2. `/dns-query/<client id>` names the device.
+//! HTTP/2. `/dns-query/<client id>` names the device. Through a trusted
+//! reverse proxy, the client is the one it names.
 
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use base64::Engine;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
+use hyper::HeaderMap;
 use hyper::body::Incoming;
 use hyper::header::{CACHE_CONTROL, CONTENT_TYPE};
 use hyper::{Method, Request, Response, StatusCode};
@@ -64,6 +66,24 @@ pub(crate) fn path_id(path: &str, sni_id: Option<String>) -> Option<Option<Strin
     ferrite_core::net::normalize_client_id(id).map(Some)
 }
 
+/// The client a reverse proxy forwards for: `X-Real-IP`, else the last
+/// entry of `X-Forwarded-For` — the one the proxy added itself; anything
+/// before it came from the client and proves nothing.
+pub(crate) fn forwarded_for(headers: &HeaderMap) -> Option<IpAddr> {
+    let parse = |s: &str| -> Option<IpAddr> {
+        let s = s.trim();
+        s.parse()
+            .ok()
+            .or_else(|| s.parse::<SocketAddr>().ok().map(|a| a.ip()))
+            .map(ferrite_core::net::unmap_v4)
+    };
+    if let Some(v) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        return parse(v);
+    }
+    let last = headers.get_all("x-forwarded-for").into_iter().next_back()?;
+    parse(last.to_str().ok()?.rsplit(',').next()?)
+}
+
 async fn answer(
     req: Request<Incoming>,
     peer: SocketAddr,
@@ -73,6 +93,21 @@ async fn answer(
 ) -> Response<Full<Bytes>> {
     let Some(client_id) = path_id(req.uri().path(), sni_id) else {
         return reply(StatusCode::NOT_FOUND, "not found\n");
+    };
+    // A proxy is at home; the device behind it may not be. One that doesn't
+    // say who that is isn't answered as if it were the device.
+    let peer = if gate.trusts(peer.ip()) {
+        match forwarded_for(req.headers()) {
+            Some(ip) => SocketAddr::new(ip, peer.port()),
+            None => {
+                return reply(
+                    StatusCode::BAD_REQUEST,
+                    "the proxy didn't say whom it forwards for (X-Real-IP)\n",
+                );
+            }
+        }
+    } else {
+        peer
     };
     let raw = match *req.method() {
         Method::GET => {
@@ -141,7 +176,43 @@ fn dns_message(bytes: Vec<u8>) -> Response<Full<Bytes>> {
 
 #[cfg(test)]
 mod tests {
-    use super::path_id;
+    use super::{forwarded_for, path_id};
+    use hyper::HeaderMap;
+
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(*k, v.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn the_proxy_names_the_client() {
+        let ip = |s: &str| Some(s.parse().unwrap());
+        assert_eq!(
+            forwarded_for(&headers(&[("x-real-ip", "198.51.100.7")])),
+            ip("198.51.100.7")
+        );
+        // What the proxy added is the last entry; the rest is the client's word.
+        assert_eq!(
+            forwarded_for(&headers(&[("x-forwarded-for", "10.0.0.1, 198.51.100.7")])),
+            ip("198.51.100.7")
+        );
+        assert_eq!(
+            forwarded_for(&headers(&[
+                ("x-forwarded-for", "10.0.0.1"),
+                ("x-forwarded-for", "2001:db8::7"),
+            ])),
+            ip("2001:db8::7")
+        );
+        assert_eq!(
+            forwarded_for(&headers(&[("x-real-ip", "::ffff:198.51.100.7")])),
+            ip("198.51.100.7")
+        );
+        assert_eq!(forwarded_for(&headers(&[])), None);
+        assert_eq!(forwarded_for(&headers(&[("x-real-ip", "nonsense")])), None);
+    }
 
     #[test]
     fn paths_name_the_device() {

@@ -2,12 +2,17 @@
 //! plain DNS anyway. From the internet, only the devices named in the
 //! settings: the name and its wildcard are public (certificates are logged
 //! for anyone to read), and the box isn't a resolver for everyone.
+//!
+//! Behind a reverse proxy every connection is the proxy's, from home; the
+//! proxies listed are trusted to say whom they forward for, and that address
+//! is what counts.
 
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
+use ferrite_core::net::{IpNetwork, unmap_v4};
 use parking_lot::Mutex;
 use serde::Serialize;
 
@@ -23,6 +28,7 @@ pub struct TurnedAway {
 #[derive(Default)]
 pub(crate) struct Gate {
     devices: ArcSwap<HashSet<String>>,
+    proxies: ArcSwap<Vec<IpNetwork>>,
     turned_away: AtomicU64,
     last: Mutex<Option<TurnedAway>>,
 }
@@ -31,6 +37,20 @@ impl Gate {
     pub fn set_devices(&self, devices: &[String]) {
         self.devices
             .store(std::sync::Arc::new(devices.iter().cloned().collect()));
+    }
+
+    /// Entries that aren't an address or a network are left out; the API
+    /// refuses them before they get here.
+    pub fn set_proxies(&self, proxies: &[String]) {
+        self.proxies.store(std::sync::Arc::new(
+            proxies.iter().filter_map(|p| IpNetwork::parse(p)).collect(),
+        ));
+    }
+
+    /// Is `peer` a reverse proxy whose word on the client is taken?
+    pub fn trusts(&self, peer: IpAddr) -> bool {
+        let peer = unmap_v4(peer);
+        self.proxies.load().iter().any(|n| n.contains(peer))
     }
 
     /// May a query from `peer` carrying `id` be answered? One that may not is
@@ -77,5 +97,16 @@ mod tests {
         let (count, last) = gate.turned_away();
         assert_eq!(count, 2);
         assert_eq!(last.unwrap().device.as_deref(), Some("stranger"));
+    }
+
+    #[test]
+    fn only_listed_proxies_are_trusted() {
+        let gate = Gate::default();
+        assert!(!gate.trusts("192.168.1.5".parse().unwrap()));
+        gate.set_proxies(&["192.168.1.5".to_string(), "172.17.0.0/16".to_string()]);
+        assert!(gate.trusts("192.168.1.5".parse().unwrap()));
+        assert!(gate.trusts("::ffff:192.168.1.5".parse().unwrap()));
+        assert!(gate.trusts("172.17.0.3".parse().unwrap()));
+        assert!(!gate.trusts("192.168.1.6".parse().unwrap()));
     }
 }

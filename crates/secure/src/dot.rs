@@ -32,6 +32,15 @@ pub(crate) async fn serve<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // A stream passed on by a proxy can't say whose it is, and every one of
+    // them would look like it came from home.
+    if gate.trusts(peer.ip()) {
+        tracing::warn!(
+            "dot: {peer} is a proxy, which can't say who it forwards for over DNS over TLS; \
+             forward the port to this box directly"
+        );
+        return;
+    }
     let (mut rd, mut wr) = tokio::io::split(stream);
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(PER_CONNECTION);
 

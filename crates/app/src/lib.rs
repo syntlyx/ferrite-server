@@ -773,6 +773,10 @@ impl ferrite_proxy::TlsHandoff for SecureHandoff {
         self.0.claims(sni)
     }
 
+    fn claims_unnamed(&self, peer: SocketAddr) -> bool {
+        self.0.claims_unnamed(peer)
+    }
+
     fn take(
         &self,
         stream: tokio::net::TcpStream,

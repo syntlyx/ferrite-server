@@ -226,7 +226,17 @@ async fn handle(mut client: TcpStream, ctx: ProxyCtx, proto: Protocol) -> std::i
             Protocol::Tls => match parse_sni(&buf) {
                 SniResult::Found(h) => break h,
                 SniResult::Incomplete => {}
-                SniResult::NotFound => return Ok(()),
+                // Nothing to route by; but a reverse proxy passing on
+                // encrypted DNS connects without a name.
+                SniResult::NotFound => {
+                    if let Some(handoff) = &ctx.tls_handoff
+                        && let Ok(peer) = client.peer_addr()
+                        && handoff.claims_unnamed(peer)
+                    {
+                        handoff.take(client, buf, peer).await;
+                    }
+                    return Ok(());
+                }
             },
             Protocol::Http => match parse_http_host(&buf) {
                 HostResult::Found(h) => break h,

@@ -1170,6 +1170,12 @@ pub struct SecureDnsConfig {
     /// wildcard are public, and this isn't a resolver for everyone.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub devices: Vec<String>,
+    /// Reverse proxies in front of DNS over HTTPS (addresses or networks),
+    /// trusted to say who they forward for in `X-Real-IP` or
+    /// `X-Forwarded-For`. A query through one is judged by the address it
+    /// names: at home or away, and which devices may ask.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub proxies: Vec<String>,
 }
 
 impl Default for SecureDnsConfig {
@@ -1184,6 +1190,7 @@ impl Default for SecureDnsConfig {
             dot_port: 853,
             doh_port: 443,
             devices: Vec::new(),
+            proxies: Vec::new(),
         }
     }
 }

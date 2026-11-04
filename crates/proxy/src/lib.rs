@@ -95,6 +95,11 @@ pub struct ProxyCtx {
 pub trait TlsHandoff: Send + Sync {
     /// Is a connection asking for `sni` (lowercase, no trailing dot) yours?
     fn claims(&self, sni: &str) -> bool;
+    /// Is a TLS connection that names no host at all yours?
+    fn claims_unnamed(&self, peer: std::net::SocketAddr) -> bool {
+        let _ = peer;
+        false
+    }
     /// Serve it; `peeked` is what was already read from it.
     fn take(
         &self,

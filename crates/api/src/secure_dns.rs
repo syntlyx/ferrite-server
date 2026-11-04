@@ -173,6 +173,12 @@ fn tidy(cfg: &mut SecureDnsConfig) {
         .map(|d| ferrite_core::net::normalize_client_id(&d).unwrap_or(d))
         .filter(|d| seen.insert(d.clone()))
         .collect();
+    let mut seen = std::collections::HashSet::new();
+    cfg.proxies = std::mem::take(&mut cfg.proxies)
+        .into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty() && seen.insert(p.clone()))
+        .collect();
     cfg.acme.email = cfg.acme.email.trim().to_string();
     cfg.acme.cloudflare_token = cfg
         .acme
@@ -210,6 +216,15 @@ pub(crate) fn validate(cfg: &SecureDnsConfig, live: &Config) -> Result<(), Strin
     {
         return Err(format!(
             "{d} can't be a device name: letters, digits and dashes"
+        ));
+    }
+    if let Some(p) = cfg
+        .proxies
+        .iter()
+        .find(|p| ferrite_core::net::IpNetwork::parse(p).is_none())
+    {
+        return Err(format!(
+            "{p} isn't an address or a network, like 192.168.1.5 or 172.17.0.0/16"
         ));
     }
     let email = &cfg.acme.email;
@@ -326,6 +341,14 @@ mod tests {
         named.devices.push("my phone".into());
         tidy(&mut named);
         assert!(validate(&named, &live).unwrap_err().contains("my phone"));
+
+        let mut proxied = on(853, 443);
+        proxied.proxies = vec![" 192.168.1.5 ".into(), "192.168.1.5".into(), "".into()];
+        tidy(&mut proxied);
+        assert_eq!(proxied.proxies, vec!["192.168.1.5"]);
+        assert_eq!(validate(&proxied, &live), Ok(()));
+        proxied.proxies.push("npm.lan".into());
+        assert!(validate(&proxied, &live).unwrap_err().contains("npm.lan"));
     }
 
     #[tokio::test]
@@ -420,6 +443,29 @@ mod tests {
         tokio_rustls::TlsConnector::from(Arc::new(cfg))
             .connect(
                 rustls::pki_types::ServerName::try_from(sni.to_string()).unwrap(),
+                tcp,
+            )
+            .await
+            .unwrap()
+    }
+
+    /// A TLS connection that names no host, as nginx makes to what it proxies.
+    async fn connect_unnamed(port: u16) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+        let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyCert))
+        .with_no_client_auth();
+        cfg.enable_sni = false;
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        tokio_rustls::TlsConnector::from(Arc::new(cfg))
+            .connect(
+                rustls::pki_types::ServerName::try_from("dns.test").unwrap(),
                 tcp,
             )
             .await
@@ -600,6 +646,7 @@ mod tests {
         let Json(v) = put_secure_dns(State(state.clone()), Json(on(free_port(), shared)))
             .await
             .unwrap();
+        assert_eq!(v["status"]["doh_shared"], true, "{v}");
         assert_eq!(v["status"]["doh"], true, "{v}");
         assert_eq!(v["status"]["doh_shared"], true, "{v}");
 
@@ -634,6 +681,58 @@ mod tests {
             assert_eq!(&response[response.len() - 4..], &[10, 0, 0, 7]);
             assert_eq!(log.recv().await.unwrap().device, "id:v6");
         }
+
+        // Behind a reverse proxy: it connects without a name, and says who
+        // it forwards for. Here the proxy is 127.0.0.1 and the client away.
+        let mut proxied = on(free_port(), shared);
+        proxied.proxies = vec!["127.0.0.1".into()];
+        proxied.devices = vec!["phone".into()];
+        let Json(v) = put_secure_dns(State(state.clone()), Json(proxied))
+            .await
+            .unwrap();
+        assert_eq!(v["config"]["proxies"][0], "127.0.0.1", "{v}");
+        let through = |path: &'static str, headers: &'static str, id: u16| async move {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(home_query(id));
+            let mut https = connect_unnamed(shared).await;
+            https
+                .write_all(
+                    format!("GET {path}?dns={b64} HTTP/1.0\r\nHost: dns.test\r\n{headers}\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            let _ = https.read_to_end(&mut response).await;
+            response
+        };
+        // A listed device, away: answered, and logged at its own address.
+        let r = through("/dns-query/phone", "X-Real-IP: 198.51.100.7\r\n", 14).await;
+        assert_eq!(&r[r.len() - 4..], &[10, 0, 0, 7]);
+        let entry = log.recv().await.unwrap();
+        assert_eq!(entry.device, "id:phone");
+        assert_eq!(entry.client_ip, "198.51.100.7");
+        // Anyone else away: refused (RCODE 5).
+        let r = through(
+            "/dns-query/stranger",
+            "X-Forwarded-For: 10.0.0.1, 198.51.100.8\r\n",
+            15,
+        )
+        .await;
+        let split = r.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        assert_eq!(r[split + 3] & 0x0f, 5, "refused");
+        // At home behind the proxy: answered like any device at home.
+        let r = through("/dns-query/tv", "X-Real-IP: 192.168.1.40\r\n", 16).await;
+        assert_eq!(&r[r.len() - 4..], &[10, 0, 0, 7]);
+        assert_eq!(log.recv().await.unwrap().client_ip, "192.168.1.40");
+        // A proxy that doesn't say: not answered as the proxy.
+        let r = through("/dns-query/phone", "", 17).await;
+        let head = String::from_utf8_lossy(&r[..r.len().min(64)]).to_string();
+        assert!(head.contains(" 400 "), "{head}");
+        let Json(v) = put_secure_dns(State(state.clone()), Json(on(free_port(), shared)))
+            .await
+            .unwrap();
+        assert_eq!(v["status"]["doh_shared"], true, "{v}");
 
         // Tunnels off: encrypted DNS takes the port over itself.
         tunnels.enabled = false;
