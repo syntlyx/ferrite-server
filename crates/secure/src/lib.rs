@@ -25,7 +25,7 @@ mod profile;
 mod rewind;
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -447,6 +447,11 @@ impl SecureDns {
     /// request on to (nginx, and so Nginx Proxy Manager).
     pub fn claims_unnamed(&self, peer: SocketAddr) -> bool {
         self.shared.load().is_some() && self.gate.trusts(peer.ip())
+    }
+
+    /// Is `peer` one of the reverse proxies in `[secure_dns] proxies`?
+    pub fn trusts(&self, peer: IpAddr) -> bool {
+        self.gate.trusts(peer)
     }
 
     /// Serve a connection Tunnels' listener accepted; `peeked` is what it

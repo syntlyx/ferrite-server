@@ -161,11 +161,11 @@ pub fn decide_as(
     // Normalise IPv4-mapped IPv6 (::ffff:a.b.c.d) to plain IPv4 so the DB
     // stores clean addresses and PTR grouping works correctly.
     let client_addr = unmap_v4(src.ip());
-    // A device that names itself at home: Tunnels' listener sees only its
-    // address when it connects, and learns from this which device that is.
-    if let Some(d) = &device
-        && ferrite_core::net::is_local(client_addr)
-    {
+    // A device that names itself: Tunnels' listener sees only its address
+    // when it connects, and learns from this which device that is. From the
+    // internet that is also what lets the connection in at all — and only
+    // a listed device gets this far from there.
+    if let Some(d) = &device {
         ctx.client_registry.note_device(client_addr, d);
     }
     let blocking_enabled = ctx.blocklist.blocking_enabled();
@@ -343,8 +343,11 @@ pub fn decide_as(
     // never gets here. Synthetic + returned early (NOT cached): routing rules
     // are runtime-mutable, so a cached redirect could outlive a deletion.
     // A device away from home (encrypted DNS from the internet) can't reach
-    // the listeners at a home address: it gets the real one.
-    if let Some(intercept) = ferrite_core::net::is_local(client_addr)
+    // the listeners at a home address: it is sent to the public one, when
+    // routing away from home is on, else to the real site. Anyone else from
+    // the internet (plain DNS left open) isn't routed at all.
+    let away = !ferrite_core::net::is_local(client_addr);
+    if let Some(intercept) = (!away || device.is_some())
         .then(|| {
             ctx.interceptor.maybe_intercept(
                 &query,
@@ -353,6 +356,7 @@ pub fn decide_as(
                 client_ip,
                 client_mac.as_deref(),
                 device.as_deref(),
+                away,
             )
         })
         .flatten()

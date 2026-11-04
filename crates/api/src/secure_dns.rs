@@ -496,6 +496,43 @@ mod tests {
             .unwrap()
     }
 
+    /// A DoH GET over TLS to `sni`, behind a PROXY `header`.
+    async fn proxied_get(port: u16, header: &[u8], sni: &str, id: u16) -> Vec<u8> {
+        use base64::Engine;
+        let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyCert))
+        .with_no_client_auth();
+        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        tcp.write_all(header).await.unwrap();
+        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(cfg))
+            .connect(
+                rustls::pki_types::ServerName::try_from(sni.to_string()).unwrap(),
+                tcp,
+            )
+            .await
+            .unwrap();
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(home_query(id));
+        tls.write_all(
+            format!(
+                "GET /dns-query?dns={b64} HTTP/1.1\r\nHost: {sni}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut response = Vec::new();
+        let _ = tls.read_to_end(&mut response).await;
+        response
+    }
+
     /// A TLS connection that names no host, as nginx makes to what it proxies.
     async fn connect_unnamed(port: u16) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
         let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -776,6 +813,20 @@ mod tests {
         let r = through("/dns-query/phone", "", 17).await;
         let head = String::from_utf8_lossy(&r[..r.len().min(64)]).to_string();
         assert!(head.contains(" 400 "), "{head}");
+
+        // Passed on whole by a proxy (nginx `stream` with `proxy_protocol
+        // on`): the PROXY header names the client, the TLS name its device.
+        let header = b"PROXY TCP4 198.51.100.9 127.0.0.1 40000 443\r\n";
+        let r = proxied_get(shared, header, "phone.dns.test", 18).await;
+        assert_eq!(&r[r.len() - 4..], &[10, 0, 0, 7]);
+        let entry = log.recv().await.unwrap();
+        assert_eq!(
+            (entry.client_ip.as_str(), entry.device.as_str()),
+            ("198.51.100.9", "id:phone")
+        );
+        let r = proxied_get(shared, header, "stranger.dns.test", 19).await;
+        let split = r.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        assert_eq!(r[split + 3] & 0x0f, 5, "refused away from home");
         let Json(v) = put_secure_dns(State(state.clone()), Json(on(free_port(), shared)))
             .await
             .unwrap();

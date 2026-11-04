@@ -26,9 +26,13 @@ pub trait DnsInterceptor: Send + Sync {
     /// Returns an answer pointing at the proxy's advertise IP when `name`
     /// should be routed for this client, else `None`. `device` is the client
     /// ID an encrypted query carried (`id:pixel`), for rules scoped to it.
+    /// `away`: the device asked from the internet, so the answer is the
+    /// public address the listeners are reached at — or `None`, sending it
+    /// direct, when routing away from home is off.
     /// Hot path: one lock-free snapshot load, nothing held across an
     /// `.await`, and `query` decoded only once a rule has matched and there
     /// is an answer to synthesise.
+    #[allow(clippy::too_many_arguments)] // the query and who asks, flat for the hot path
     fn maybe_intercept(
         &self,
         query: &LazyQuery,
@@ -37,5 +41,6 @@ pub trait DnsInterceptor: Send + Sync {
         client_ip: &str,
         client_mac: Option<&str>,
         device: Option<&str>,
+        away: bool,
     ) -> Option<Intercept>;
 }

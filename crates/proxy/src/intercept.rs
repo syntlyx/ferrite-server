@@ -8,6 +8,7 @@
 //! connection through the chosen egress (or direct if the client reached us
 //! for a host we don't route).
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -25,6 +26,7 @@ use super::egress::{
     ConnectErrorKind, EgressConn, EvasionParams, direct_connect, enable_keepalive, write_split,
 };
 use super::http_host::{HostResult, parse_http_host};
+use super::proxy_protocol::{self, Header};
 use super::sni::{SniResult, parse_sni};
 use super::stats::{Counted, EgressStats};
 
@@ -211,6 +213,16 @@ async fn handle(mut client: TcpStream, ctx: ProxyCtx, proto: Protocol) -> std::i
     let _live = ferrite_core::memstats::PROXY_CONNS.guard();
     enable_keepalive(&client);
 
+    // Who this is: the connection's own peer, or — through a reverse proxy
+    // you trust, which says so in a PROXY header — the client behind it.
+    let via = client
+        .peer_addr()
+        .ok()
+        .map(|a| SocketAddr::new(a.ip().to_canonical(), a.port()));
+    let trusted = via.is_some_and(|v| ctx.tls_handoff.as_ref().is_some_and(|h| h.trusts(v.ip())));
+    let mut peer = via;
+    let mut header_read = !trusted;
+
     // Peek the destination host from the first bytes.
     let mut buf: Vec<u8> = Vec::with_capacity(2048);
     let host = loop {
@@ -222,6 +234,26 @@ async fn handle(mut client: TcpStream, ctx: ProxyCtx, proto: Protocol) -> std::i
             Err(_) => return Ok(()), // peek timed out
         };
         buf.extend_from_slice(&tmp[..n]);
+        if buf.len() > PEEK_CAP {
+            return Ok(());
+        }
+        if !header_read {
+            match proxy_protocol::parse(&buf) {
+                Header::Incomplete => continue,
+                Header::Absent => header_read = true,
+                Header::Present { from, len } => {
+                    if let Some(from) = from {
+                        peer = Some(SocketAddr::new(from.ip().to_canonical(), from.port()));
+                    }
+                    buf.drain(..len);
+                    header_read = true;
+                    if buf.is_empty() {
+                        continue;
+                    }
+                }
+                Header::Invalid => return Ok(()),
+            }
+        }
         match proto {
             Protocol::Tls => match parse_sni(&buf) {
                 SniResult::Found(h) => break h,
@@ -230,8 +262,8 @@ async fn handle(mut client: TcpStream, ctx: ProxyCtx, proto: Protocol) -> std::i
                 // encrypted DNS connects without a name.
                 SniResult::NotFound => {
                     if let Some(handoff) = &ctx.tls_handoff
-                        && let Ok(peer) = client.peer_addr()
-                        && handoff.claims_unnamed(peer)
+                        && let (Some(via), Some(peer)) = (via, peer)
+                        && handoff.claims_unnamed(via)
                     {
                         handoff.take(client, buf, peer).await;
                     }
@@ -244,9 +276,6 @@ async fn handle(mut client: TcpStream, ctx: ProxyCtx, proto: Protocol) -> std::i
                 HostResult::NotFound => return Ok(()),
             },
         }
-        if buf.len() > PEEK_CAP {
-            return Ok(());
-        }
     };
 
     // Another service's name on the shared TLS port: its connection, not ours
@@ -255,13 +284,13 @@ async fn handle(mut client: TcpStream, ctx: ProxyCtx, proto: Protocol) -> std::i
         && let Some(handoff) = &ctx.tls_handoff
         && handoff.claims(&host)
     {
-        if let Ok(peer) = client.peer_addr() {
+        if let Some(peer) = peer {
             handoff.take(client, buf, peer).await;
         }
         return Ok(());
     }
 
-    splice_through(client, ctx, proto, host, buf).await
+    splice_through(client, ctx, proto, host, buf, peer.map(|p| p.ip())).await
 }
 
 /// Forward an already-peeked HTTP connection through the proxy. Used by the shared
@@ -269,9 +298,17 @@ async fn handle(mut client: TcpStream, ctx: ProxyCtx, proto: Protocol) -> std::i
 /// though the proxy itself doesn't bind :80 when the panel owns it.
 pub async fn forward_http(ctx: ProxyCtx, client: TcpStream, buf: Vec<u8>, host: String) {
     enable_keepalive(&client);
-    if let Err(e) = splice_through(client, ctx, Protocol::Http, host, buf).await {
+    let peer = client.peer_addr().ok().map(|a| a.ip().to_canonical());
+    if let Err(e) = splice_through(client, ctx, Protocol::Http, host, buf, peer).await {
         tracing::debug!("proxy: http forward ended: {e}");
     }
+}
+
+/// May a connection be routed at all? From home, yes. From the internet only
+/// one of your devices — known by the address it just asked over encrypted
+/// DNS from — and only while routing away from home is on.
+fn admitted(away: bool, device: Option<&str>, routes_away: bool) -> bool {
+    !away || (device.is_some() && routes_away)
 }
 
 /// Would the DNS pipeline block `host` for this client? Mirrors the handler's
@@ -307,14 +344,16 @@ async fn splice_through(
     proto: Protocol,
     host: String,
     buf: Vec<u8>,
+    // The client: the connection's peer, or the one a trusted reverse proxy
+    // named (canonical, so an IPv4-mapped IPv6 peer matches the registry's
+    // plain IPv4).
+    client_addr: Option<IpAddr>,
 ) -> std::io::Result<()> {
     let port = proto.upstream_port();
 
     // Identify the connecting client for client-scoped rules and per-client
-    // blocking (canonicalize so an IPv4-mapped IPv6 peer matches the registry's
-    // plain IPv4). MAC resolution is a cheap in-memory lookup, but skip it
+    // blocking. MAC resolution is a cheap in-memory lookup, but skip it
     // entirely when nothing keys on it.
-    let client_addr = client.peer_addr().ok().map(|a| a.ip().to_canonical());
     let client_ip = client_addr.map(|ip| ip.to_string()).unwrap_or_default();
     let need_mac = ctx.proxy.has_client_rules()
         || (ctx.blocklist.blocking_enabled()
@@ -324,13 +363,21 @@ async fn splice_through(
     } else {
         None
     };
+    // From the internet, only one of your devices — at an address it has
+    // just asked from over encrypted DNS — is let in, and only for a name
+    // routed for it: never a plain forwarder for whoever finds the port.
+    let away = client_addr.is_some_and(|ip| !ferrite_core::net::is_local(ip));
     // The device that named itself over encrypted DNS from this address, for
     // rules and profiles scoped to it.
-    let device = if need_mac {
+    let device = if need_mac || away {
         client_addr.and_then(|ip| ctx.client_registry.device_at(ip))
     } else {
         None
     };
+    if !admitted(away, device.as_deref(), ctx.proxy.routes_away()) {
+        tracing::debug!("proxy: {client_ip} isn't one of ours away from home → dropping {host}");
+        return Ok(());
+    }
 
     // Blocking applies here too, not just at DNS answer time: the client may
     // hold a stale (or deliberately kept) resolution to our advertise IP, and
@@ -414,6 +461,11 @@ async fn splice_through(
                     }
                 }
             }
+        }
+        // From the internet, nothing but routed names.
+        None if away => {
+            tracing::debug!("proxy: {host} isn't routed for {client_ip} away from home → dropping");
+            return Ok(());
         }
         None => {
             // The client reached us for a host we don't route (it used its own
@@ -685,6 +737,17 @@ mod blocking_tests {
 #[cfg(test)]
 mod splice_tests {
     use super::*;
+
+    #[test]
+    fn from_the_internet_only_our_devices_are_routed() {
+        assert!(admitted(false, None, false), "at home");
+        assert!(admitted(true, Some("id:pixel"), true));
+        assert!(!admitted(true, None, true), "a stranger");
+        assert!(
+            !admitted(true, Some("id:pixel"), false),
+            "routing away is off"
+        );
+    }
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
     /// Bytes flow both ways and the splice returns cleanly once both ends EOF.

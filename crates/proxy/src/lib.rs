@@ -13,6 +13,7 @@ mod health;
 pub mod http_host;
 mod intercept;
 mod probe;
+mod proxy_protocol;
 mod rules;
 mod sni;
 /// Zero-copy relay via `splice(2)`; the generic userspace relay stays the
@@ -28,7 +29,7 @@ pub use intercept::forward_http;
 pub use intercept::run;
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -37,7 +38,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use hickory_proto::op::{Message, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA};
-use hickory_proto::rr::{RData, Record};
+use hickory_proto::rr::{RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinEncodable;
 use parking_lot::RwLock;
 use tokio::sync::Notify;
@@ -100,6 +101,12 @@ pub trait TlsHandoff: Send + Sync {
         let _ = peer;
         false
     }
+    /// Is `peer` a reverse proxy whose PROXY header, naming the client
+    /// behind it, is believed?
+    fn trusts(&self, peer: std::net::IpAddr) -> bool {
+        let _ = peer;
+        false
+    }
     /// Serve it; `peeked` is what was already read from it.
     fn take(
         &self,
@@ -128,6 +135,9 @@ pub struct ProxyState {
     down: DashMap<String, DownState>,
     /// The TLS listener is bound right now.
     https_up: std::sync::atomic::AtomicBool,
+    /// The public address found for devices away from home (see
+    /// [`ProxyState::find_away_address`]), when the config doesn't give one.
+    away_found: ArcSwap<(Option<Ipv4Addr>, Option<Ipv6Addr>)>,
 }
 
 /// Per-egress downtime bookkeeping for the alert watcher.
@@ -176,6 +186,10 @@ struct Snapshot {
     enabled: bool,
     advertise_ipv4: Option<Ipv4Addr>,
     advertise_ipv6: Option<Ipv6Addr>,
+    /// Route names for devices away from home too, at the public address.
+    route_away: bool,
+    away_ipv4: Option<Ipv4Addr>,
+    away_ipv6: Option<Ipv6Addr>,
     egresses: Vec<Arc<Egress>>,
     /// The config each `egresses[i]` was built from, in the same order. Kept so a
     /// reload can reuse an unchanged egress instead of tearing its tunnel down
@@ -214,7 +228,50 @@ impl ProxyState {
             stats: ProxyStats::new(switches),
             down: DashMap::new(),
             https_up: std::sync::atomic::AtomicBool::new(false),
+            away_found: ArcSwap::from_pointee((None, None)),
         })
+    }
+
+    /// Whether names are routed for devices away from home.
+    pub fn routes_away(&self) -> bool {
+        let snap = self.registry.load();
+        snap.enabled && snap.route_away
+    }
+
+    /// Where a device away from home is sent for a routed name: the config's
+    /// address, else the one found. `(None, None)`: routing away is off, or
+    /// no public address is known — away devices go direct.
+    pub fn away_address(&self) -> (Option<Ipv4Addr>, Option<Ipv6Addr>) {
+        let snap = self.registry.load();
+        if !snap.enabled || !snap.route_away {
+            return (None, None);
+        }
+        let found = self.away_found.load();
+        (snap.away_ipv4.or(found.0), snap.away_ipv6.or(found.1))
+    }
+
+    /// Look the public address up as the internet sees it: `name`'s A and
+    /// AAAA records, through the upstreams — not ferrite's own answer for it,
+    /// which is the home address. A private address there is no use away
+    /// from home, and is ignored.
+    pub async fn find_away_address(&self, name: &str) -> (Option<Ipv4Addr>, Option<Ipv6Addr>) {
+        let public = |ip: IpAddr| !ferrite_core::net::is_local(ip);
+        let v4 = egress::query_addr(&self.upstream, name, RecordType::A)
+            .await
+            .filter(|ip| public(*ip))
+            .and_then(|ip| match ip {
+                IpAddr::V4(v4) => Some(v4),
+                IpAddr::V6(_) => None,
+            });
+        let v6 = egress::query_addr(&self.upstream, name, RecordType::AAAA)
+            .await
+            .filter(|ip| public(*ip))
+            .and_then(|ip| match ip {
+                IpAddr::V6(v6) => Some(v6),
+                IpAddr::V4(_) => None,
+            });
+        self.away_found.store(Arc::new((v4, v6)));
+        (v4, v6)
     }
 
     /// Whether the TLS listener is up — for a service sharing its port.
@@ -391,11 +448,23 @@ impl DnsInterceptor for ProxyState {
         client_ip: &str,
         client_mac: Option<&str>,
         device: Option<&str>,
+        away: bool,
     ) -> Option<Intercept> {
         let snap = self.registry.load();
         if !snap.enabled {
             return None;
         }
+        // Away from home the listeners are reached at the public address, if
+        // routing away is on and one is known; otherwise the device goes
+        // direct.
+        let (v4, v6) = if away {
+            match self.away_address() {
+                (None, None) => return None,
+                found => found,
+            }
+        } else {
+            (snap.advertise_ipv4, snap.advertise_ipv6)
+        };
         // Routing is orthogonal to blocking: the DNS pipeline checks the
         // blocklist BEFORE calling this, so a blocked name never reaches us —
         // and the whitelist means "never block this", not "never route this"
@@ -406,12 +475,7 @@ impl DnsInterceptor for ProxyState {
         let egress_id = snap.egresses[rule.egress_idx].id().to_string();
         // Decoded only now: the query has to be echoed into an answer, which
         // is the one thing the wire form can't do for us.
-        let response = synth_response(
-            query.message()?,
-            qtype,
-            snap.advertise_ipv4,
-            snap.advertise_ipv6,
-        );
+        let response = synth_response(query.message()?, qtype, v4, v6);
         Some(Intercept {
             response,
             egress_id,
@@ -492,6 +556,9 @@ fn build_snapshot(
             .advertise_ipv4
             .or_else(ferrite_core::net::local_ipv4_for_internet),
         advertise_ipv6: cfg.advertise_ipv6,
+        route_away: cfg.route_away,
+        away_ipv4: cfg.away_ipv4,
+        away_ipv6: cfg.away_ipv6,
         egresses,
         egress_configs,
         rules,
@@ -612,6 +679,9 @@ mod tests {
             https_port: 8443,
             advertise_ipv4: Some(Ipv4Addr::new(192, 168, 1, 5)),
             advertise_ipv6: None,
+            route_away: false,
+            away_ipv4: None,
+            away_ipv6: None,
             max_connections: 16,
             alert_webhook: None,
             probe_target: None,
@@ -653,6 +723,66 @@ mod tests {
         m.to_bytes().unwrap()
     }
 
+    /// A device away from home is sent to the public address when routing
+    /// away is on, and straight to the site when it's off.
+    #[test]
+    fn away_devices_get_the_public_address() {
+        let proxy = state(true);
+        let q = query("www.example.com", RecordType::A);
+        let ask = |p: &ProxyState| {
+            p.maybe_intercept(
+                &LazyQuery::new(&q),
+                "www.example.com",
+                qtype::A,
+                "198.51.100.7",
+                None,
+                Some("id:pixel"),
+                true,
+            )
+        };
+        assert!(ask(&proxy).is_none(), "routing away is off");
+
+        let mut cfg = ProxyConfig {
+            enabled: true,
+            route_away: true,
+            ..ProxyConfig::default()
+        };
+        cfg.egresses = vec![EgressConfig {
+            id: "t".into(),
+            name: "t".into(),
+            enabled: true,
+            kind: "direct".into(),
+            address: None,
+            port: None,
+            username: None,
+            password: None,
+            config: None,
+            seg_position: None,
+            buffer_kb: None,
+            tx_buffer_kb: None,
+            backend: None,
+        }];
+        cfg.rules = vec![RuleConfig {
+            pattern: "*.example.com".into(),
+            service: None,
+            egress: "t".into(),
+            fail_closed: true,
+            clients: Vec::new(),
+        }];
+        proxy.reload(&cfg);
+        assert!(ask(&proxy).is_none(), "no public address known yet");
+        assert!(proxy.routes_away());
+
+        cfg.away_ipv4 = Some(Ipv4Addr::new(203, 0, 113, 9));
+        proxy.reload(&cfg);
+        let hit = ask(&proxy).expect("routed away from home");
+        let msg = Message::from_bytes(&hit.response.bytes).unwrap();
+        assert!(matches!(
+            msg.answers[0].data,
+            RData::A(A(ip)) if ip == Ipv4Addr::new(203, 0, 113, 9)
+        ));
+    }
+
     #[test]
     fn routes_matching_domain_to_advertise_ip() {
         let proxy = state(true);
@@ -665,6 +795,7 @@ mod tests {
                 "0.0.0.0",
                 None,
                 None,
+                false,
             )
             .expect("should route");
         assert_eq!(hit.egress_id, "t");
@@ -704,6 +835,7 @@ mod tests {
                 "192.168.1.40",
                 None,
                 device,
+                false,
             )
         };
         assert!(ask(Some("id:pixel")).is_some());
@@ -723,7 +855,8 @@ mod tests {
                     qtype::A,
                     "0.0.0.0",
                     None,
-                    None
+                    None,
+                    false,
                 )
                 .is_none()
         );
@@ -741,7 +874,8 @@ mod tests {
                     qtype::A,
                     "0.0.0.0",
                     None,
-                    None
+                    None,
+                    false,
                 )
                 .is_none()
         );
@@ -759,6 +893,7 @@ mod tests {
                 "0.0.0.0",
                 None,
                 None,
+                false,
             )
             .expect("should still intercept");
         let msg = Message::from_bytes(&hit.response.bytes).unwrap();
@@ -774,6 +909,9 @@ mod tests {
             https_port: 8443,
             advertise_ipv4: Some(Ipv4Addr::new(192, 168, 1, 5)),
             advertise_ipv6: None,
+            route_away: false,
+            away_ipv4: None,
+            away_ipv6: None,
             max_connections: 16,
             alert_webhook: None,
             probe_target: None,
@@ -905,6 +1043,7 @@ mod tests {
                 "0.0.0.0",
                 None,
                 None,
+                false,
             )
             .expect("should intercept type 65");
         let msg = Message::from_bytes(&hit.response.bytes).unwrap();

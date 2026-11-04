@@ -20,6 +20,7 @@ use ferrite_proxy::usable_rcvbuf_bytes;
 /// GET /api/proxy — current config (socks5 passwords redacted) + egress health.
 pub async fn get_proxy(State(state): State<AppState>) -> Json<Value> {
     let proxy = state.live_config.read().proxy.clone();
+    let away = state.inner.proxy.away_address();
 
     let health: serde_json::Map<String, Value> = proxy
         .egresses
@@ -41,6 +42,12 @@ pub async fn get_proxy(State(state): State<AppState>) -> Json<Value> {
         // per-connection buffer exceeds this drops bursts under load; the UI warns
         // and suggests raising net.core.rmem_max.
         "max_buffer_kb": kernel_udp_recv_kb(),
+        // Where devices away from home are sent for routed names: the
+        // configured address, or the one found from the encrypted DNS name.
+        "away_address": {
+            "ipv4": away.0,
+            "ipv6": away.1,
+        },
     }))
 }
 

@@ -16,7 +16,7 @@ mod evasion;
 mod socks5;
 mod wireguard;
 
-pub use direct::{DirectEgress, direct_connect};
+pub use direct::{DirectEgress, direct_connect, query_addr};
 pub use evasion::{EvasionParams, write_split};
 
 use std::sync::Arc;

@@ -79,7 +79,8 @@ async fn resolve_via_upstream(upstream: &ZoneRouter, host: &str) -> Result<IpAdd
     Err(FeriteError::Dns(format!("could not resolve {host}")))
 }
 
-async fn query_addr(upstream: &ZoneRouter, host: &str, rtype: RecordType) -> Option<IpAddr> {
+/// The first `rtype` address `host` has, asked of the upstreams.
+pub async fn query_addr(upstream: &ZoneRouter, host: &str, rtype: RecordType) -> Option<IpAddr> {
     let name = Name::from_str(&format!("{}.", host.trim_end_matches('.'))).ok()?;
     let mut msg = Message::new(0, MessageType::Query, OpCode::Query);
     msg.metadata.recursion_desired = true;

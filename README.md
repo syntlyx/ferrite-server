@@ -38,6 +38,9 @@ device does through an egress: built-in WireGuard (paste a `.conf`; the kernel
 does the crypto when ferrite has `CAP_NET_ADMIN`, an in-process userspace
 tunnel otherwise — no TUN device either way), SOCKS5 (point it at Tor), or
 direct with TLS ClientHello fragmentation to get past DPI. Rules can be scoped to devices and fail closed when a tunnel is down.
+Devices on encrypted DNS can be routed away from home too, with no VPN app:
+their routed names point at the box's public address, which lets in only
+your devices, and only for routed names.
 ferrite reads the SNI or Host and never terminates TLS. Routing decides *how*
 traffic leaves; blocking still decides *whether* a name resolves.
 

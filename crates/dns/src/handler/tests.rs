@@ -55,7 +55,12 @@ impl DnsInterceptor for StubInterceptor {
         _client_ip: &str,
         _client_mac: Option<&str>,
         _device: Option<&str>,
+        away: bool,
     ) -> Option<Intercept> {
+        // Away from home routing is off here: those go direct.
+        if away {
+            return None;
+        }
         let routes = self.routes.read();
         let (bytes, egress_id) = routes.get(name)?;
         Some(Intercept {
@@ -689,8 +694,9 @@ async fn routed_domain_is_logged_with_routed_status_and_egress() {
     cleanup_sqlite(&h.db_path);
 }
 
-/// A device that names itself at home is remembered at its address, so
-/// Tunnels' listener can tell whose connection it is; away, nothing is noted.
+/// A device that names itself is remembered at its address, so Tunnels'
+/// listener can tell whose connection it is — away from home too, where that
+/// is what lets the connection in.
 #[tokio::test]
 async fn a_named_device_is_known_at_its_home_address() {
     let mut h = Harness::new("dns-device-at").await;
@@ -719,7 +725,10 @@ async fn a_named_device_is_known_at_its_home_address() {
         h.client_registry.device_at(home.ip()).as_deref(),
         Some("id:pixel")
     );
-    assert_eq!(h.client_registry.device_at(away.ip()), None);
+    assert_eq!(
+        h.client_registry.device_at(away.ip()).as_deref(),
+        Some("id:pixel")
+    );
 
     // Another device from the same address takes it over.
     handle_query_as(

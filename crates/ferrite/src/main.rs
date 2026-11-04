@@ -230,6 +230,7 @@ async fn run() -> anyhow::Result<()> {
 
     // ── New-device notifications ─────────────────────────────────────────────
     tokio::spawn(new_device_loop(state.clone()));
+    tokio::spawn(away_address_loop(state.clone()));
     // Following a primary ferrite, when `[sync]` names one.
     tokio::spawn(ferrite_api::sync::run(state.clone()));
 
@@ -578,6 +579,57 @@ async fn new_device_loop(state: ferrite_app::AppState) {
                 tracing::warn!("new-device webhook for {}: {}", device.mac, e);
             }
         });
+    }
+}
+
+/// How often the public address for devices away from home is looked up.
+const AWAY_ADDRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Keep the public address devices away from home are sent to for routed
+/// names current, when the config doesn't fix it: the encrypted DNS name's
+/// own records as the internet sees them, which a home on a changing address
+/// keeps up to date anyway (it has to, for the devices to find the box).
+/// Looked up again at once when the name, or routing away, changes.
+async fn away_address_loop(state: ferrite_app::AppState) {
+    let mut done: Option<(String, std::time::Instant)> = None;
+    let mut known = (None, None);
+    loop {
+        let name = {
+            let cfg = state.live_config.read();
+            let p = &cfg.proxy;
+            (p.enabled && p.route_away && (p.away_ipv4.is_none() || p.away_ipv6.is_none()))
+                .then(|| cfg.secure_dns.hostname.clone())
+                .filter(|h| !h.is_empty())
+        };
+        match name {
+            Some(name)
+                if done
+                    .as_ref()
+                    .is_none_or(|(n, at)| *n != name || at.elapsed() >= AWAY_ADDRESS_EVERY) =>
+            {
+                let found = state.inner.proxy.find_away_address(&name).await;
+                if found != known {
+                    match found {
+                        (None, None) => tracing::warn!(
+                            "tunnels away from home: {name} has no public address; away devices go direct"
+                        ),
+                        (v4, v6) => tracing::info!(
+                            "tunnels away from home: sending devices to {}",
+                            [v4.map(|a| a.to_string()), v6.map(|a| a.to_string())]
+                                .into_iter()
+                                .flatten()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    }
+                    known = found;
+                }
+                done = Some((name, std::time::Instant::now()));
+            }
+            Some(_) => {}
+            None => done = None,
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
     }
 }
 

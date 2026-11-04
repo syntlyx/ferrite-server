@@ -777,6 +777,10 @@ impl ferrite_proxy::TlsHandoff for SecureHandoff {
         self.0.claims_unnamed(peer)
     }
 
+    fn trusts(&self, peer: std::net::IpAddr) -> bool {
+        self.0.trusts(peer)
+    }
+
     fn take(
         &self,
         stream: tokio::net::TcpStream,

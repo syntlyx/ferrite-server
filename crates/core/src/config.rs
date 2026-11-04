@@ -673,6 +673,21 @@ pub struct ProxyConfig {
     /// routed domains return NODATA so clients fall back to IPv4.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub advertise_ipv6: Option<Ipv6Addr>,
+    /// Routed names for devices away from home, asking over encrypted DNS
+    /// from the internet. On, they get the box's public address, where the
+    /// internet's port 443 must reach `https_port`; a connection there is let
+    /// in only from an address one of your devices has just asked from, and
+    /// only for a routed name. Off, they go direct away from home.
+    pub route_away: bool,
+    /// The public address for `route_away`. Unset: the encrypted DNS name's
+    /// own A record, looked up through the upstreams every few minutes, so a
+    /// changing address at home is followed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub away_ipv4: Option<Ipv4Addr>,
+    /// The same for IPv6, which a box usually has without NAT. Unset: the
+    /// name's AAAA record, if it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub away_ipv6: Option<Ipv6Addr>,
     /// Hard cap on simultaneous proxied connections (bounds memory).
     pub max_connections: usize,
     /// DEPRECATED: superseded by `[notifications] webhook`. Still accepted on
@@ -701,6 +716,9 @@ impl Default for ProxyConfig {
             https_port: default_https_port(),
             advertise_ipv4: None,
             advertise_ipv6: None,
+            route_away: false,
+            away_ipv4: None,
+            away_ipv6: None,
             max_connections: default_max_connections(),
             alert_webhook: None,
             probe_target: None,
