@@ -47,6 +47,20 @@ the services behind it, the profile that governs it. Notifications go to ntfy,
 Telegram, Discord, Slack, Gotify or a JSON webhook when a tunnel stays down or
 a device the box has never seen joins the network.
 
+**Encrypted DNS for your devices.** Android's Private DNS (DNS over TLS) and
+iPhones, Macs and browsers (DNS over HTTPS) can use ferrite at home and away.
+Each device connects under its own name, so it keeps its profile wherever it
+is. Give it a Cloudflare token and ferrite gets the certificate from Let's
+Encrypt and renews it, with no port open for that; an iPhone or Mac sets
+itself up from a profile. DNS over HTTPS shares 443 with Tunnels, and from
+outside the house only the devices you list are answered.
+
+**Keeping devices on the filter.** Firefox is kept from switching to its own
+DNS over HTTPS, and iCloud Private Relay and Encrypted Client Hello can be
+turned off for the network. For routers that won't hand out another DNS
+server, ferrite can run DHCP itself (off by default), and every device it
+gives an address shows up under its own name.
+
 **Private DNS.** Plain, DoT, DoH and DoQ upstreams in one pool with failover; an
 upstream's queries can themselves ride a tunnel. EDNS Client Subnet is stripped,
 DNSSEC is requested, local zones can be forwarded to your router, and custom
@@ -216,7 +230,8 @@ open **`http://fe.te`** on the LAN, and set a password.
   client's LAN IP/MAC — behind a Docker bridge every query arrives from the
   gateway, so all your devices look like one. If you must use bridge mode, set
   `FERRITE_PANEL_IP=<host LAN IP>` so the `fe.te` shortcut resolves, and publish
-  `443/tcp` as well if you use selective routing.
+  `443/tcp` as well if you use selective routing or DNS over HTTPS, and
+  `853/tcp` for DNS over TLS. DHCP needs host networking.
 - `fe.te` is a built-in DNS record pointing at the detected (or configured) server
   IP, so the panel is easy to find.
 
