@@ -50,16 +50,19 @@ impl CompiledRule {
     }
 
     /// Does this rule apply to the querying client? Empty client list = all
-    /// clients; otherwise the client's IP or resolved MAC must be listed.
-    pub fn matches_client(&self, ip: &str, mac: Option<&str>) -> bool {
+    /// clients; otherwise the client's IP, resolved MAC or device name (the
+    /// client ID of encrypted DNS, `id:pixel`) must be listed.
+    pub fn matches_client(&self, ip: &str, mac: Option<&str>, device: Option<&str>) -> bool {
         if self.clients.is_empty() {
             return true;
         }
         // Compared in place: this runs per query for every client-scoped rule,
         // and lowercasing both sides first allocated two strings to do it.
-        self.clients
-            .iter()
-            .any(|c| c.eq_ignore_ascii_case(ip) || mac.is_some_and(|m| c.eq_ignore_ascii_case(m)))
+        self.clients.iter().any(|c| {
+            c.eq_ignore_ascii_case(ip)
+                || mac.is_some_and(|m| c.eq_ignore_ascii_case(m))
+                || device.is_some_and(|d| c.eq_ignore_ascii_case(d))
+        })
     }
 }
 
@@ -187,12 +190,18 @@ mod tests {
             pattern: "x.test".to_string(),
             egress_idx: 0,
             fail_closed: true,
-            clients: vec!["aa:bb:cc:dd:ee:ff".to_string(), "10.0.0.5".to_string()],
+            clients: vec![
+                "aa:bb:cc:dd:ee:ff".to_string(),
+                "10.0.0.5".to_string(),
+                "id:pixel".to_string(),
+            ],
             specificity: 0,
         };
-        assert!(scoped.matches_client("10.0.0.5", None)); // by IP
-        assert!(scoped.matches_client("10.0.0.9", Some("AA:BB:CC:DD:EE:FF"))); // by MAC, case-insensitive
-        assert!(!scoped.matches_client("10.0.0.9", None)); // neither IP nor MAC listed
+        assert!(scoped.matches_client("10.0.0.5", None, None)); // by IP
+        assert!(scoped.matches_client("10.0.0.9", Some("AA:BB:CC:DD:EE:FF"), None)); // by MAC, case-insensitive
+        assert!(scoped.matches_client("10.0.0.9", None, Some("id:pixel"))); // by device name
+        assert!(!scoped.matches_client("10.0.0.9", None, Some("id:tv")));
+        assert!(!scoped.matches_client("10.0.0.9", None, None)); // neither IP nor MAC listed
 
         let all = CompiledRule {
             matcher: Matcher::Exact("x.test".to_string()),
@@ -202,7 +211,7 @@ mod tests {
             clients: Vec::new(),
             specificity: 0,
         };
-        assert!(all.matches_client("1.2.3.4", None)); // empty list = all clients
+        assert!(all.matches_client("1.2.3.4", None, None)); // empty list = all clients
     }
 
     #[test]

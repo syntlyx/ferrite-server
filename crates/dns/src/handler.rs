@@ -161,6 +161,13 @@ pub fn decide_as(
     // Normalise IPv4-mapped IPv6 (::ffff:a.b.c.d) to plain IPv4 so the DB
     // stores clean addresses and PTR grouping works correctly.
     let client_addr = unmap_v4(src.ip());
+    // A device that names itself at home: Tunnels' listener sees only its
+    // address when it connects, and learns from this which device that is.
+    if let Some(d) = &device
+        && ferrite_core::net::is_local(client_addr)
+    {
+        ctx.client_registry.note_device(client_addr, d);
+    }
     let blocking_enabled = ctx.blocklist.blocking_enabled();
     // Does anything below key on *which* client this is — a blocklist
     // client-bypass, a per-device blocking profile, or a proxy rule scoped to
@@ -339,8 +346,14 @@ pub fn decide_as(
     // the listeners at a home address: it gets the real one.
     if let Some(intercept) = ferrite_core::net::is_local(client_addr)
         .then(|| {
-            ctx.interceptor
-                .maybe_intercept(&query, &name, qtype, client_ip, client_mac.as_deref())
+            ctx.interceptor.maybe_intercept(
+                &query,
+                &name,
+                qtype,
+                client_ip,
+                client_mac.as_deref(),
+                device.as_deref(),
+            )
         })
         .flatten()
     {

@@ -13,6 +13,10 @@ use super::{
     BINDING_RETENTION, BINDING_TOUCH_INTERVAL, ClientRegistry, DashMap, DashSet, NewDevice,
 };
 
+/// How long an address stays tied to the device that last named itself from
+/// it (see [`ClientRegistry::device_at`]).
+const DEVICE_AT_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 impl ClientRegistry {
     pub async fn new(
         upstream: Arc<ZoneRouter>,
@@ -36,6 +40,7 @@ impl ClientRegistry {
             upstream,
             storage,
             switches,
+            device_at: DashMap::new(),
         });
 
         // Manual aliases come from `config.toml`: they are what the operator
@@ -160,6 +165,27 @@ impl ClientRegistry {
     }
 
     /// Return the best known MAC for `ip`, if it has been learned already.
+    /// `device` (`id:pixel`) just asked over encrypted DNS from `ip`.
+    pub fn note_device(&self, ip: IpAddr, device: &str) {
+        let ip = unmap_v4(ip);
+        match self.device_at.get_mut(&ip) {
+            Some(mut e) if e.0 == device => e.1 = Instant::now(),
+            _ => {
+                self.device_at
+                    .insert(ip, (device.to_string(), Instant::now()));
+            }
+        }
+    }
+
+    /// The device that asked from `ip` lately, by its client ID — gone half
+    /// an hour after its last encrypted query, so an address handed to
+    /// another device soon stops carrying the old one's rules.
+    pub fn device_at(&self, ip: IpAddr) -> Option<String> {
+        let ip = unmap_v4(ip);
+        let e = self.device_at.get(&ip)?;
+        (e.1.elapsed() < DEVICE_AT_TTL).then(|| e.0.clone())
+    }
+
     pub fn get_mac(&self, ip: IpAddr) -> Option<String> {
         let ip = unmap_v4(ip);
         self.mac_for_ip(ip).map(|mac| format_mac(&mac))

@@ -273,13 +273,18 @@ fn host_blocked_for_client(
     host: &str,
     client_ip: &str,
     client_mac: Option<&str>,
+    device: Option<&str>,
 ) -> bool {
     if !blocklist.blocking_enabled()
+        || device.is_some_and(|d| blocklist.client_filtering_off_normalized(d, None))
         || blocklist.client_filtering_off_normalized(client_ip, client_mac)
     {
         return false;
     }
-    let profile = blocklist.profile_for(client_ip, client_mac);
+    // The device's own profile first, as the DNS pipeline does.
+    let profile = device
+        .and_then(|d| blocklist.profile_for(d, None))
+        .or_else(|| blocklist.profile_for(client_ip, client_mac));
     blocklist.should_block_for(host, profile.as_deref())
 }
 
@@ -309,13 +314,26 @@ async fn splice_through(
     } else {
         None
     };
+    // The device that named itself over encrypted DNS from this address, for
+    // rules and profiles scoped to it.
+    let device = if need_mac {
+        client_addr.and_then(|ip| ctx.client_registry.device_at(ip))
+    } else {
+        None
+    };
 
     // Blocking applies here too, not just at DNS answer time: the client may
     // hold a stale (or deliberately kept) resolution to our advertise IP, and
     // the DNS-level block is useless if presenting a blocked SNI/Host to the
     // listener still gets spliced through. Same per-client gating as the DNS
     // pipeline; the peeked host is already lowercased with no trailing dot.
-    if host_blocked_for_client(&ctx.blocklist, &host, &client_ip, client_mac.as_deref()) {
+    if host_blocked_for_client(
+        &ctx.blocklist,
+        &host,
+        &client_ip,
+        client_mac.as_deref(),
+        device.as_deref(),
+    ) {
         tracing::debug!("proxy: {host} is blocked for {client_ip} → dropping connection");
         return Ok(());
     }
@@ -325,7 +343,7 @@ async fn splice_through(
     // connect await.
     let decision = {
         let snap = ctx.proxy.registry.load();
-        snap.route(&host, &client_ip, client_mac.as_deref())
+        snap.route(&host, &client_ip, client_mac.as_deref(), device.as_deref())
             .map(|r| {
                 (
                     Arc::clone(&snap.egresses[r.egress_idx]),
@@ -583,22 +601,28 @@ mod blocking_tests {
         let bl = blocklist("proxy-blocked-host", vec![]);
         bl.add_blacklist("ads.test").unwrap();
 
-        assert!(host_blocked_for_client(&bl, "ads.test", "10.0.0.5", None));
+        assert!(host_blocked_for_client(
+            &bl, "ads.test", "10.0.0.5", None, None
+        ));
         assert!(host_blocked_for_client(
             &bl,
             "pixel.ads.test",
             "10.0.0.5",
+            None,
             None
         ));
         assert!(!host_blocked_for_client(
             &bl,
             "example.test",
             "10.0.0.5",
+            None,
             None
         ));
 
         bl.add_whitelist("ads.test").unwrap();
-        assert!(!host_blocked_for_client(&bl, "ads.test", "10.0.0.5", None));
+        assert!(!host_blocked_for_client(
+            &bl, "ads.test", "10.0.0.5", None, None
+        ));
     }
 
     /// The global blocking switch and the per-client bypass gate the listener
@@ -608,11 +632,43 @@ mod blocking_tests {
         let bl = blocklist("proxy-bypass", vec!["10.0.0.9".to_string()]);
         bl.add_blacklist("ads.test").unwrap();
 
-        assert!(host_blocked_for_client(&bl, "ads.test", "10.0.0.5", None));
-        assert!(!host_blocked_for_client(&bl, "ads.test", "10.0.0.9", None));
+        assert!(host_blocked_for_client(
+            &bl, "ads.test", "10.0.0.5", None, None
+        ));
+        assert!(!host_blocked_for_client(
+            &bl, "ads.test", "10.0.0.9", None, None
+        ));
 
         bl.set_blocking_enabled(false);
-        assert!(!host_blocked_for_client(&bl, "ads.test", "10.0.0.5", None));
+        assert!(!host_blocked_for_client(
+            &bl, "ads.test", "10.0.0.5", None, None
+        ));
+    }
+
+    /// A device known by its client ID is exempted by its own name, as in
+    /// the DNS pipeline, even at an address that isn't.
+    #[test]
+    fn a_device_name_carries_its_bypass() {
+        let bl = blocklist("proxy-bypass-id", vec!["id:pixel".to_string()]);
+        bl.add_blacklist("ads.test").unwrap();
+
+        assert!(!host_blocked_for_client(
+            &bl,
+            "ads.test",
+            "10.0.0.5",
+            None,
+            Some("id:pixel")
+        ));
+        assert!(host_blocked_for_client(
+            &bl,
+            "ads.test",
+            "10.0.0.5",
+            None,
+            Some("id:tv")
+        ));
+        assert!(host_blocked_for_client(
+            &bl, "ads.test", "10.0.0.5", None, None
+        ));
     }
 }
 

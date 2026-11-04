@@ -54,6 +54,7 @@ impl DnsInterceptor for StubInterceptor {
         _qtype: u16,
         _client_ip: &str,
         _client_mac: Option<&str>,
+        _device: Option<&str>,
     ) -> Option<Intercept> {
         let routes = self.routes.read();
         let (bytes, egress_id) = routes.get(name)?;
@@ -684,6 +685,41 @@ async fn routed_domain_is_logged_with_routed_status_and_egress() {
     // …and the log entry carries the routed status + which egress will serve it.
     assert_eq!(entry.status, QueryStatus::Routed);
     assert_eq!(entry.upstream.as_deref(), Some("proxy:t"));
+
+    cleanup_sqlite(&h.db_path);
+}
+
+/// A device that names itself at home is remembered at its address, so
+/// Tunnels' listener can tell whose connection it is; away, nothing is noted.
+#[tokio::test]
+async fn a_named_device_is_known_at_its_home_address() {
+    let mut h = Harness::new("dns-device-at").await;
+    h.custom_records
+        .add(&ferrite_core::config::CustomRecordConfig {
+            domain: "home.test".into(),
+            record_type: "A".into(),
+            value: "10.0.0.7".into(),
+            ttl: 60,
+        })
+        .unwrap();
+    let home = SocketAddr::from(([192, 168, 1, 40], 40_000));
+    let away = SocketAddr::from(([198, 51, 100, 20], 40_000));
+    for src in [home, away] {
+        handle_query_as(
+            query("home.test", RecordType::A).to_bytes().unwrap(),
+            src,
+            Some("pixel"),
+            Arc::new(h.ctx()),
+        )
+        .await
+        .unwrap();
+        let _ = h.rx.try_recv();
+    }
+    assert_eq!(
+        h.client_registry.device_at(home.ip()).as_deref(),
+        Some("id:pixel")
+    );
+    assert_eq!(h.client_registry.device_at(away.ip()), None);
 
     cleanup_sqlite(&h.db_path);
 }

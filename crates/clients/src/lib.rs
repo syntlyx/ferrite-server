@@ -116,6 +116,10 @@ pub struct ClientRegistry {
     /// "record nothing" has to mean nothing. In memory it keeps working (names
     /// in the UI, device attribution); what stops is writing it down.
     switches: Arc<RecordSwitches>,
+    /// Which device (client ID, `id:pixel`) last asked over encrypted DNS
+    /// from a home address, and when. Tunnels' listener sees only an address,
+    /// and asks this to apply rules scoped to the device. Memory only.
+    device_at: DashMap<IpAddr, (String, Instant)>,
 }
 
 // ── Public utilities ──────────────────────────────────────────────────────────

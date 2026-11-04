@@ -185,10 +185,11 @@ impl Snapshot {
         name: &str,
         client_ip: &str,
         client_mac: Option<&str>,
+        device: Option<&str>,
     ) -> Option<&CompiledRule> {
         self.rules
             .iter()
-            .find(|r| r.matches(name) && r.matches_client(client_ip, client_mac))
+            .find(|r| r.matches(name) && r.matches_client(client_ip, client_mac, device))
     }
 }
 
@@ -384,6 +385,7 @@ impl DnsInterceptor for ProxyState {
         qtype: u16,
         client_ip: &str,
         client_mac: Option<&str>,
+        device: Option<&str>,
     ) -> Option<Intercept> {
         let snap = self.registry.load();
         if !snap.enabled {
@@ -395,7 +397,7 @@ impl DnsInterceptor for ProxyState {
         // (whitelisted + routed = routed). To exclude a subdomain from a broad
         // rule without blocking it, point it at a Direct egress. A rule may
         // also be scoped to specific clients (by IP/MAC).
-        let rule = snap.route(name, client_ip, client_mac)?;
+        let rule = snap.route(name, client_ip, client_mac, device)?;
         let egress_id = snap.egresses[rule.egress_idx].id().to_string();
         // Decoded only now: the query has to be echoed into an answer, which
         // is the one thing the wire form can't do for us.
@@ -657,6 +659,7 @@ mod tests {
                 qtype::A,
                 "0.0.0.0",
                 None,
+                None,
             )
             .expect("should route");
         assert_eq!(hit.egress_id, "t");
@@ -667,13 +670,56 @@ mod tests {
         ));
     }
 
+    /// A rule scoped to a device name routes that device — by the client ID
+    /// its encrypted queries carry — and nobody else at the same address.
+    #[test]
+    fn a_rule_can_be_scoped_to_a_device_name() {
+        let proxy = state(true);
+        let mut scoped = ProxyConfig {
+            enabled: true,
+            advertise_ipv4: Some(Ipv4Addr::new(192, 168, 1, 5)),
+            egresses: proxy.registry.load().egress_configs.clone(),
+            rules: vec![RuleConfig {
+                pattern: "*.example.com".to_string(),
+                service: None,
+                egress: "t".to_string(),
+                fail_closed: true,
+                clients: vec!["id:pixel".to_string()],
+            }],
+            ..ProxyConfig::default()
+        };
+        scoped.normalize();
+        proxy.reload(&scoped);
+        let q = query("www.example.com", RecordType::A);
+        let ask = |device| {
+            proxy.maybe_intercept(
+                &LazyQuery::new(&q),
+                "www.example.com",
+                qtype::A,
+                "192.168.1.40",
+                None,
+                device,
+            )
+        };
+        assert!(ask(Some("id:pixel")).is_some());
+        assert!(ask(Some("id:tv")).is_none());
+        assert!(ask(None).is_none());
+    }
+
     #[test]
     fn does_not_route_unmatched_domain() {
         let proxy = state(true);
         let q = query("other.test", RecordType::A);
         assert!(
             proxy
-                .maybe_intercept(&LazyQuery::new(&q), "other.test", qtype::A, "0.0.0.0", None)
+                .maybe_intercept(
+                    &LazyQuery::new(&q),
+                    "other.test",
+                    qtype::A,
+                    "0.0.0.0",
+                    None,
+                    None
+                )
                 .is_none()
         );
     }
@@ -689,6 +735,7 @@ mod tests {
                     "www.example.com",
                     qtype::A,
                     "0.0.0.0",
+                    None,
                     None
                 )
                 .is_none()
@@ -705,6 +752,7 @@ mod tests {
                 "www.example.com",
                 qtype::AAAA,
                 "0.0.0.0",
+                None,
                 None,
             )
             .expect("should still intercept");
@@ -850,6 +898,7 @@ mod tests {
                 "www.example.com",
                 qtype::HTTPS,
                 "0.0.0.0",
+                None,
                 None,
             )
             .expect("should intercept type 65");
