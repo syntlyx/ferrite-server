@@ -794,6 +794,7 @@ dependencies = [
  "ferrite-updater",
  "ferrite-upstream",
  "flate2",
+ "futures-util",
  "h3",
  "h3-quinn",
  "hex",

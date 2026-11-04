@@ -232,6 +232,18 @@ impl ProxyState {
         })
     }
 
+    /// The rule `name` is routed by, whoever asks: its key
+    /// ([`ferrite_core::config::RuleConfig::hit_key`]) — the pattern, or
+    /// `service:<id>`. `None` when no rule takes the name.
+    pub fn rule_key_for(&self, name: &str) -> Option<String> {
+        self.registry
+            .load()
+            .rules
+            .iter()
+            .find(|r| r.matches(name))
+            .map(|r| r.pattern.clone())
+    }
+
     /// Whether names are routed for devices away from home.
     pub fn routes_away(&self) -> bool {
         let snap = self.registry.load();

@@ -2,6 +2,7 @@ pub mod auth;
 pub mod backup;
 pub mod blocklist;
 pub mod clients;
+pub mod companions;
 pub mod custom_records;
 pub mod dhcp;
 pub mod error;
@@ -164,6 +165,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/proxy", get(proxy::get_proxy))
         .route("/proxy", put(proxy::put_proxy))
         .route("/proxy/stats", get(proxy::get_proxy_stats))
+        .route("/proxy/companions", get(companions::companions))
         // Live server logs (in-memory ring)
         .route("/logs", get(logs::get_logs))
         // Prometheus exposition (scrape with metrics_path: /api/metrics; when an
