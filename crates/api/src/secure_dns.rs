@@ -399,6 +399,14 @@ mod tests {
         sni: &str,
         alpn: &[u8],
     ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+        connect_to(SocketAddr::from(([127, 0, 0, 1], port)), sni, alpn).await
+    }
+
+    async fn connect_to(
+        addr: SocketAddr,
+        sni: &str,
+        alpn: &[u8],
+    ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
         let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -408,9 +416,7 @@ mod tests {
         .with_custom_certificate_verifier(Arc::new(AnyCert))
         .with_no_client_auth();
         cfg.alpn_protocols = vec![alpn.to_vec()];
-        let tcp = tokio::net::TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port)))
-            .await
-            .unwrap();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         tokio_rustls::TlsConnector::from(Arc::new(cfg))
             .connect(
                 rustls::pki_types::ServerName::try_from(sni.to_string()).unwrap(),
@@ -603,6 +609,31 @@ mod tests {
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         assert_eq!(&response[response.len() - 4..], &[10, 0, 0, 7]);
         assert_eq!(log.recv().await.unwrap().device, "id:tv");
+
+        // The same over IPv6, where the box has it: Tunnels' listener takes both.
+        if std::net::TcpListener::bind("[::1]:0").is_ok() {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(home_query(13));
+            let mut https = connect_to(
+                SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, shared)),
+                "dns.test",
+                b"http/1.1",
+            )
+            .await;
+            https
+                .write_all(
+                    format!(
+                        "GET /dns-query/v6?dns={b64} HTTP/1.1\r\nHost: dns.test\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            let _ = https.read_to_end(&mut response).await;
+            assert_eq!(&response[response.len() - 4..], &[10, 0, 0, 7]);
+            assert_eq!(log.recv().await.unwrap().device, "id:v6");
+        }
 
         // Tunnels off: encrypted DNS takes the port over itself.
         tunnels.enabled = false;

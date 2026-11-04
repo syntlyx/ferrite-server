@@ -119,7 +119,7 @@ async fn start_session(ctx: &ProxyCtx) -> Vec<tokio::task::JoinHandle<()>> {
     ctx.proxy.https_up.store(https.is_some(), Ordering::Relaxed);
     let mut handles = Vec::new();
     if let Some(listener) = https {
-        tracing::info!("proxy: TLS/SNI listener on 0.0.0.0:{}", cfg.https_port);
+        tracing::info!("proxy: TLS/SNI listener on :{}", cfg.https_port);
         handles.push(tokio::spawn(accept_loop(
             listener,
             ctx.clone(),
@@ -128,7 +128,7 @@ async fn start_session(ctx: &ProxyCtx) -> Vec<tokio::task::JoinHandle<()>> {
         )));
     }
     if let Some(listener) = http {
-        tracing::info!("proxy: HTTP listener on 0.0.0.0:{}", cfg.http_port);
+        tracing::info!("proxy: HTTP listener on :{}", cfg.http_port);
         handles.push(tokio::spawn(accept_loop(
             listener,
             ctx.clone(),
@@ -139,19 +139,32 @@ async fn start_session(ctx: &ProxyCtx) -> Vec<tokio::task::JoinHandle<()>> {
     handles
 }
 
+/// Both address families on one socket (`[::]`, which takes IPv4 too) — an
+/// IPv6 client sent here by an AAAA answer, or connecting to encrypted DNS on
+/// the shared port, must find a listener — falling back to IPv4 alone on a
+/// box without IPv6.
+async fn bind_once(port: u16) -> std::io::Result<TcpListener> {
+    match TcpListener::bind((std::net::Ipv6Addr::UNSPECIFIED, port)).await {
+        Err(e) if e.kind() != std::io::ErrorKind::AddrInUse => {
+            TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).await
+        }
+        other => other,
+    }
+}
+
 async fn bind(port: u16) -> Option<TcpListener> {
     // A port another listener is letting go of — encrypted DNS handing :443
     // over when Tunnels comes on — may take a moment to come free.
     let mut tries = 0;
     loop {
-        match TcpListener::bind(("0.0.0.0", port)).await {
+        match bind_once(port).await {
             Ok(l) => return Some(l),
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && tries < 12 => {
                 tries += 1;
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
             Err(e) => {
-                tracing::warn!("proxy: failed to bind 0.0.0.0:{port}: {e}");
+                tracing::warn!("proxy: failed to bind :{port}: {e}");
                 return None;
             }
         }

@@ -766,16 +766,32 @@ fn builtin_secure_records(config: &Config) -> Vec<CustomRecordConfig> {
     if !secure.enabled || host.is_empty() {
         return Vec::new();
     }
-    let Some(ip) = panel_ipv4(config) else {
-        return Vec::new();
-    };
+    let v6 = ferrite_core::net::default_route_interface()
+        .and_then(|iface| ferrite_core::net::interface_ipv6(&iface).into_iter().next());
+    secure_records_for(host, panel_ipv4(config), v6)
+}
+
+/// The name and its wildcard, at this box's IPv4 and (when it has one) IPv6
+/// address — so a device at home that asks for either finds the box.
+fn secure_records_for(
+    host: &str,
+    v4: Option<Ipv4Addr>,
+    v6: Option<std::net::Ipv6Addr>,
+) -> Vec<CustomRecordConfig> {
+    let addrs: Vec<(&str, String)> = v4
+        .map(|ip| ("A", ip.to_string()))
+        .into_iter()
+        .chain(v6.map(|ip| ("AAAA", ip.to_string())))
+        .collect();
     [host.to_string(), format!("*.{host}")]
         .into_iter()
-        .map(|domain| CustomRecordConfig {
-            domain,
-            record_type: "A".to_string(),
-            value: ip.to_string(),
-            ttl: BUILTIN_PANEL_TTL,
+        .flat_map(|domain| {
+            addrs.iter().map(move |(kind, ip)| CustomRecordConfig {
+                domain: domain.clone(),
+                record_type: kind.to_string(),
+                value: ip.clone(),
+                ttl: BUILTIN_PANEL_TTL,
+            })
         })
         .collect()
 }
@@ -916,10 +932,35 @@ mod tests {
         cfg.secure_dns.hostname = "dns.example.com".to_string();
         assert!(builtin_secure_records(&cfg).is_empty());
         cfg.secure_dns.enabled = true;
-        let records = builtin_secure_records(&cfg);
-        let names: Vec<&str> = records.iter().map(|r| r.domain.as_str()).collect();
-        assert_eq!(names, ["dns.example.com", "*.dns.example.com"]);
-        assert!(records.iter().all(|r| r.value == "192.168.1.5"));
+        assert!(!builtin_secure_records(&cfg).is_empty());
+
+        let records = secure_records_for(
+            "dns.example.com",
+            Some("192.168.1.5".parse().unwrap()),
+            Some("fd00::5".parse().unwrap()),
+        );
+        let got: Vec<(&str, &str, &str)> = records
+            .iter()
+            .map(|r| (r.domain.as_str(), r.record_type.as_str(), r.value.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("dns.example.com", "A", "192.168.1.5"),
+                ("dns.example.com", "AAAA", "fd00::5"),
+                ("*.dns.example.com", "A", "192.168.1.5"),
+                ("*.dns.example.com", "AAAA", "fd00::5"),
+            ]
+        );
+        assert_eq!(
+            secure_records_for(
+                "dns.example.com",
+                Some("192.168.1.5".parse().unwrap()),
+                None
+            )
+            .len(),
+            2
+        );
     }
 
     #[test]
