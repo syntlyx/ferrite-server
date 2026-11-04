@@ -94,6 +94,7 @@ a Docker image, and an Unraid template.
 ![Profiles](https://raw.githubusercontent.com/syntlyx/ferrite-web/main/screenshots/profiles.png)
 ![Device panel](https://raw.githubusercontent.com/syntlyx/ferrite-web/main/screenshots/device.png)
 ![Tunnels](https://raw.githubusercontent.com/syntlyx/ferrite-web/main/screenshots/tunnels.png)
+![Encrypted DNS](https://raw.githubusercontent.com/syntlyx/ferrite-web/main/screenshots/encrypted-dns.png)
 
 ## Privacy
 
