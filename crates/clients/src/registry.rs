@@ -453,8 +453,11 @@ impl ClientRegistry {
                 is_alias: self.is_aliased(ip),
             };
         }
+        // A device that named itself over encrypted DNS (`id:pixel`) is called
+        // what it said; the key stays its one token, so a pause or a bypass
+        // aimed at it reaches it.
         super::DeviceInfo {
-            name: None,
+            name: device.strip_prefix("id:").map(str::to_string),
             ips: vec![device.to_string()],
             macs: Vec::new(),
             is_alias: false,
