@@ -721,6 +721,20 @@ async fn a_named_device_is_known_at_its_home_address() {
     );
     assert_eq!(h.client_registry.device_at(away.ip()), None);
 
+    // Another device from the same address takes it over.
+    handle_query_as(
+        query("home.test", RecordType::A).to_bytes().unwrap(),
+        home,
+        Some("tv"),
+        Arc::new(h.ctx()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        h.client_registry.device_at(home.ip()).as_deref(),
+        Some("id:tv")
+    );
+
     cleanup_sqlite(&h.db_path);
 }
 

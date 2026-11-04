@@ -168,13 +168,16 @@ impl ClientRegistry {
     /// `device` (`id:pixel`) just asked over encrypted DNS from `ip`.
     pub fn note_device(&self, ip: IpAddr, device: &str) {
         let ip = unmap_v4(ip);
-        match self.device_at.get_mut(&ip) {
-            Some(mut e) if e.0 == device => e.1 = Instant::now(),
-            _ => {
-                self.device_at
-                    .insert(ip, (device.to_string(), Instant::now()));
-            }
+        // One entry guard throughout: a `get_mut` held while inserting into
+        // the same map deadlocks on its shard.
+        let mut e = self
+            .device_at
+            .entry(ip)
+            .or_insert_with(|| (device.to_string(), Instant::now()));
+        if e.0 != device {
+            e.0 = device.to_string();
         }
+        e.1 = Instant::now();
     }
 
     /// The device that asked from `ip` lately, by its client ID — gone half
