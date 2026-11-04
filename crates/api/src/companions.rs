@@ -66,7 +66,7 @@ pub(crate) fn site_of(name: &str) -> String {
 /// Accepts any certificate: a try only asks whether the site answers the
 /// handshake at all, and nothing is sent after it.
 #[derive(Debug)]
-struct AnyAnswer;
+pub(crate) struct AnyAnswer;
 
 impl rustls::client::danger::ServerCertVerifier for AnyAnswer {
     fn verify_server_cert(

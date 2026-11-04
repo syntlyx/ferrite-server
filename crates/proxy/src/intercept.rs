@@ -26,9 +26,9 @@ use super::egress::{
     ConnectErrorKind, EgressConn, EvasionParams, direct_connect, enable_keepalive, write_split,
 };
 use super::http_host::{HostResult, parse_http_host};
-use super::proxy_protocol::{self, Header};
-use super::sni::{SniResult, parse_sni};
 use super::stats::{Counted, EgressStats};
+use ferrite_edge::peek::proxy_protocol::{self, Header};
+use ferrite_edge::peek::sni::{SniResult, parse_sni};
 
 const PEEK_TIMEOUT: Duration = Duration::from_secs(5);
 const PEEK_CAP: usize = 16 * 1024;

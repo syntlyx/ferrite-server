@@ -254,6 +254,9 @@ async fn run() -> anyhow::Result<()> {
         let state = state.clone();
         tokio::spawn(async move { state.apply_secure_dns().await });
     }
+    if let Err(e) = state.apply_relay() {
+        tracing::warn!("relay: {e}");
+    }
 
     // ── Selective routing / proxy ─────────────────────────────────────────────
     // Detached (not in the try_join! below) so a listener bind failure — :80/:443

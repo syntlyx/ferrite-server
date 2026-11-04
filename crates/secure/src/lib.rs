@@ -164,6 +164,9 @@ pub struct SecureDns {
     status: Mutex<SecureDnsStatus>,
     apply_lock: tokio::sync::Mutex<()>,
     shared: ArcSwapOption<Shared>,
+    /// What serves a connection now, wherever it came from — for one a
+    /// relay passes on. `None` while nothing runs.
+    current: ArcSwapOption<Serving>,
     /// Pinged to ask Let's Encrypt again right away.
     retry: Notify,
     gate: Arc<gate::Gate>,
@@ -184,6 +187,7 @@ impl SecureDns {
             status: Mutex::new(SecureDnsStatus::default()),
             apply_lock: tokio::sync::Mutex::new(()),
             shared: ArcSwapOption::empty(),
+            current: ArcSwapOption::empty(),
             retry: Notify::new(),
             gate: Arc::new(gate::Gate::default()),
             applied: Mutex::new(None),
@@ -272,6 +276,7 @@ impl SecureDns {
             let _ = task.await;
         }
         self.shared.store(None);
+        self.current.store(None);
         let mut status = SecureDnsStatus::default();
         let mut renewal = None;
         if cfg.enabled {
@@ -379,6 +384,7 @@ impl SecureDns {
             gate: Arc::clone(&self.gate),
             h3_port: Arc::new(AtomicU16::new(0)),
         });
+        self.current.store(Some(Arc::clone(&serving)));
 
         let mut ports: Vec<(u16, Default_)> = Vec::new();
         if cfg.dot_port != 0 {
@@ -496,6 +502,28 @@ impl SecureDns {
     /// Is `peer` one of the reverse proxies in `[secure_dns] proxies`?
     pub fn trusts(&self, peer: IpAddr) -> bool {
         self.gate.trusts(peer)
+    }
+
+    /// Serve a connection a relay passed on: `from` is the device it came
+    /// from, `port` the relay's port it came in on — 853 is DNS over TLS
+    /// when the device names no protocol, anything else DNS over HTTPS.
+    pub async fn take_relayed<S>(&self, stream: S, from: SocketAddr, port: u16)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let Some(serving) = self.current.load_full() else {
+            return;
+        };
+        let Ok(slot) = Arc::clone(&serving.connections).try_acquire_owned() else {
+            return;
+        };
+        let default = if port == 853 {
+            Default_::Tls
+        } else {
+            Default_::Https
+        };
+        serve(stream, from, &serving, default).await;
+        drop(slot);
     }
 
     /// Serve a connection Tunnels' listener accepted; `peeked` is what it

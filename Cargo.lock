@@ -788,6 +788,7 @@ dependencies = [
  "ferrite-clients",
  "ferrite-core",
  "ferrite-dns",
+ "ferrite-edge",
  "ferrite-proxy",
  "ferrite-secure",
  "ferrite-storage",
@@ -835,6 +836,7 @@ dependencies = [
  "ferrite-core",
  "ferrite-dhcp",
  "ferrite-dns",
+ "ferrite-edge",
  "ferrite-proxy",
  "ferrite-secure",
  "ferrite-stats",
@@ -948,6 +950,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-edge"
+version = "0.1.10"
+dependencies = [
+ "data-encoding",
+ "hex",
+ "parking_lot",
+ "quinn",
+ "rcgen",
+ "ring",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "x509-parser",
+]
+
+[[package]]
 name = "ferrite-proxy"
 version = "0.1.10"
 dependencies = [
@@ -961,6 +981,7 @@ dependencies = [
  "ferrite-clients",
  "ferrite-core",
  "ferrite-dns",
+ "ferrite-edge",
  "ferrite-upstream",
  "futures-util",
  "genetlink",

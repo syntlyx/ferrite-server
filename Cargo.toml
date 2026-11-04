@@ -24,6 +24,7 @@ ferrite-clients = { path = "crates/clients" }
 ferrite-core = { path = "crates/core" }
 ferrite-dhcp = { path = "crates/dhcp" }
 ferrite-secure = { path = "crates/secure" }
+ferrite-edge = { path = "crates/edge" }
 ferrite-dns = { path = "crates/dns" }
 ferrite-proxy = { path = "crates/proxy" }
 ferrite-stats = { path = "crates/stats" }
@@ -62,6 +63,9 @@ http = "1"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
+# The relay: a box's own key and self-signed certificate, and its ID.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem", "x509-parser"] }
+data-encoding = "2"
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }  # CORS + request tracing middleware
 # `rustls-no-provider` rather than `rustls`: the latter force-enables the aws-lc-rs

@@ -13,9 +13,7 @@ mod health;
 pub mod http_host;
 mod intercept;
 mod probe;
-mod proxy_protocol;
 mod rules;
-mod sni;
 /// Zero-copy relay via `splice(2)`; the generic userspace relay stays the
 /// fallback (userspace-WG egresses, non-Linux builds).
 #[cfg(target_os = "linux")]

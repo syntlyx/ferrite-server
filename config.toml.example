@@ -530,6 +530,15 @@ domains = [
 # "anyone". The device is added to `devices` and the webhook is told.
 # self_setup  = "named"
 #
+# ── Relay: devices away from home reach this box through a relay ──────────────
+# The box keeps a QUIC connection out to a relay (ferrite-relay), which passes
+# on devices' encrypted connections to the box's names, never opening them:
+# no port forwarded on the router. The relay is known by its key.
+# [relay]
+# enabled = true
+# server  = "relay.example.net:4433"
+# pin     = "sha256:…"            # `ferrite-relay pin` prints it
+#
 # [secure_dns.acme]
 # cloudflare_token = "…"
 # email            = "you@example.com"   # optional

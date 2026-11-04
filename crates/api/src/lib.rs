@@ -18,6 +18,7 @@ pub mod pause;
 pub mod profiles;
 pub mod proxy;
 pub mod queries;
+pub mod relay;
 pub mod safesearch;
 pub mod secure_dns;
 pub mod services;
@@ -166,6 +167,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/proxy", put(proxy::put_proxy))
         .route("/proxy/stats", get(proxy::get_proxy_stats))
         .route("/proxy/companions", get(companions::companions))
+        .route("/relay", get(relay::get_relay).put(relay::put_relay))
         // Live server logs (in-memory ring)
         .route("/logs", get(logs::get_logs))
         // Prometheus exposition (scrape with metrics_path: /api/metrics; when an

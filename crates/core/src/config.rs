@@ -75,6 +75,11 @@ pub struct Config {
     /// a client ID. Off by default.
     #[serde(default, skip_serializing_if = "SecureDnsConfig::is_unset")]
     pub secure_dns: SecureDnsConfig,
+    /// `[relay]`: reach this box through a relay — devices away from home
+    /// get to its encrypted DNS without a port opened on the router. Off by
+    /// default.
+    #[serde(default, skip_serializing_if = "RelayConfig::is_unset")]
+    pub relay: RelayConfig,
     /// Verbose debug-level logging for the `ferrite` target. **Off by default**:
     /// every DNS query and proxied connection emits a record, and each one costs
     /// two allocations, a process-wide ring-buffer lock and a stdout write — real
@@ -1027,6 +1032,7 @@ impl Default for Config {
             dhcp: DhcpConfig::default(),
             ra: RaConfig::default(),
             secure_dns: SecureDnsConfig::default(),
+            relay: RelayConfig::default(),
             debug_logging: false,
             web_dir: None,
         }
@@ -1148,6 +1154,27 @@ impl Default for RaConfig {
 }
 
 impl RaConfig {
+    /// Nothing set up: left out of the config file.
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// `[relay]`: the box keeps a connection out to a relay (`ferrite-relay`),
+/// and the relay passes on the encrypted connections devices make to the
+/// box's names, unopened — so no port has to be forwarded to the box. The
+/// relay is known by its key: `pin`, which `ferrite-relay pin` prints.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RelayConfig {
+    pub enabled: bool,
+    /// `host:port` of the relay's side for boxes (UDP, QUIC).
+    pub server: String,
+    /// The relay's key: `sha256:<64 hex>`.
+    pub pin: String,
+}
+
+impl RelayConfig {
     /// Nothing set up: left out of the config file.
     pub fn is_unset(&self) -> bool {
         *self == Self::default()

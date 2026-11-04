@@ -87,7 +87,7 @@ fn split_position(buf: &[u8], params: &EvasionParams) -> Option<usize> {
             return Some(p);
         }
     }
-    let (start, len) = super::super::sni::sni_host_range(buf)?;
+    let (start, len) = ferrite_edge::peek::sni::sni_host_range(buf)?;
     let pos = start + len / 2;
     (pos > 0 && pos < buf.len()).then_some(pos)
 }

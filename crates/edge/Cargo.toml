@@ -1,0 +1,25 @@
+[package]
+name = "ferrite-edge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# What a box and the relay share, kept apart from the rest of ferrite so the
+# relay (its own project) needs only this: reading a connection's first bytes
+# without opening it (the name a TLS connection asks for, a PROXY header),
+# the keys boxes and relays are known by, the relay protocol, and the client
+# a box runs to keep its connection to a relay.
+
+[dependencies]
+data-encoding.workspace = true
+hex.workspace = true
+parking_lot.workspace = true
+quinn.workspace = true
+rcgen.workspace = true
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+x509-parser.workspace = true

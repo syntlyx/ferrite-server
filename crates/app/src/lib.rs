@@ -79,6 +79,34 @@ pub struct AppStateInner {
     pub dhcp: Arc<dhcp::DhcpService>,
     /// DNS over TLS / HTTPS for devices, reconfigured live.
     pub secure_dns: Arc<ferrite_secure::SecureDns>,
+    /// The connection to a relay, while `[relay]` is on.
+    pub relay: parking_lot::Mutex<Option<RelayRun>>,
+}
+
+/// A box's connection to its relay, running.
+pub struct RelayRun {
+    pub client: Arc<ferrite_edge::client::Client>,
+    /// What it was started with: a change starts it over.
+    pub config: ferrite_core::config::RelayConfig,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// What a relay passes on: devices' encrypted DNS, to be served here.
+struct RelayInbound(Arc<ferrite_secure::SecureDns>);
+
+impl ferrite_edge::client::Inbound for RelayInbound {
+    fn serve(
+        &self,
+        stream: ferrite_edge::client::Stream,
+        opening: ferrite_edge::proto::Opening,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        let secure = Arc::clone(&self.0);
+        Box::pin(async move {
+            secure
+                .take_relayed(stream, opening.from, opening.port)
+                .await;
+        })
+    }
 }
 
 /// Cheaply-cloneable application state handle, backed by `Arc<AppStateInner>`.
@@ -312,6 +340,45 @@ impl AppState {
         let ctx = Arc::new(self.dns_ctx());
         let tunnels = self.tunnels_tls_port();
         self.inner.secure_dns.apply(&cfg, ctx, tunnels).await;
+    }
+
+    /// This box's key for relays, made the first time it's wanted.
+    pub fn relay_identity(&self) -> std::io::Result<ferrite_edge::identity::Identity> {
+        let dir = relay_dir(&self.live_config.read());
+        ferrite_edge::identity::Identity::load_or_create(&dir, "ferrite-box")
+    }
+
+    /// Bring the relay connection in line with `[relay]`: start it, stop it,
+    /// or start it over when what it was started with changed.
+    pub fn apply_relay(&self) -> std::result::Result<(), String> {
+        let cfg = self.live_config.read().relay.clone();
+        let mut slot = self.inner.relay.lock();
+        if slot.as_ref().is_some_and(|run| run.config == cfg) && cfg.enabled {
+            return Ok(());
+        }
+        if let Some(old) = slot.take() {
+            old.task.abort();
+        }
+        if !cfg.enabled {
+            return Ok(());
+        }
+        let identity = self.relay_identity().map_err(|e| e.to_string())?;
+        let software = format!("ferrite {}", env!("CARGO_PKG_VERSION"));
+        let client = Arc::new(ferrite_edge::client::Client::new(
+            identity,
+            &cfg.server,
+            &cfg.pin,
+            &software,
+        )?);
+        tracing::info!("relay: connecting to {} as box {}", cfg.server, client.id());
+        let inbound = Arc::new(RelayInbound(Arc::clone(&self.inner.secure_dns)));
+        let task = tokio::spawn(Arc::clone(&client).run(inbound));
+        *slot = Some(RelayRun {
+            client,
+            config: cfg,
+            task,
+        });
+        Ok(())
     }
 
     /// Keep `[secure_dns] owners` in line with the device list: a device
@@ -632,6 +699,7 @@ impl AppState {
             sync_wake: Arc::new(Notify::new()),
             dhcp,
             secure_dns: ferrite_secure::SecureDns::new(acme_dir(config)),
+            relay: parking_lot::Mutex::new(None),
             record_switches,
             query_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
         });
@@ -788,6 +856,11 @@ fn fold_legacy_rows(cfg: &mut Config, rows: &LegacyConfigRows) {
             });
         }
     }
+}
+
+/// Where the box's own key for relays is kept: beside the database.
+pub fn relay_dir(config: &Config) -> std::path::PathBuf {
+    acme_dir(config).with_file_name("relay")
 }
 
 /// Where Let's Encrypt certificates for encrypted DNS are kept: beside the

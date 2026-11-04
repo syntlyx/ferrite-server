@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ferrite-edge.workspace = true
 ferrite-app.workspace = true
 ferrite-secure.workspace = true
 ferrite-blocklist.workspace = true

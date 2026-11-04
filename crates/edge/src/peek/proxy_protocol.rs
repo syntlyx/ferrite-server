@@ -27,6 +27,36 @@ pub enum Header {
     Invalid,
 }
 
+/// The v1 line for a connection from `from` to `to`, to put in front of it
+/// when passing it on to something that expects one.
+pub fn v1_header(from: SocketAddr, to: SocketAddr) -> String {
+    let (from_ip, to_ip) = (canonical(from.ip()), canonical(to.ip()));
+    let family = if from_ip.is_ipv4() && to_ip.is_ipv4() {
+        "TCP4"
+    } else {
+        "TCP6"
+    };
+    // One family for both ends: an IPv4 address next to IPv6 is written mapped.
+    let show = |ip: IpAddr| match (family, ip) {
+        ("TCP6", IpAddr::V4(v4)) => IpAddr::V6(v4.to_ipv6_mapped()).to_string(),
+        _ => ip.to_string(),
+    };
+    format!(
+        "PROXY {family} {} {} {} {}\r\n",
+        show(from_ip),
+        show(to_ip),
+        from.port(),
+        to.port()
+    )
+}
+
+fn canonical(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    }
+}
+
 pub fn parse(buf: &[u8]) -> Header {
     let v1 = b"PROXY ";
     let prefix = |sig: &[u8]| buf.len() < sig.len() && sig.starts_with(buf);
@@ -136,6 +166,26 @@ mod tests {
                 from: None,
                 len: 15
             }
+        );
+    }
+
+    #[test]
+    fn a_written_line_reads_back() {
+        let from: SocketAddr = "198.51.100.7:40000".parse().unwrap();
+        let to: SocketAddr = "[::ffff:192.168.1.4]:443".parse().unwrap();
+        let line = v1_header(from, to);
+        assert_eq!(line, "PROXY TCP4 198.51.100.7 192.168.1.4 40000 443\r\n");
+        assert_eq!(
+            parse(line.as_bytes()),
+            Header::Present {
+                from: Some(from),
+                len: line.len()
+            }
+        );
+        let six = v1_header("[2001:db8::7]:1".parse().unwrap(), to);
+        assert!(
+            six.starts_with("PROXY TCP6 2001:db8::7 ::ffff:192.168.1.4 "),
+            "{six}"
         );
     }
 
