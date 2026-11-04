@@ -86,15 +86,31 @@ async fn rollups_answer_the_dashboard_the_same_way() {
         assert_eq!((clients[0].total, clients[0].blocked), (3, 3));
         assert_eq!(clients[1].device, "192.168.1.10");
 
-        let one = storage.client_stats("192.168.1.10").await.unwrap().unwrap();
+        let keys = |k: &[&str]| k.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let one = storage
+            .client_stats(&keys(&["192.168.1.10"]))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!((one.total, one.blocked), (2, 0));
+        // One device under two tokens: their counts together.
+        let both = storage
+            .client_stats(&keys(&["192.168.1.10", "192.168.1.11"]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (both.device.as_str(), both.total, both.blocked),
+            ("192.168.1.10", 5, 3)
+        );
         assert!(
             storage
-                .client_stats("no.such.device")
+                .client_stats(&keys(&["no.such.device"]))
                 .await
                 .unwrap()
                 .is_none()
         );
+        assert!(storage.client_stats(&[]).await.unwrap().is_none());
 
         let series = storage.timeseries(600).await.unwrap();
         let current = series.iter().find(|b| b.bucket == bucket as u64).unwrap();
@@ -520,7 +536,10 @@ async fn a_devices_domains_and_activity_read_the_same_way() {
             blocked,
         };
 
-        let top = storage.device_domains(me, bucket, 10, false).await.unwrap();
+        let top = storage
+            .device_domains(&[me.to_string()], bucket, 10, false)
+            .await
+            .unwrap();
         assert_eq!(
             top,
             vec![
@@ -529,24 +548,45 @@ async fn a_devices_domains_and_activity_read_the_same_way() {
                 d("track.test", 1, 1)
             ]
         );
-        let blocked = storage.device_domains(me, bucket, 10, true).await.unwrap();
+        let blocked = storage
+            .device_domains(&[me.to_string()], bucket, 10, true)
+            .await
+            .unwrap();
         assert_eq!(blocked, vec![d("ads.test", 2, 2), d("track.test", 1, 1)]);
         assert_eq!(
             storage
-                .device_domains(me, bucket, 1, false)
+                .device_domains(&[me.to_string()], bucket, 1, false)
                 .await
                 .unwrap()
                 .len(),
             1
         );
 
-        let activity = storage.device_activity(me, bucket).await.unwrap();
+        let activity = storage
+            .device_activity(&[me.to_string()], bucket)
+            .await
+            .unwrap();
         let a = |bucket, total, blocked| crate::DeviceActivity {
             bucket,
             total,
             blocked,
         };
         assert_eq!(activity, vec![a(bucket, 5, 2), a(bucket + 600, 1, 1)]);
+
+        // The same device under another token too (a new private MAC): its
+        // rows join in, bucket by bucket and domain by domain.
+        let both = [me.to_string(), "192.168.1.31".to_string()];
+        assert_eq!(
+            storage.device_activity(&both, bucket).await.unwrap(),
+            vec![a(bucket, 6, 2), a(bucket + 600, 1, 1)]
+        );
+        assert_eq!(
+            storage
+                .device_domains(&both, bucket, 1, false)
+                .await
+                .unwrap(),
+            vec![d("video.test", 4, 0)]
+        );
     })
     .await;
 }

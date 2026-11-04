@@ -377,17 +377,20 @@ impl Storage for MemoryStorage {
         Ok(out.into_values().collect())
     }
 
-    async fn client_stats(&self, device: &str) -> Result<Option<ClientStats>> {
+    async fn client_stats(&self, devices: &[String]) -> Result<Option<ClientStats>> {
+        let Some(first) = devices.first() else {
+            return Ok(None);
+        };
         let inner = self.inner.read();
         let mut found = false;
         let mut stats = ClientStats {
-            device: device.to_string(),
+            device: first.clone(),
             total: 0,
             blocked: 0,
             last_seen: 0,
         };
         for ((_, key), agg) in &inner.device_buckets {
-            if key != device {
+            if !devices.contains(key) {
                 continue;
             }
             found = true;
@@ -400,7 +403,7 @@ impl Storage for MemoryStorage {
 
     async fn device_domains(
         &self,
-        device: &str,
+        devices: &[String],
         from_ts: i64,
         n: usize,
         blocked_first: bool,
@@ -410,7 +413,7 @@ impl Storage for MemoryStorage {
         for q in inner
             .queries
             .iter()
-            .filter(|q| q.device == device && q.timestamp.timestamp() >= from_ts)
+            .filter(|q| devices.contains(&q.device) && q.timestamp.timestamp() >= from_ts)
         {
             let e = by_domain.entry(q.domain.as_str()).or_default();
             e.0 += 1;
@@ -437,19 +440,34 @@ impl Storage for MemoryStorage {
         Ok(rows)
     }
 
-    async fn device_activity(&self, device: &str, from_ts: i64) -> Result<Vec<DeviceActivity>> {
+    async fn device_activity(
+        &self,
+        devices: &[String],
+        from_ts: i64,
+    ) -> Result<Vec<DeviceActivity>> {
         let inner = self.inner.read();
         let from_bucket = align_bucket(from_ts);
-        Ok(inner
+        let mut out: Vec<DeviceActivity> = Vec::new();
+        // Keyed (bucket, device): buckets come in order, a device's rows
+        // within one bucket next to each other.
+        for ((bucket, _), agg) in inner
             .device_buckets
             .range((from_bucket, String::new())..)
-            .filter(|((_, d), _)| d == device)
-            .map(|((bucket, _), agg)| DeviceActivity {
-                bucket: *bucket,
-                total: agg.total,
-                blocked: agg.blocked,
-            })
-            .collect())
+            .filter(|((_, d), _)| devices.contains(d))
+        {
+            match out.last_mut() {
+                Some(last) if last.bucket == *bucket => {
+                    last.total += agg.total;
+                    last.blocked += agg.blocked;
+                }
+                _ => out.push(DeviceActivity {
+                    bucket: *bucket,
+                    total: agg.total,
+                    blocked: agg.blocked,
+                }),
+            }
+        }
+        Ok(out)
     }
 
     async fn summary(&self, secs: u64) -> Result<(u64, u64)> {

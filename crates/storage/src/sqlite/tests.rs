@@ -818,7 +818,11 @@ async fn device_keyed_rollups_merge_a_devices_ips_across_an_ip_change() {
     assert!(rows.iter().any(|r| r.client_ip == "192.168.1.77"));
 
     // Per-device stats are keyed by the device token.
-    let cs = storage.client_stats(mac).await.unwrap().unwrap();
+    let cs = storage
+        .client_stats(&[mac.to_string()])
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(cs.device, mac);
     assert_eq!(cs.total, 3);
 }
@@ -977,7 +981,11 @@ async fn migration_upgrades_a_legacy_v0_database() {
     assert!(rows.iter().all(|r| r.device == "192.168.1.50"));
 
     // Device rollups were built from the backfilled rows.
-    let cs = storage.client_stats("192.168.1.50").await.unwrap().unwrap();
+    let cs = storage
+        .client_stats(&["192.168.1.50".to_string()])
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(cs.total, 2);
     assert_eq!(cs.blocked, 1);
 
@@ -986,7 +994,7 @@ async fn migration_upgrades_a_legacy_v0_database() {
     let storage2 = SqliteStorage::open(&path).await.unwrap();
     assert_eq!(
         storage2
-            .client_stats("192.168.1.50")
+            .client_stats(&["192.168.1.50".to_string()])
             .await
             .unwrap()
             .unwrap()

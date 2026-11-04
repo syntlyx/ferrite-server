@@ -51,6 +51,14 @@ struct ClientBucketAgg {
     last_seen: i64,
 }
 
+/// `?1, ?2, …` for `n` values starting at `?start`, for an `IN (…)` list.
+fn placeholders(n: usize, start: usize) -> String {
+    (start..start + n)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 impl SqliteStorage {
     pub async fn open(path: &Path) -> Result<Arc<Self>> {
         if let Some(parent) = path.parent() {
@@ -479,29 +487,35 @@ impl Storage for SqliteStorage {
         Ok(rows)
     }
 
-    async fn client_stats(&self, device: &str) -> Result<Option<ClientStats>> {
-        let device = device.to_string();
+    async fn client_stats(&self, devices: &[String]) -> Result<Option<ClientStats>> {
+        let Some(first) = devices.first().cloned() else {
+            return Ok(None);
+        };
+        let devices = devices.to_vec();
         let result = self
             .conn
             .call(move |c| {
-                let mut stmt = c.prepare(
-                    "SELECT device,
-                            SUM(total) as total,
-                            SUM(blocked) as blocked,
-                            MAX(last_seen) as last_seen
-                     FROM device_buckets_10m WHERE device = ?1 GROUP BY device",
-                )?;
-                let row = stmt
-                    .query_row(rusqlite::params![device], |row| {
-                        Ok(ClientStats {
-                            device: row.get(0)?,
-                            total: row.get::<_, i64>(1)? as u64,
-                            blocked: row.get::<_, i64>(2)? as u64,
-                            last_seen: row.get(3)?,
-                        })
-                    })
-                    .optional()?;
-                Ok(row)
+                let sql = format!(
+                    "SELECT COUNT(*), COALESCE(SUM(total), 0), COALESCE(SUM(blocked), 0),
+                            COALESCE(MAX(last_seen), 0)
+                     FROM device_buckets_10m WHERE device IN ({})",
+                    placeholders(devices.len(), 1)
+                );
+                let (rows, total, blocked, last_seen) =
+                    c.query_row(&sql, rusqlite::params_from_iter(devices.iter()), |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    })?;
+                Ok((rows > 0).then_some(ClientStats {
+                    device: first,
+                    total: total as u64,
+                    blocked: blocked as u64,
+                    last_seen,
+                }))
             })
             .await
             .map_err(FeriteError::TokioDatabase)?;
@@ -510,30 +524,41 @@ impl Storage for SqliteStorage {
 
     async fn device_domains(
         &self,
-        device: &str,
+        devices: &[String],
         from_ts: i64,
         n: usize,
         blocked_first: bool,
     ) -> Result<Vec<DeviceDomain>> {
-        let device = device.to_string();
+        if devices.is_empty() {
+            return Ok(Vec::new());
+        }
+        let devices = devices.to_vec();
         let (having, order) = if blocked_first {
             ("HAVING blocked > 0", "blocked")
         } else {
             ("", "total")
         };
-        // Served by idx_queries_device_time_id_desc: one device's rows in the
+        // Served by idx_queries_device_time_id_desc: each token's rows in the
         // window, then grouped.
+        let k = devices.len();
         let sql = format!(
             "SELECT domain, COUNT(*) AS total, SUM(status = 'blocked') AS blocked
-             FROM queries WHERE device = ?1 AND timestamp >= ?2
+             FROM queries WHERE device IN ({}) AND timestamp >= ?{}
              GROUP BY domain {having}
-             ORDER BY {order} DESC, domain ASC LIMIT ?3"
+             ORDER BY {order} DESC, domain ASC LIMIT ?{}",
+            placeholders(k, 1),
+            k + 1,
+            k + 2
         );
         self.conn
             .call(move |c| {
                 let mut stmt = c.prepare(&sql)?;
+                let mut params: Vec<rusqlite::types::Value> =
+                    devices.iter().cloned().map(Into::into).collect();
+                params.push(from_ts.into());
+                params.push((n as i64).into());
                 let rows = stmt
-                    .query_map(rusqlite::params![device, from_ts, n as i64], |row| {
+                    .query_map(rusqlite::params_from_iter(params), |row| {
                         Ok(DeviceDomain {
                             domain: row.get(0)?,
                             total: row.get::<_, i64>(1)? as u64,
@@ -547,17 +572,31 @@ impl Storage for SqliteStorage {
             .map_err(FeriteError::TokioDatabase)
     }
 
-    async fn device_activity(&self, device: &str, from_ts: i64) -> Result<Vec<DeviceActivity>> {
-        let device = device.to_string();
+    async fn device_activity(
+        &self,
+        devices: &[String],
+        from_ts: i64,
+    ) -> Result<Vec<DeviceActivity>> {
+        if devices.is_empty() {
+            return Ok(Vec::new());
+        }
+        let devices = devices.to_vec();
         let from_bucket = align_bucket(from_ts);
         self.conn
             .call(move |c| {
-                let mut stmt = c.prepare(
-                    "SELECT bucket, total, blocked FROM device_buckets_10m
-                     WHERE device = ?1 AND bucket >= ?2 ORDER BY bucket ASC",
-                )?;
+                let k = devices.len();
+                let mut stmt = c.prepare(&format!(
+                    "SELECT bucket, SUM(total), SUM(blocked) FROM device_buckets_10m
+                     WHERE device IN ({}) AND bucket >= ?{}
+                     GROUP BY bucket ORDER BY bucket ASC",
+                    placeholders(k, 1),
+                    k + 1
+                ))?;
+                let mut params: Vec<rusqlite::types::Value> =
+                    devices.iter().cloned().map(Into::into).collect();
+                params.push(from_bucket.into());
                 let rows = stmt
-                    .query_map(rusqlite::params![device, from_bucket], |row| {
+                    .query_map(rusqlite::params_from_iter(params), |row| {
                         Ok(DeviceActivity {
                             bucket: row.get(0)?,
                             total: row.get::<_, i64>(1)? as u64,

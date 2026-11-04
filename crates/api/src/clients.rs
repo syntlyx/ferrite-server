@@ -28,6 +28,11 @@ pub struct ListClientsParams {
 #[derive(Serialize)]
 struct ClientGroup {
     name: String,
+    /// The tokens this row merges (MACs, IPs, client IDs), the one seen last
+    /// first — what the device's own statistics are read under.
+    devices: Vec<String>,
+    #[serde(skip)]
+    device_seen: Vec<i64>,
     ips: Vec<String>,
     macs: Vec<String>,
     total: u64,
@@ -97,6 +102,8 @@ pub async fn list_clients(
 
         let group = groups.entry(name.clone()).or_insert_with(|| ClientGroup {
             name,
+            devices: vec![],
+            device_seen: vec![],
             ips: vec![],
             macs: vec![],
             total: 0,
@@ -123,6 +130,8 @@ pub async fn list_clients(
                 group.first_seen = Some(group.first_seen.map_or(seen, |s| s.min(seen)));
             }
         }
+        group.devices.push(device.clone());
+        group.device_seen.push(stat.last_seen);
         group.total += stat.total;
         group.blocked += stat.blocked;
         group.last_seen = group.last_seen.max(stat.last_seen);
@@ -135,6 +144,12 @@ pub async fn list_clients(
     }
 
     let mut clients: Vec<ClientGroup> = groups.into_values().collect();
+    for c in &mut clients {
+        let mut keyed: Vec<(i64, String)> =
+            c.device_seen.drain(..).zip(c.devices.drain(..)).collect();
+        keyed.sort_by_key(|k| std::cmp::Reverse(k.0));
+        c.devices = keyed.into_iter().map(|(_, d)| d).collect();
+    }
     clients.sort_by_key(|b| std::cmp::Reverse(b.total));
     clients.truncate(limit);
 
@@ -270,6 +285,8 @@ const DEVICE_TOP: usize = 10;
 /// How many distinct domains are looked at to find the services a device uses
 /// — enough to see past its handful of noisiest names.
 const DEVICE_SERVICE_SCAN: usize = 500;
+/// Tokens one device's statistics may be asked for under at once.
+const MAX_DEVICE_TOKENS: usize = 32;
 
 /// One catalog service a device used, from the domains it asked for.
 #[derive(Debug, Serialize)]
@@ -300,8 +317,17 @@ pub async fn client_ip_stats(
         )));
     }
 
+    // One device may be known under several tokens — the Clients list merges
+    // them by name and passes them all, comma-separated: a Mac whose private
+    // Wi-Fi address changed is one device with two MACs.
+    let mut devices: Vec<String> = Vec::new();
+    for d in device.split(',').map(str::trim).filter(|d| !d.is_empty()) {
+        if !devices.iter().any(|x| x == d) && devices.len() < MAX_DEVICE_TOKENS {
+            devices.push(d.to_string());
+        }
+    }
     let storage = &state.inner.storage;
-    let stats = storage.client_stats(&device).await?.ok_or_else(|| {
+    let stats = storage.client_stats(&devices).await?.ok_or_else(|| {
         ApiError(ferrite_core::error::FeriteError::NotFound(format!(
             "client '{}' not found",
             device
@@ -315,12 +341,12 @@ pub async fn client_ip_stats(
         .unwrap_or_default()
         - (hours * 3600) as i64;
     let scan = storage
-        .device_domains(&device, since, DEVICE_SERVICE_SCAN, false)
+        .device_domains(&devices, since, DEVICE_SERVICE_SCAN, false)
         .await?;
     let top_blocked = storage
-        .device_domains(&device, since, DEVICE_TOP, true)
+        .device_domains(&devices, since, DEVICE_TOP, true)
         .await?;
-    let activity = storage.device_activity(&device, since).await?;
+    let activity = storage.device_activity(&devices, since).await?;
 
     let mut services: Vec<ServiceUse> = Vec::new();
     for d in &scan {
@@ -341,12 +367,15 @@ pub async fn client_ip_stats(
     }
     services.sort_by(|a, b| b.queries.cmp(&a.queries).then(a.id.cmp(b.id)));
 
-    ClientRegistry::trigger_resolve_device(&state.inner.client_registry, &device);
-    let info = state.inner.client_registry.describe_device(&device);
-    let first_seen = info
-        .macs
+    let registry = &state.inner.client_registry;
+    for d in &devices {
+        ClientRegistry::trigger_resolve_device(registry, d);
+    }
+    let info = registry.describe_device(&stats.device);
+    let first_seen = devices
         .iter()
-        .filter_map(|m| state.inner.client_registry.first_seen(m))
+        .flat_map(|d| registry.describe_device(d).macs)
+        .filter_map(|m| registry.first_seen(&m))
         .filter(|&t| t > 0)
         .min();
 

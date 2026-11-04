@@ -163,22 +163,31 @@ pub trait Storage: Send + Sync {
     /// Return timeseries buckets for the last 24 hours.
     async fn timeseries(&self, bucket_secs: u64) -> Result<Vec<TimeseriesBucket>>;
 
-    /// Return aggregated stats for a specific device identity token (MAC or IP).
-    async fn client_stats(&self, device: &str) -> Result<Option<ClientStats>>;
+    /// Aggregated stats for one device, which may be known under several
+    /// identity tokens (MACs, IPs): a Mac whose private Wi-Fi address
+    /// changed is one device with two MACs. `device` of the result is the
+    /// first token. `None` when no token has any record.
+    async fn client_stats(&self, devices: &[String]) -> Result<Option<ClientStats>>;
 
-    /// The domains a device asked for since `from_ts`, from the query log:
-    /// most asked first, or — with `blocked_first` — only blocked ones, most
-    /// blocked first. Ties go alphabetically. Empty while the log is off.
+    /// The domains a device (under any of its tokens) asked for since
+    /// `from_ts`, from the query log: most asked first, or — with
+    /// `blocked_first` — only blocked ones, most blocked first. Ties go
+    /// alphabetically. Empty while the log is off.
     async fn device_domains(
         &self,
-        device: &str,
+        devices: &[String],
         from_ts: i64,
         n: usize,
         blocked_first: bool,
     ) -> Result<Vec<DeviceDomain>>;
 
-    /// A device's 10-minute rollups since `from_ts`, oldest first.
-    async fn device_activity(&self, device: &str, from_ts: i64) -> Result<Vec<DeviceActivity>>;
+    /// A device's 10-minute rollups since `from_ts`, its tokens summed per
+    /// bucket, oldest first.
+    async fn device_activity(
+        &self,
+        devices: &[String],
+        from_ts: i64,
+    ) -> Result<Vec<DeviceActivity>>;
 
     /// Return summary stats: (total, blocked) for the last `secs` seconds.
     async fn summary(&self, secs: u64) -> Result<(u64, u64)>;
