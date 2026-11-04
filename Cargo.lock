@@ -905,6 +905,7 @@ version = "0.1.10"
 dependencies = [
  "libc",
  "parking_lot",
+ "serde",
  "socket2",
  "thiserror 2.0.21",
  "tokio",

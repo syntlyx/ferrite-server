@@ -45,6 +45,13 @@ pub struct LeasePool {
     reservations: HashMap<[u8; 6], Ipv4Addr>,
     by_ip: HashMap<Ipv4Addr, Lease>,
     by_mac: HashMap<[u8; 6], Ipv4Addr>,
+    /// Addresses not handed out until a time (unix seconds): ones a client
+    /// declined because it found them in use.
+    held: HashMap<Ipv4Addr, u64>,
+    /// Who the box last saw at each address (its neighbour table). An address
+    /// a device holds without a lease from us — a fixed one inside the pool,
+    /// or one the old router's DHCP gave out — isn't offered to another.
+    seen: HashMap<Ipv4Addr, [u8; 6]>,
 }
 
 impl LeasePool {
@@ -57,7 +64,24 @@ impl LeasePool {
             reservations: HashMap::new(),
             by_ip: HashMap::new(),
             by_mac: HashMap::new(),
+            held: HashMap::new(),
+            seen: HashMap::new(),
         }
+    }
+
+    /// Keep `ip` out of offers until `until` (a declined address).
+    pub fn hold(&mut self, ip: Ipv4Addr, until: u64) {
+        self.held.insert(ip, until);
+    }
+
+    /// The addresses in use on the network right now, and by whom.
+    pub fn set_seen(&mut self, seen: HashMap<Ipv4Addr, [u8; 6]>) {
+        self.seen = seen;
+    }
+
+    /// Is `ip` in use by another device the pool has no lease for?
+    pub fn seen_elsewhere(&self, ip: Ipv4Addr, mac: [u8; 6]) -> bool {
+        self.seen.get(&ip).is_some_and(|&m| m != mac)
     }
 
     /// Add a static MAC→IP reservation.
@@ -79,6 +103,9 @@ impl LeasePool {
             .iter()
             .any(|(&res_mac, &res_ip)| res_ip == ip && res_mac != mac)
         {
+            return false;
+        }
+        if self.held.get(&ip).is_some_and(|&until| until > now) || self.seen_elsewhere(ip, mac) {
             return false;
         }
         // Free unless an active lease for a *different* client holds it.
@@ -186,8 +213,10 @@ impl LeasePool {
             .filter(|l| l.is_active(now))
     }
 
-    /// Drop expired leases; returns how many were removed. Reservations stay.
+    /// Drop expired leases and holds; returns how many leases were removed.
+    /// Reservations stay.
     pub fn prune_expired(&mut self, now: u64) -> usize {
+        self.held.retain(|_, until| *until > now);
         let dead: Vec<Ipv4Addr> = self
             .by_ip
             .values()
@@ -364,5 +393,33 @@ mod tests {
             p.lookup_by_mac(A, 100).unwrap().ip,
             Ipv4Addr::new(192, 168, 1, 11)
         );
+    }
+
+    #[test]
+    fn a_declined_address_is_not_offered_again_for_a_while() {
+        let mut p = pool();
+        let ip = p.offer(A, None, 100).unwrap();
+        p.hold(ip, 100 + 1800);
+        assert_ne!(p.offer(A, None, 200), Some(ip));
+        assert_ne!(p.offer(B, None, 200), Some(ip));
+        assert_eq!(p.commit(B, ip, None, 200, 3600), Err(LeaseError::Conflict));
+        // Once the hold is over, it is free again.
+        assert_eq!(p.offer(B, None, 2000), Some(ip));
+        p.prune_expired(2000);
+        assert!(p.held.is_empty());
+    }
+
+    #[test]
+    fn an_address_another_device_is_using_is_not_offered() {
+        let mut p = pool();
+        let first = Ipv4Addr::new(192, 168, 1, 10);
+        p.set_seen(HashMap::from([(first, C)]));
+        assert_eq!(p.offer(A, None, 100), Some(Ipv4Addr::new(192, 168, 1, 11)));
+        assert_eq!(
+            p.commit(A, first, None, 100, 3600),
+            Err(LeaseError::Conflict)
+        );
+        // The device seen there may have it.
+        assert_eq!(p.offer(C, Some(first), 100), Some(first));
     }
 }

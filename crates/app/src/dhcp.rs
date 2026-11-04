@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use ferrite_clients::ClientRegistry;
 use ferrite_core::config::{DhcpConfig, RaConfig};
 use ferrite_core::net::{format_mac, parse_mac};
+use ferrite_dhcp::probe::Rival;
 use ferrite_dhcp::server::{self, LeaseEvent, SharedPool};
 use ferrite_dhcp::{LeasePool, ServerConfig, ra};
 use ferrite_dns::custom::CustomRecords;
@@ -33,6 +34,13 @@ const PRUNE_EVERY: Duration = Duration::from_secs(600);
 const EVENT_QUEUE: usize = 256;
 /// The search domain when none is set.
 pub const DEFAULT_DOMAIN: &str = "lan";
+/// How often the neighbour table is read into the pool, so an address a device
+/// is using without a lease from us isn't offered to another.
+const SEEN_EVERY: Duration = Duration::from_secs(30);
+/// How often, while serving, the network is asked for other DHCP servers.
+const RIVALS_EVERY: Duration = Duration::from_secs(30 * 60);
+/// How long a check listens for answers.
+const RIVALS_WAIT: Duration = Duration::from_secs(3);
 
 /// Placeholder owners that keep the box's own address and the router's out of
 /// the pool: a reservation for a MAC no device has (locally administered,
@@ -55,6 +63,17 @@ pub struct DhcpStatus {
     pub ra_error: Option<String>,
     pub ra_interface: Option<String>,
     pub ra_rdnss: Vec<Ipv6Addr>,
+}
+
+/// The last look for other DHCP servers on the network.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RivalCheck {
+    /// Servers other than this one that offered an address.
+    pub servers: Vec<Rival>,
+    /// Unix seconds; `None` = not looked yet.
+    pub checked_at: Option<u64>,
+    /// Why it couldn't look.
+    pub error: Option<String>,
 }
 
 /// One lease as the panel shows it.
@@ -144,6 +163,7 @@ pub struct DhcpService {
     status: Mutex<DhcpStatus>,
     /// One reconfigure at a time.
     apply_lock: tokio::sync::Mutex<()>,
+    rivals: Mutex<RivalCheck>,
 }
 
 impl DhcpService {
@@ -163,11 +183,74 @@ impl DhcpService {
             tasks: Mutex::new(Tasks::default()),
             status: Mutex::new(DhcpStatus::default()),
             apply_lock: tokio::sync::Mutex::new(()),
+            rivals: Mutex::new(RivalCheck::default()),
         })
     }
 
     pub fn status(&self) -> DhcpStatus {
         self.status.lock().clone()
+    }
+
+    /// The last look for other DHCP servers.
+    pub fn rivals(&self) -> RivalCheck {
+        self.rivals.lock().clone()
+    }
+
+    /// Look for other DHCP servers now (takes a few seconds).
+    pub async fn check_rivals(&self) -> RivalCheck {
+        let mut ours: Vec<Ipv4Addr> = ferrite_core::net::local_ipv4_for_internet()
+            .into_iter()
+            .collect();
+        ours.extend(self.status.lock().server_ip);
+        let check = match ferrite_dhcp::probe::probe(&ours, RIVALS_WAIT).await {
+            Ok(servers) => {
+                if !servers.is_empty() {
+                    let list: Vec<String> = servers.iter().map(|r| r.server.to_string()).collect();
+                    tracing::warn!(
+                        "dhcp: another DHCP server answers on this network: {}",
+                        list.join(", ")
+                    );
+                }
+                RivalCheck {
+                    servers,
+                    checked_at: Some(now()),
+                    error: None,
+                }
+            }
+            Err(e) => RivalCheck {
+                servers: Vec::new(),
+                checked_at: Some(now()),
+                error: Some(match e.kind() {
+                    std::io::ErrorKind::PermissionDenied => {
+                        "no permission for port 68 — ferrite needs CAP_NET_BIND_SERVICE".into()
+                    }
+                    std::io::ErrorKind::AddrInUse => {
+                        "port 68 is taken by this box's own DHCP client".into()
+                    }
+                    _ => format!("couldn't ask the network: {e}"),
+                }),
+            },
+        };
+        *self.rivals.lock() = check.clone();
+        check
+    }
+
+    /// Forget the lease `mac` holds: the address goes back to the pool and
+    /// its name out of DNS. The device asks again when it next renews.
+    pub async fn forget(&self, mac: [u8; 6]) -> bool {
+        let Some(pool) = self.pool.lock().clone() else {
+            return false;
+        };
+        let ip = pool.lock().lookup_by_mac(mac, now()).map(|l| l.ip);
+        let Some(ip) = ip else {
+            return false;
+        };
+        pool.lock().release(mac);
+        if let Err(e) = self.storage.delete_dhcp_lease(&ip.to_string()).await {
+            tracing::warn!("dhcp: couldn't drop the lease for {ip}: {e}");
+        }
+        self.refresh_names();
+        true
     }
 
     /// The active leases, reservations marked.
@@ -354,8 +437,10 @@ impl DhcpService {
             })
         };
         let events = tokio::spawn(Arc::clone(self).consume(rx));
-        let prune = tokio::spawn(Arc::clone(self).prune_loop(pool));
-        self.tasks.lock().dhcp = vec![serve, events, prune];
+        let prune = tokio::spawn(Arc::clone(self).prune_loop(Arc::clone(&pool)));
+        let seen = tokio::spawn(seen_loop(pool, start, end));
+        let rivals = tokio::spawn(Arc::clone(self).rivals_loop());
+        self.tasks.lock().dhcp = vec![serve, events, prune, seen, rivals];
         tracing::info!(
             "dhcp: serving {start}–{end} as {server_ip}, router {}, domain {}",
             gateway.map_or_else(|| "none".to_string(), |g| g.to_string()),
@@ -446,6 +531,16 @@ impl DhcpService {
         }
     }
 
+    /// Every so often while serving, look for other DHCP servers — a router
+    /// whose own came back on after a firmware update, say.
+    async fn rivals_loop(self: Arc<Self>) {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        loop {
+            self.check_rivals().await;
+            tokio::time::sleep(RIVALS_EVERY).await;
+        }
+    }
+
     async fn prune_loop(self: Arc<Self>, pool: SharedPool) {
         let mut tick = tokio::time::interval(PRUNE_EVERY);
         tick.tick().await;
@@ -484,6 +579,24 @@ impl DhcpService {
             }
         }
         self.records.load_leases(&names, LEASE_NAME_TTL);
+    }
+}
+
+/// Feed the pool who the box sees at each address of the pool, so it never
+/// offers one a device is using.
+async fn seen_loop(pool: SharedPool, start: Ipv4Addr, end: Ipv4Addr) {
+    let (lo, hi) = (u32::from(start), u32::from(end));
+    loop {
+        let seen: std::collections::HashMap<Ipv4Addr, [u8; 6]> = ferrite_clients::scan_neighbors()
+            .await
+            .into_iter()
+            .filter_map(|(ip, mac)| match ip {
+                std::net::IpAddr::V4(v4) if (lo..=hi).contains(&u32::from(v4)) => Some((v4, mac)),
+                _ => None,
+            })
+            .collect();
+        pool.lock().set_seen(seen);
+        tokio::time::sleep(SEEN_EVERY).await;
     }
 }
 

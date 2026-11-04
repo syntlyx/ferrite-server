@@ -56,6 +56,9 @@ impl ServerConfig {
     }
 }
 
+/// How long an address a client declined stays out of offers.
+pub const DECLINE_HOLD_SECS: u64 = 30 * 60;
+
 /// Decide the reply to `req`, mutating `pool` on commit/release. `None` means
 /// "stay silent" (not for us, pool exhausted, or a message that needs no reply).
 pub fn handle(
@@ -76,9 +79,12 @@ pub fn handle(
             None
         }
         MessageType::Decline => {
-            // The client found the offered address already in use (ARP probe).
-            // Drop the lease so we stop handing it out; a fuller server would
-            // quarantine it, but releasing is enough to move the client on.
+            // The client found the address in use (its ARP probe got an
+            // answer). Drop the lease and keep the address out of offers for a
+            // while, or the next DISCOVER would get the same one back.
+            if let Some(ip) = req.requested_ip() {
+                pool.hold(ip, now.saturating_add(DECLINE_HOLD_SECS));
+            }
             pool.release(req.chaddr);
             None
         }
@@ -370,6 +376,34 @@ mod tests {
         );
         assert!(reply.is_none());
         assert!(p.lookup_by_mac(MAC, 100).is_none());
+    }
+
+    #[test]
+    fn a_declined_address_goes_to_someone_else_next() {
+        let mut p = pool();
+        let first = handle(
+            &cfg(),
+            &mut p,
+            &request(MAC, MessageType::Discover, vec![]),
+            100,
+        )
+        .unwrap()
+        .yiaddr;
+        let decline = request(
+            MAC,
+            MessageType::Decline,
+            vec![DhcpOption::RequestedIp(first)],
+        );
+        assert!(handle(&cfg(), &mut p, &decline, 100).is_none());
+        let next = handle(
+            &cfg(),
+            &mut p,
+            &request(MAC, MessageType::Discover, vec![]),
+            101,
+        )
+        .unwrap()
+        .yiaddr;
+        assert_ne!(next, first);
     }
 
     #[test]

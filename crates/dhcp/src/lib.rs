@@ -14,6 +14,7 @@ pub mod handler;
 pub mod lease;
 pub mod message;
 pub mod options;
+pub mod probe;
 pub mod ra;
 pub mod server;
 

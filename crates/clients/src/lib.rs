@@ -1,4 +1,6 @@
 mod mac;
+/// The OS neighbour tables (ARP and NDP): who is at which address right now.
+pub use mac::scan_neighbors;
 mod mdns;
 mod ptr;
 mod registry;

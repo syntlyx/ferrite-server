@@ -7,7 +7,10 @@
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use axum::{Json, extract::State};
+use axum::{
+    Json,
+    extract::{Path, State},
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -30,7 +33,30 @@ fn view(state: &AppState) -> Value {
         "ra": cfg.ra,
         "status": state.inner.dhcp.status(),
         "detected": dhcp::detect(),
+        "rivals": state.inner.dhcp.rivals(),
     })
+}
+
+/// POST /api/dhcp/check — ask the network for other DHCP servers now (a few
+/// seconds). Worth doing before switching ferrite's on: a network takes one.
+pub async fn check(State(state): State<AppState>) -> Json<Value> {
+    Json(json!(state.inner.dhcp.check_rivals().await))
+}
+
+/// DELETE /api/dhcp/leases/{mac} — forget a lease: the address goes back to
+/// the pool, the device asks again when it next renews.
+pub async fn forget_lease(
+    State(state): State<AppState>,
+    Path(mac): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let parsed = ferrite_core::net::parse_mac(&mac)
+        .ok_or_else(|| ApiError(FeriteError::Config(format!("{mac} isn't a MAC address"))))?;
+    if !state.inner.dhcp.forget(parsed).await {
+        return Err(ApiError(FeriteError::NotFound(format!(
+            "no lease for {mac}"
+        ))));
+    }
+    Ok(Json(json!({ "status": "ok" })))
 }
 
 /// GET /api/dhcp

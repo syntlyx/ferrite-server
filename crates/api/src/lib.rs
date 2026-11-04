@@ -131,6 +131,8 @@ pub fn build_router(state: AppState) -> Router {
         // Follow a primary ferrite
         .route("/dhcp", get(dhcp::get_dhcp).put(dhcp::put_dhcp))
         .route("/dhcp/leases", get(dhcp::get_leases))
+        .route("/dhcp/leases/{mac}", delete(dhcp::forget_lease))
+        .route("/dhcp/check", post(dhcp::check))
         .route(
             "/secure-dns",
             get(secure_dns::get_secure_dns).put(secure_dns::put_secure_dns),

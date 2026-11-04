@@ -12,4 +12,5 @@ tokio.workspace = true
 socket2.workspace = true
 libc.workspace = true
 parking_lot.workspace = true
+serde.workspace = true
 tracing.workspace = true
