@@ -4,7 +4,7 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -120,6 +120,53 @@ pub async fn profile_link(
         "url": format!("/api/secure-dns/profile/{token}"),
         "device": device,
     })))
+}
+
+#[derive(Deserialize)]
+pub struct DeviceName {
+    /// A client's name from Clients, or a device name itself.
+    name: String,
+}
+
+/// The device a client goes by in encrypted DNS, and what to type in.
+fn described(state: &AppState, found: Option<(String, bool)>) -> Value {
+    let cfg = state.live_config.read().secure_dns.clone();
+    let on = cfg.enabled && !cfg.hostname.is_empty();
+    let Some((id, made)) = found.filter(|_| on) else {
+        return json!({ "enabled": on, "id": null });
+    };
+    let mut v = crate::setup::how(&cfg, &id);
+    v["enabled"] = json!(true);
+    v["apple"] = json!(ferrite_secure::SecureDns::profile(&cfg, &id).is_some());
+    v["id"] = json!(id);
+    v["new"] = json!(made);
+    v
+}
+
+/// GET /api/secure-dns/device?name=… — the device name a client from
+/// Clients goes by in encrypted DNS, if it has one yet.
+pub async fn device(State(state): State<AppState>, Query(q): Query<DeviceName>) -> Json<Value> {
+    let found = crate::setup::device_for(&state, &q.name, false).await;
+    Json(described(&state, found))
+}
+
+/// POST /api/secure-dns/device — give a client from Clients a device name
+/// in encrypted DNS (its own name and four letters), answered away from
+/// home; the one it has, if it has one.
+pub async fn make_device(
+    State(state): State<AppState>,
+    Json(q): Json<DeviceName>,
+) -> Result<Json<Value>, ApiError> {
+    {
+        let cfg = &state.live_config.read().secure_dns;
+        if !cfg.enabled || cfg.hostname.is_empty() {
+            return Err(ApiError(FeriteError::Config(
+                "turn encrypted DNS on first".into(),
+            )));
+        }
+    }
+    let found = crate::setup::device_for(&state, &q.name, true).await;
+    Ok(Json(described(&state, found)))
 }
 
 /// GET /api/secure-dns/profile/{token} — public: the token is the key.

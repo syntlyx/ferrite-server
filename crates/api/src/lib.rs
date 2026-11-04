@@ -21,6 +21,7 @@ pub mod safesearch;
 pub mod secure_dns;
 pub mod services;
 pub mod settings;
+pub mod setup;
 pub mod stats;
 pub mod storage;
 pub mod sync;
@@ -52,6 +53,9 @@ pub fn build_router(state: AppState) -> Router {
         // A device's encrypted DNS profile, opened by the device's own
         // browser: the link's token is the key.
         .route("/secure-dns/profile/{token}", get(secure_dns::profile))
+        // A device at home setting itself up for encrypted DNS, where
+        // `[secure_dns] self_setup` lets it; from home only.
+        .route("/setup", get(setup::view).post(setup::claim))
         .with_state(state.clone());
 
     let api = Router::new()
@@ -139,6 +143,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/secure-dns/renew", post(secure_dns::renew_secure_dns))
         .route("/secure-dns/profile-link", post(secure_dns::profile_link))
+        .route(
+            "/secure-dns/device",
+            get(secure_dns::device).post(secure_dns::make_device),
+        )
         .route("/sync", get(sync::get_sync).put(sync::put_sync))
         .route("/sync/now", post(sync::sync_now))
         // Bring a Pi-hole or AdGuard Home setup over (a Teleporter archive

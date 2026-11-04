@@ -234,12 +234,14 @@ impl SecureDns {
         let _guard = self.apply_lock.lock().await;
         self.gate.set_devices(&cfg.devices);
         self.gate.set_proxies(&cfg.proxies);
-        // Only the device or proxy list changed, and what runs is fine:
-        // nothing to restart. Anything that failed gets another go.
+        // Only the device or proxy list (or self-setup) changed, and what
+        // runs is fine: nothing to restart. Anything that failed gets
+        // another go.
         let key = (
             SecureDnsConfig {
                 devices: Vec::new(),
                 proxies: Vec::new(),
+                self_setup: Default::default(),
                 ..cfg.clone()
             },
             tunnels_port,

@@ -524,6 +524,10 @@ domains = [
 # address, so the client it names in X-Real-IP counts, not the proxy.
 # DNS over TLS has to reach ferrite directly.
 # proxies     = ["192.168.1.5"]
+# Who may set a device up from http://<panel>/setup, at home and without the
+# password: "off", "named" (devices you've named in Clients; the default) or
+# "anyone". The device is added to `devices` and the webhook is told.
+# self_setup  = "named"
 #
 # [secure_dns.acme]
 # cloudflare_token = "…"

@@ -1176,6 +1176,10 @@ pub struct SecureDnsConfig {
     /// names: at home or away, and which devices may ask.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub proxies: Vec<String>,
+    /// Who may set a device up from `/setup` on the panel, at home and
+    /// without the password. One that does is added to `devices` under its
+    /// own name, and the webhook is told.
+    pub self_setup: SelfSetup,
 }
 
 impl Default for SecureDnsConfig {
@@ -1191,8 +1195,22 @@ impl Default for SecureDnsConfig {
             doh_port: 443,
             devices: Vec::new(),
             proxies: Vec::new(),
+            self_setup: SelfSetup::default(),
         }
     }
+}
+
+/// Who may set a device up for encrypted DNS without the panel's password.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SelfSetup {
+    /// Nobody: devices are added in the panel, profiles handed over from it.
+    Off,
+    /// Devices at home that have a name in Clients — ones you know.
+    #[default]
+    Named,
+    /// Any device at home, guests too.
+    Anyone,
 }
 
 /// Where encrypted DNS gets its certificate.
