@@ -28,3 +28,7 @@ serde_json.workspace = true
 hyper = { workspace = true, features = ["server", "http1", "http2"] }
 hyper-util = { workspace = true, features = ["tokio", "service", "server-auto", "http1", "http2"] }
 http-body-util = "0.1"
+http.workspace = true
+quinn.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true

@@ -56,8 +56,9 @@ Each device connects under its own name, so it keeps its profile wherever it
 is. Give it a Cloudflare token and ferrite gets the certificate from Let's
 Encrypt and renews it, with no port open for that; an iPhone or Mac sets
 itself up from a profile, from a QR code in the panel or by opening the
-panel's `/setup` page at home, with no password. DNS over HTTPS shares 443
-with Tunnels, or sits behind a reverse proxy such as Nginx Proxy Manager, and
+panel's `/setup` page at home, with no password. DNS over HTTPS speaks
+HTTP/3 too, shares 443 with Tunnels, or sits behind a reverse proxy such as
+Nginx Proxy Manager, and
 from outside the house only the devices you list are answered.
 
 **Keeping devices on the filter.** Firefox is kept from switching to its own

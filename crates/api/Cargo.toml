@@ -48,3 +48,8 @@ yaml-rust2.workspace = true
 [dev-dependencies]
 ferrite-app = { workspace = true, features = ["testutil"] }
 ferrite-blocklist = { workspace = true, features = ["testutil"] }
+# An HTTP/3 client, to ask encrypted DNS over QUIC in the tests.
+quinn.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+http.workspace = true

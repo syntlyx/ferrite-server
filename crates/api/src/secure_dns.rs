@@ -499,6 +499,58 @@ mod tests {
             .unwrap()
     }
 
+    /// A QUIC connection to `port` asking for `sni`, speaking HTTP/3.
+    async fn h3_connect(port: u16, sni: &str) -> Result<quinn::Connection, String> {
+        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyCert))
+        .with_no_client_auth();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
+        let connecting = endpoint
+            .connect(SocketAddr::from(([127, 0, 0, 1], port)), sni)
+            .map_err(|e| e.to_string())?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), connecting)
+            .await
+            .map_err(|_| "timed out".to_string())?
+            .map_err(|e| e.to_string())
+    }
+
+    /// A DoH GET over HTTP/3; the response body.
+    async fn h3_get(port: u16, sni: &str, path: &str, id: u16) -> Vec<u8> {
+        use base64::Engine;
+        use bytes::Buf;
+        let conn = h3_connect(port, sni).await.unwrap();
+        let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn))
+            .await
+            .unwrap();
+        tokio::spawn(async move { std::future::poll_fn(|cx| driver.poll_close(cx)).await });
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(home_query(id));
+        let req = http::Request::get(format!("https://{sni}{path}?dns={b64}"))
+            .body(())
+            .unwrap();
+        let mut stream = send.send_request(req).await.unwrap();
+        stream.finish().await.unwrap();
+        let response = stream.recv_response().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let mut body = Vec::new();
+        while let Some(mut chunk) = stream.recv_data().await.unwrap() {
+            while chunk.has_remaining() {
+                let part = chunk.chunk();
+                body.extend_from_slice(part);
+                let n = part.len();
+                chunk.advance(n);
+            }
+        }
+        body
+    }
+
     /// A DoH GET over TLS to `sni`, behind a PROXY `header`.
     async fn proxied_get(port: u16, header: &[u8], sni: &str, id: u16) -> Vec<u8> {
         use base64::Engine;
@@ -662,6 +714,20 @@ mod tests {
         assert!(head.contains("application/dns-message"), "{head}");
         assert_eq!(&response[response.len() - 4..], &[10, 0, 0, 7]);
         assert_eq!(log.recv().await.unwrap().device, "id:tv");
+        // …and it says HTTP/3 is there too, on the same port's UDP side.
+        assert_eq!(v["status"]["doh3"], true, "{v}");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains(&format!("alt-svc: h3=\":{doh}\"")),
+            "{head}"
+        );
+
+        // DNS over HTTP/3, named `phone` in the TLS name.
+        let answer = h3_get(doh, "phone.dns.test", "/dns-query", 10).await;
+        assert_eq!(&answer[answer.len() - 4..], &[10, 0, 0, 7]);
+        assert_eq!(log.recv().await.unwrap().device, "id:phone");
+        // A name that isn't ours gets no certificate at all.
+        assert!(h3_connect(doh, "www.youtube.com").await.is_err());
 
         // Switched off: the ports close.
         let mut off = on(dot, doh);

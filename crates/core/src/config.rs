@@ -1183,6 +1183,10 @@ pub struct SecureDnsConfig {
     pub dot_port: u16,
     /// DNS over HTTPS; 0 = off.
     pub doh_port: u16,
+    /// DNS over HTTPS over HTTP/3 too, on `doh_port`'s UDP side. Devices
+    /// learn of it from the first answer over TCP; away from home it needs
+    /// the router to send that UDP port here directly.
+    pub http3: bool,
     /// The devices, by client ID, that are answered away from home. At home
     /// any device is; from the internet only these — the name and its
     /// wildcard are public, and this isn't a resolver for everyone.
@@ -1217,6 +1221,7 @@ impl Default for SecureDnsConfig {
             acme: AcmeConfig::default(),
             dot_port: 853,
             doh_port: 443,
+            http3: true,
             devices: Vec::new(),
             proxies: Vec::new(),
             self_setup: SelfSetup::default(),

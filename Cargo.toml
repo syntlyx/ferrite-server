@@ -57,6 +57,11 @@ axum = { version = "0.8", features = ["macros"] }     # REST API + serves the we
 # hyper/hyper-util: serve the panel on a single peeked connection so the :80
 # listener can demux panel-vs-proxy by Host (already in the tree via axum).
 hyper = { version = "1", features = ["server", "http1"] }
+http = "1"
+# DNS over HTTPS over HTTP/3 (QUIC) for devices; ring, like the rest of TLS.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }  # CORS + request tracing middleware
 # `rustls-no-provider` rather than `rustls`: the latter force-enables the aws-lc-rs

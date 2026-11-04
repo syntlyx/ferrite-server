@@ -19,6 +19,7 @@ mod acme;
 mod cert;
 mod cloudflare;
 mod doh;
+mod doh3;
 mod dot;
 mod gate;
 mod profile;
@@ -28,6 +29,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use arc_swap::ArcSwapOption;
@@ -70,6 +72,9 @@ pub struct SecureDnsStatus {
     /// Comes in through Tunnels' listener on the same port.
     pub dot_shared: bool,
     pub doh_shared: bool,
+    /// DNS over HTTPS over HTTP/3, on the DoH port's UDP side.
+    pub doh3: bool,
+    pub doh3_error: Option<String>,
     pub cert: Option<CertInfo>,
     /// The certificate works, but not for everything: a name it doesn't cover.
     pub cert_warning: Option<String>,
@@ -132,6 +137,8 @@ struct Serving {
     ctx: Arc<DnsCtx>,
     connections: Arc<Semaphore>,
     gate: Arc<gate::Gate>,
+    /// The UDP port HTTP/3 is on, for `Alt-Svc`; 0 while it's off.
+    h3_port: Arc<AtomicU16>,
 }
 
 /// A port shared with Tunnels.
@@ -249,7 +256,10 @@ impl SecureDns {
         );
         let healthy = {
             let st = self.status.lock();
-            st.error.is_none() && st.dot_error.is_none() && st.doh_error.is_none()
+            st.error.is_none()
+                && st.dot_error.is_none()
+                && st.doh_error.is_none()
+                && st.doh3_error.is_none()
         };
         if healthy && self.applied.lock().as_ref() == Some(&key) {
             return;
@@ -367,6 +377,7 @@ impl SecureDns {
             ctx,
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             gate: Arc::clone(&self.gate),
+            h3_port: Arc::new(AtomicU16::new(0)),
         });
 
         let mut ports: Vec<(u16, Default_)> = Vec::new();
@@ -427,6 +438,38 @@ impl SecureDns {
                         _ => format!("couldn't open port {port}: {e}"),
                     };
                     mark(status, false, false, Some(msg));
+                }
+            }
+        }
+        // HTTP/3 on the UDP side of the DNS over HTTPS port. Its own socket
+        // even where TCP is shared with Tunnels, which take no UDP.
+        if cfg.http3 && cfg.doh_port != 0 && status.doh {
+            let certs = Arc::clone(&self.certs) as Arc<dyn rustls::server::ResolvesServerCert>;
+            let bound = doh3::server_config(certs, &hostname).and_then(|qc| {
+                doh3::bind(cfg.doh_port, qc).map_err(|e| match e.kind() {
+                    std::io::ErrorKind::AddrInUse => format!("UDP port {} is taken", cfg.doh_port),
+                    std::io::ErrorKind::PermissionDenied => {
+                        format!("no permission for UDP port {}", cfg.doh_port)
+                    }
+                    _ => format!("couldn't open UDP port {}: {e}", cfg.doh_port),
+                })
+            });
+            match bound {
+                Ok(endpoint) => {
+                    tracing::info!(
+                        "secure dns: DNS over HTTP/3 on :{}/udp as {hostname}",
+                        cfg.doh_port
+                    );
+                    serving.h3_port.store(cfg.doh_port, Ordering::Relaxed);
+                    status.doh3 = true;
+                    tasks.push(tokio::spawn(doh3::accept_loop(
+                        endpoint,
+                        Arc::clone(&serving),
+                    )));
+                }
+                Err(msg) => {
+                    tracing::warn!("secure dns: no DNS over HTTP/3: {msg}");
+                    status.doh3_error = Some(msg);
                 }
             }
         }
@@ -660,7 +703,8 @@ where
     };
     let (ctx, gate) = (Arc::clone(&serving.ctx), Arc::clone(&serving.gate));
     if https {
-        doh::serve(tls, peer, sni_id, ctx, gate).await;
+        let h3 = Arc::clone(&serving.h3_port);
+        doh::serve(tls, peer, sni_id, ctx, gate, h3).await;
     } else {
         dot::serve(tls, peer, sni_id, ctx, gate).await;
     }
