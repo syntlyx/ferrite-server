@@ -20,12 +20,15 @@ mod cert;
 mod cloudflare;
 mod doh;
 mod dot;
+mod gate;
+mod profile;
 mod rewind;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use arc_swap::ArcSwapOption;
 use parking_lot::Mutex;
@@ -41,6 +44,7 @@ use ferrite_core::config::{AcmeConfig, CertSource, SecureDnsConfig};
 use ferrite_dns::ctx::DnsCtx;
 
 pub use cert::CertInfo;
+pub use gate::TurnedAway;
 
 /// A handshake that hasn't finished in this long is dropped.
 const HANDSHAKE: Duration = Duration::from_secs(10);
@@ -50,6 +54,8 @@ const CERT_CHECK: Duration = Duration::from_secs(600);
 const RENEW_CHECK: Duration = Duration::from_secs(12 * 3600);
 /// Encrypted connections open at once, across all listeners.
 const MAX_CONNECTIONS: usize = 1024;
+/// How long a link to a device's profile works.
+const PROFILE_LINK: Duration = Duration::from_secs(15 * 60);
 
 /// What the encrypted listeners are doing — the panel's status line.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -69,6 +75,9 @@ pub struct SecureDnsStatus {
     pub cert_warning: Option<String>,
     /// With Let's Encrypt: getting and renewing the certificate.
     pub acme: Option<AcmeStatus>,
+    /// Queries from outside home that named no device of the list.
+    pub turned_away: u64,
+    pub last_turned_away: Option<TurnedAway>,
 }
 
 /// Where getting the certificate from Let's Encrypt stands.
@@ -109,7 +118,7 @@ fn is_ours(sni: &str, hostname: &str) -> bool {
             .is_some_and(|front| front.ends_with('.'))
 }
 
-fn unix_now() -> i64 {
+pub(crate) fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -122,6 +131,7 @@ struct Serving {
     hostname: String,
     ctx: Arc<DnsCtx>,
     connections: Arc<Semaphore>,
+    gate: Arc<gate::Gate>,
 }
 
 /// A port shared with Tunnels.
@@ -149,6 +159,12 @@ pub struct SecureDns {
     shared: ArcSwapOption<Shared>,
     /// Pinged to ask Let's Encrypt again right away.
     retry: Notify,
+    gate: Arc<gate::Gate>,
+    /// What runs now, with the Tunnels port it shares — a change to the
+    /// device list alone needn't touch the listeners.
+    applied: Mutex<Option<(SecureDnsConfig, Option<u16>)>>,
+    /// Profile links handed out: token → (device, made at).
+    links: Mutex<HashMap<String, (String, Instant)>>,
 }
 
 impl SecureDns {
@@ -162,11 +178,44 @@ impl SecureDns {
             apply_lock: tokio::sync::Mutex::new(()),
             shared: ArcSwapOption::empty(),
             retry: Notify::new(),
+            gate: Arc::new(gate::Gate::default()),
+            applied: Mutex::new(None),
+            links: Mutex::new(HashMap::new()),
         })
     }
 
     pub fn status(&self) -> SecureDnsStatus {
-        self.status.lock().clone()
+        let mut status = self.status.lock().clone();
+        (status.turned_away, status.last_turned_away) = self.gate.turned_away();
+        status
+    }
+
+    /// A link that hands out `device`'s profile for a while, to whoever has
+    /// it: the profile is opened by the device's own browser, which carries
+    /// no panel credentials.
+    pub fn profile_link(&self, device: &str) -> String {
+        let mut bytes = [0u8; 16];
+        let _ = ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut bytes);
+        let token = hex::encode(bytes);
+        let mut links = self.links.lock();
+        links.retain(|_, (_, made)| made.elapsed() < PROFILE_LINK);
+        links.insert(token.clone(), (device.to_string(), Instant::now()));
+        token
+    }
+
+    /// The device a profile link is for, while it works.
+    pub fn redeem(&self, token: &str) -> Option<String> {
+        let links = self.links.lock();
+        links
+            .get(token)
+            .filter(|(_, made)| made.elapsed() < PROFILE_LINK)
+            .map(|(device, _)| device.clone())
+    }
+
+    /// The `.mobileconfig` for `device` under `cfg`; `None` when no protocol
+    /// an Apple device can use is on.
+    pub fn profile(cfg: &SecureDnsConfig, device: &str) -> Option<String> {
+        profile::mobileconfig(&cfg.hostname, device, cfg.doh_port, cfg.dot_port)
     }
 
     /// Ask Let's Encrypt again now rather than at the next try.
@@ -183,6 +232,24 @@ impl SecureDns {
         tunnels_port: Option<u16>,
     ) {
         let _guard = self.apply_lock.lock().await;
+        self.gate.set_devices(&cfg.devices);
+        // Only the device list changed, and what runs is fine: nothing to
+        // restart. Anything that failed gets another go.
+        let key = (
+            SecureDnsConfig {
+                devices: Vec::new(),
+                ..cfg.clone()
+            },
+            tunnels_port,
+        );
+        let healthy = {
+            let st = self.status.lock();
+            st.error.is_none() && st.dot_error.is_none() && st.doh_error.is_none()
+        };
+        if healthy && self.applied.lock().as_ref() == Some(&key) {
+            return;
+        }
+        *self.applied.lock() = Some(key);
         // Taken out first: the lock mustn't be held across the awaits below.
         let running = std::mem::take(&mut *self.tasks.lock());
         for task in running {
@@ -294,6 +361,7 @@ impl SecureDns {
             hostname: hostname.clone(),
             ctx,
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            gate: Arc::clone(&self.gate),
         });
 
         let mut ports: Vec<(u16, Default_)> = Vec::new();
@@ -573,11 +641,11 @@ where
         Some(_) => false,
         None => default == Default_::Https,
     };
-    let ctx = Arc::clone(&serving.ctx);
+    let (ctx, gate) = (Arc::clone(&serving.ctx), Arc::clone(&serving.gate));
     if https {
-        doh::serve(tls, peer, sni_id, ctx).await;
+        doh::serve(tls, peer, sni_id, ctx, gate).await;
     } else {
-        dot::serve(tls, peer, sni_id, ctx).await;
+        dot::serve(tls, peer, sni_id, ctx, gate).await;
     }
 }
 

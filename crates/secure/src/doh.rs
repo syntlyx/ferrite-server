@@ -18,16 +18,23 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use ferrite_dns::ctx::DnsCtx;
 
+use crate::gate::Gate;
+
 const DNS_MESSAGE: &str = "application/dns-message";
 const MAX_MESSAGE: usize = 65_535;
 
-pub async fn serve<S>(stream: S, peer: SocketAddr, sni_id: Option<String>, ctx: Arc<DnsCtx>)
-where
+pub(crate) async fn serve<S>(
+    stream: S,
+    peer: SocketAddr,
+    sni_id: Option<String>,
+    ctx: Arc<DnsCtx>,
+    gate: Arc<Gate>,
+) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let service = hyper::service::service_fn(move |req| {
-        let (ctx, sni_id) = (Arc::clone(&ctx), sni_id.clone());
-        async move { Ok::<_, Infallible>(answer(req, peer, sni_id, ctx).await) }
+        let (ctx, sni_id, gate) = (Arc::clone(&ctx), sni_id.clone(), Arc::clone(&gate));
+        async move { Ok::<_, Infallible>(answer(req, peer, sni_id, ctx, &gate).await) }
     });
     if let Err(e) = auto::Builder::new(TokioExecutor::new())
         .serve_connection(TokioIo::new(stream), service)
@@ -62,6 +69,7 @@ async fn answer(
     peer: SocketAddr,
     sni_id: Option<String>,
     ctx: Arc<DnsCtx>,
+    gate: &Gate,
 ) -> Response<Full<Bytes>> {
     let Some(client_id) = path_id(req.uri().path(), sni_id) else {
         return reply(StatusCode::NOT_FOUND, "not found\n");
@@ -104,21 +112,31 @@ async fn answer(
     if raw.len() < 12 || raw.len() > MAX_MESSAGE {
         return reply(StatusCode::BAD_REQUEST, "not a DNS message\n");
     }
+    if !gate.allows(peer.ip(), client_id.as_deref()) {
+        return dns_message(ferrite_dns::handler::refused(&raw));
+    }
     let Ok(permit) = Arc::clone(&ctx.query_semaphore).try_acquire_owned() else {
         return reply(StatusCode::SERVICE_UNAVAILABLE, "busy\n");
     };
     let result = ferrite_dns::handler::handle_query_as(raw, peer, client_id.as_deref(), ctx).await;
     drop(permit);
     match result {
-        Ok(bytes) if !bytes.is_empty() => Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, DNS_MESSAGE)
-            // Answers already carry the TTL the device may keep them for.
-            .header(CACHE_CONTROL, "no-store")
-            .body(Full::new(Bytes::from(bytes)))
-            .unwrap_or_default(),
+        Ok(bytes) => dns_message(bytes),
         _ => reply(StatusCode::BAD_REQUEST, "not a DNS query\n"),
     }
+}
+
+fn dns_message(bytes: Vec<u8>) -> Response<Full<Bytes>> {
+    if bytes.is_empty() {
+        return reply(StatusCode::BAD_REQUEST, "not a DNS query\n");
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, DNS_MESSAGE)
+        // Answers already carry the TTL the device may keep them for.
+        .header(CACHE_CONTROL, "no-store")
+        .body(Full::new(Bytes::from(bytes)))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

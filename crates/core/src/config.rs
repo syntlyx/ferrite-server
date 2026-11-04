@@ -1165,6 +1165,11 @@ pub struct SecureDnsConfig {
     pub dot_port: u16,
     /// DNS over HTTPS; 0 = off.
     pub doh_port: u16,
+    /// The devices, by client ID, that are answered away from home. At home
+    /// any device is; from the internet only these — the name and its
+    /// wildcard are public, and this isn't a resolver for everyone.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<String>,
 }
 
 impl Default for SecureDnsConfig {
@@ -1178,6 +1183,7 @@ impl Default for SecureDnsConfig {
             acme: AcmeConfig::default(),
             dot_port: 853,
             doh_port: 443,
+            devices: Vec::new(),
         }
     }
 }

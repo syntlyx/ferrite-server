@@ -12,6 +12,8 @@ use tokio::time::timeout;
 
 use ferrite_dns::ctx::DnsCtx;
 
+use crate::gate::Gate;
+
 /// A connection with nothing to say this long is closed; the device reopens
 /// it when it next asks.
 const IDLE: Duration = Duration::from_secs(60);
@@ -21,8 +23,13 @@ const BODY: Duration = Duration::from_secs(10);
 const PER_CONNECTION: usize = 32;
 const MAX_MESSAGE: usize = 65_535;
 
-pub async fn serve<S>(stream: S, peer: SocketAddr, client_id: Option<String>, ctx: Arc<DnsCtx>)
-where
+pub(crate) async fn serve<S>(
+    stream: S,
+    peer: SocketAddr,
+    client_id: Option<String>,
+    ctx: Arc<DnsCtx>,
+    gate: Arc<Gate>,
+) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (mut rd, mut wr) = tokio::io::split(stream);
@@ -55,6 +62,13 @@ where
         match timeout(BODY, rd.read_exact(&mut raw)).await {
             Ok(Ok(_)) => {}
             _ => break,
+        }
+        if !gate.allows(peer.ip(), client_id.as_deref()) {
+            let answer = ferrite_dns::handler::refused(&raw);
+            if answer.is_empty() || tx.send(answer).await.is_err() {
+                break;
+            }
+            continue;
         }
         let Ok(slot) = Arc::clone(&in_flight).acquire_owned().await else {
             break;

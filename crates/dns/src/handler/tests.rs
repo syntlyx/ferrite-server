@@ -668,7 +668,7 @@ async fn routed_domain_is_logged_with_routed_status_and_egress() {
 
     let response = handle_query(
         query("routed.test", RecordType::A).to_bytes().unwrap(),
-        SocketAddr::from(([192, 0, 2, 10], 53_000)),
+        SocketAddr::from(([192, 168, 1, 10], 53_000)),
         Arc::new(h.ctx()),
     )
     .await
@@ -684,6 +684,43 @@ async fn routed_domain_is_logged_with_routed_status_and_egress() {
     // …and the log entry carries the routed status + which egress will serve it.
     assert_eq!(entry.status, QueryStatus::Routed);
     assert_eq!(entry.upstream.as_deref(), Some("proxy:t"));
+
+    cleanup_sqlite(&h.db_path);
+}
+
+/// A device away from home asked over encrypted DNS: it can't reach the
+/// proxy at a home address, so a routed name resolves as any other.
+#[tokio::test]
+async fn a_device_away_from_home_is_not_routed() {
+    let mut h = Harness::new("dns-routed-away").await;
+    h.interceptor.route(
+        "routed.test",
+        a_response(0, "routed.test", Ipv4Addr::new(192, 168, 1, 2), 60),
+        "t",
+    );
+    h.custom_records
+        .load_builtin(&[ferrite_core::config::CustomRecordConfig {
+            domain: "routed.test".into(),
+            record_type: "A".into(),
+            value: "203.0.113.9".into(),
+            ttl: 60,
+        }]);
+
+    let response = handle_query_as(
+        query("routed.test", RecordType::A).to_bytes().unwrap(),
+        SocketAddr::from(([198, 51, 100, 20], 40_000)),
+        Some("pixel"),
+        Arc::new(h.ctx()),
+    )
+    .await
+    .unwrap();
+    let msg = Message::from_bytes(&response).unwrap();
+    assert!(matches!(
+        msg.answers[0].data,
+        RData::A(A(ip)) if ip == Ipv4Addr::new(203, 0, 113, 9)
+    ));
+    let entry = h.rx.try_recv().unwrap();
+    assert_ne!(entry.status, QueryStatus::Routed);
 
     cleanup_sqlite(&h.db_path);
 }
@@ -1093,7 +1130,7 @@ async fn whitelist_restores_routing_for_blocklisted_domain() {
 
     let response = handle_query(
         query("ads.routed.test", RecordType::A).to_bytes().unwrap(),
-        SocketAddr::from(([192, 0, 2, 10], 53_000)),
+        SocketAddr::from(([192, 168, 1, 10], 53_000)),
         Arc::new(h.ctx()),
     )
     .await

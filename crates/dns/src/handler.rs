@@ -335,9 +335,14 @@ pub fn decide_as(
     // to the proxy listeners. The blocklist already ran, so a blocked name
     // never gets here. Synthetic + returned early (NOT cached): routing rules
     // are runtime-mutable, so a cached redirect could outlive a deletion.
-    if let Some(intercept) =
-        ctx.interceptor
-            .maybe_intercept(&query, &name, qtype, client_ip, client_mac.as_deref())
+    // A device away from home (encrypted DNS from the internet) can't reach
+    // the listeners at a home address: it gets the real one.
+    if let Some(intercept) = ferrite_core::net::is_local(client_addr)
+        .then(|| {
+            ctx.interceptor
+                .maybe_intercept(&query, &name, qtype, client_ip, client_mac.as_deref())
+        })
+        .flatten()
     {
         if !log_ignored {
             emit(ctx, device.as_deref(), QueryStatus::Routed, |status| {
@@ -919,6 +924,16 @@ fn negative_encoded(query: &LazyQuery, ttl: u32, rcode: ResponseCode) -> Vec<u8>
 /// pretending to be of that kind.
 fn build_servfail(query: &LazyQuery) -> Vec<u8> {
     build_error(query, ResponseCode::ServFail)
+}
+
+/// REFUSED for `raw`: what a device that may not ask here gets. Empty when
+/// `raw` isn't a query worth answering at all.
+pub fn refused(raw: &[u8]) -> Vec<u8> {
+    let query = LazyQuery::new(raw);
+    if query.message().is_none() {
+        return Vec::new();
+    }
+    build_error(&query, ResponseCode::Refused)
 }
 
 /// An answer that is only an RCODE — SERVFAIL, REFUSED — echoing the query's

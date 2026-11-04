@@ -155,6 +155,30 @@ pub fn unmap_v4(ip: IpAddr) -> IpAddr {
     ip
 }
 
+/// Is `ip` an address a device has inside a home network — private,
+/// loopback, link-local, carrier-grade NAT (Tailscale and the like) or IPv6
+/// unique-local — rather than one from out on the internet? A query from out
+/// there can only have come in over encrypted DNS from a device away from
+/// home.
+pub fn is_local(ip: IpAddr) -> bool {
+    match unmap_v4(ip) {
+        IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                // 100.64.0.0/10
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+        }
+    }
+}
+
 /// Local IPv4 for internet traffic via dummy UDP connect (no packets sent).
 pub fn local_ipv4_for_internet() -> Option<Ipv4Addr> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
@@ -350,6 +374,33 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn home_addresses_are_told_from_the_internet() {
+        for local in [
+            "192.168.1.20",
+            "10.0.0.3",
+            "172.20.1.1",
+            "127.0.0.1",
+            "169.254.3.4",
+            "100.101.102.103",
+            "::1",
+            "fd12:3456::1",
+            "fe80::1",
+            "::ffff:192.168.1.20",
+        ] {
+            assert!(is_local(local.parse().unwrap()), "{local}");
+        }
+        for away in [
+            "8.8.8.8",
+            "100.128.0.1",
+            "2001:db8::1",
+            "2a00:1450::1",
+            "::ffff:1.1.1.1",
+        ] {
+            assert!(!is_local(away.parse().unwrap()), "{away}");
+        }
+    }
 
     #[test]
     fn ip_text_matches_display() {

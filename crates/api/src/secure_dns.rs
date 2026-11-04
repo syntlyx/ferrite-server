@@ -2,7 +2,13 @@
 //! settings, what the listeners are doing, and what to type into a device.
 //! A change applies at once, no restart.
 
-use axum::{Json, extract::State};
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::{StatusCode, header},
+    response::{IntoResponse, Response},
+};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::ApiError;
@@ -85,6 +91,68 @@ pub async fn renew_secure_dns(State(state): State<AppState>) -> Json<Value> {
     Json(view(&state))
 }
 
+#[derive(Deserialize)]
+pub struct LinkRequest {
+    device: String,
+}
+
+/// POST /api/secure-dns/profile-link — a link, good for a while, to the
+/// `.mobileconfig` that sets an iPhone, iPad or Mac up as `device`. Opened by
+/// the device's own browser, which has no panel credentials to send.
+pub async fn profile_link(
+    State(state): State<AppState>,
+    Json(req): Json<LinkRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let bad = |m: String| ApiError(FeriteError::Config(m));
+    let device = ferrite_core::net::normalize_client_id(&req.device)
+        .ok_or_else(|| bad(format!("{} can't be a device name", req.device)))?;
+    let cfg = state.live_config.read().secure_dns.clone();
+    if !cfg.enabled || cfg.hostname.is_empty() {
+        return Err(bad("turn encrypted DNS on first".into()));
+    }
+    if ferrite_secure::SecureDns::profile(&cfg, &device).is_none() {
+        return Err(bad(
+            "Apple devices need DNS over HTTPS, or DNS over TLS on 853".into(),
+        ));
+    }
+    let token = state.inner.secure_dns.profile_link(&device);
+    Ok(Json(json!({
+        "url": format!("/api/secure-dns/profile/{token}"),
+        "device": device,
+    })))
+}
+
+/// GET /api/secure-dns/profile/{token} — public: the token is the key.
+pub async fn profile(State(state): State<AppState>, Path(token): Path<String>) -> Response {
+    let token = token.trim_end_matches(".mobileconfig");
+    let Some(device) = state.inner.secure_dns.redeem(token) else {
+        return (
+            StatusCode::NOT_FOUND,
+            "This link has run out. Make a new one in ferrite's settings.\n",
+        )
+            .into_response();
+    };
+    let cfg = state.live_config.read().secure_dns.clone();
+    let Some(body) = ferrite_secure::SecureDns::profile(&cfg, &device) else {
+        return (StatusCode::NOT_FOUND, "Encrypted DNS is off.\n").into_response();
+    };
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                "application/x-apple-aspen-config".to_string(),
+            ),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"ferrite-{device}.mobileconfig\""),
+            ),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 fn tidy(cfg: &mut SecureDnsConfig) {
     cfg.hostname = cfg
         .hostname
@@ -98,6 +166,13 @@ fn tidy(cfg: &mut SecureDnsConfig) {
             .filter(|p| !p.is_empty())
             .map(Into::into);
     }
+    // Device names as the server reads client IDs; each once.
+    let mut seen = std::collections::HashSet::new();
+    cfg.devices = std::mem::take(&mut cfg.devices)
+        .into_iter()
+        .map(|d| ferrite_core::net::normalize_client_id(&d).unwrap_or(d))
+        .filter(|d| seen.insert(d.clone()))
+        .collect();
     cfg.acme.email = cfg.acme.email.trim().to_string();
     cfg.acme.cloudflare_token = cfg
         .acme
@@ -126,6 +201,15 @@ pub(crate) fn validate(cfg: &SecureDnsConfig, live: &Config) -> Result<(), Strin
         return Err(format!(
             "{} isn't a host name like dns.example.com",
             cfg.hostname
+        ));
+    }
+    if let Some(d) = cfg
+        .devices
+        .iter()
+        .find(|d| ferrite_core::net::normalize_client_id(d).as_deref() != Some(d.as_str()))
+    {
+        return Err(format!(
+            "{d} can't be a device name: letters, digits and dashes"
         ));
     }
     let email = &cfg.acme.email;
@@ -233,6 +317,15 @@ mod tests {
         assert_eq!(validate(&le, &live), Ok(()));
         le.acme.email = "nobody".into();
         assert!(validate(&le, &live).unwrap_err().contains("email"));
+
+        // Device names are read as client IDs, each once.
+        let mut named = on(853, 443);
+        named.devices = vec!["Pixel".into(), "pixel".into(), "ipad".into()];
+        tidy(&mut named);
+        assert_eq!(named.devices, vec!["pixel", "ipad"]);
+        named.devices.push("my phone".into());
+        tidy(&mut named);
+        assert!(validate(&named, &live).unwrap_err().contains("my phone"));
     }
 
     #[tokio::test]

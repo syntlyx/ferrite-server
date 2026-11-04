@@ -49,6 +49,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/auth", get(auth::check_auth))
         .route("/auth", post(auth::login))
         .route("/auth", delete(auth::logout))
+        // A device's encrypted DNS profile, opened by the device's own
+        // browser: the link's token is the key.
+        .route("/secure-dns/profile/{token}", get(secure_dns::profile))
         .with_state(state.clone());
 
     let api = Router::new()
@@ -133,6 +136,7 @@ pub fn build_router(state: AppState) -> Router {
             get(secure_dns::get_secure_dns).put(secure_dns::put_secure_dns),
         )
         .route("/secure-dns/renew", post(secure_dns::renew_secure_dns))
+        .route("/secure-dns/profile-link", post(secure_dns::profile_link))
         .route("/sync", get(sync::get_sync).put(sync::put_sync))
         .route("/sync/now", post(sync::sync_now))
         // Bring a Pi-hole or AdGuard Home setup over (a Teleporter archive
@@ -355,6 +359,61 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+
+        drop(state);
+        test_support::cleanup_sqlite(&db_path);
+    }
+
+    /// A device's profile is opened by its own browser, with no API key: the
+    /// link is the key — the profile-link endpoint itself is not public.
+    #[tokio::test]
+    async fn a_profile_link_opens_without_the_api_key() {
+        let (state, db_path) = test_support::app_state("api-secure-profile").await;
+        {
+            let mut live = state.live_config.write();
+            live.api.api_key = Some("secret-key".to_string());
+            live.secure_dns.enabled = true;
+            live.secure_dns.hostname = "dns.example.com".to_string();
+        }
+        let app = build_router(state.clone());
+        let post = |auth: bool| {
+            let mut b = Request::builder()
+                .method("POST")
+                .uri("/api/secure-dns/profile-link")
+                .header("content-type", "application/json");
+            if auth {
+                b = b.header("x-api-key", "secret-key");
+            }
+            b.body(Body::from(r#"{"device":"iPhone"}"#)).unwrap()
+        };
+        let denied = app.clone().oneshot(post(false)).await.unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let made = json_body(app.clone().oneshot(post(true)).await.unwrap()).await;
+        assert_eq!(made["device"], "iphone");
+        let url = made["url"].as_str().unwrap().to_string();
+
+        let profile = app.clone().oneshot(request(&url)).await.unwrap();
+        assert_eq!(profile.status(), StatusCode::OK);
+        assert_eq!(
+            profile.headers()["content-type"],
+            "application/x-apple-aspen-config"
+        );
+        let body = axum::body::to_bytes(profile.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("https://dns.example.com/dns-query/iphone"),
+            "{body}"
+        );
+
+        let made_up = app
+            .clone()
+            .oneshot(request("/api/secure-dns/profile/0123456789abcdef"))
+            .await
+            .unwrap();
+        assert_eq!(made_up.status(), StatusCode::NOT_FOUND);
 
         drop(state);
         test_support::cleanup_sqlite(&db_path);
