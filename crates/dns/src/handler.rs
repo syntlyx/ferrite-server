@@ -55,6 +55,9 @@ pub struct Pending {
     profile: Option<Arc<ferrite_blocklist::CompiledProfile>>,
     client_addr: std::net::IpAddr,
     client_text: Option<String>,
+    /// `id:<client id>` for a query that named its device (encrypted DNS);
+    /// the log files it under that device instead of the address.
+    device: Option<String>,
     log_ignored: bool,
     client_ttl: u32,
     start: Instant,
@@ -86,7 +89,18 @@ pub struct Pending {
 /// once it has to wait for the network. TCP, already on a task of its own,
 /// runs both halves through this function.
 pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Result<Vec<u8>> {
-    Ok(match decide(&raw, src, &ctx) {
+    handle_query_as(raw, src, None, ctx).await
+}
+
+/// [`handle_query`] for a query that named its device — the client ID of an
+/// encrypted connection (`pixel.dns.example.com`, `/dns-query/pixel`).
+pub async fn handle_query_as(
+    raw: Vec<u8>,
+    src: SocketAddr,
+    client_id: Option<&str>,
+    ctx: Arc<DnsCtx>,
+) -> Result<Vec<u8>> {
+    Ok(match decide_as(&raw, src, client_id, &ctx) {
         Decision::Answer(bytes) => bytes,
         Decision::Upstream(pending) => resolve_upstream(&raw, pending, &ctx).await,
         Decision::Drop => Vec::new(),
@@ -96,7 +110,21 @@ pub async fn handle_query(raw: Vec<u8>, src: SocketAddr, ctx: Arc<DnsCtx>) -> Re
 /// Steps 1-4 of the pipeline (see [`handle_query`]): everything that can be
 /// settled from memory. Runs on whichever thread received the datagram.
 pub fn decide(raw: &[u8], src: SocketAddr, ctx: &Arc<DnsCtx>) -> Decision {
+    decide_as(raw, src, None, ctx)
+}
+
+/// [`decide`] for a query that may carry a client ID. The ID is the device:
+/// its own bypass, pause and profile come first, then the address's (a phone
+/// at home is both `id:pixel` and its LAN address), and the log files the
+/// query under `id:<client id>`.
+pub fn decide_as(
+    raw: &[u8],
+    src: SocketAddr,
+    client_id: Option<&str>,
+    ctx: &Arc<DnsCtx>,
+) -> Decision {
     let start = Instant::now();
+    let device: Option<String> = client_id.map(|id| format!("id:{id}"));
 
     // The query is read off the wire and decoded only if a step has to build an
     // answer of ferrite's own (see `LazyQuery`) — the paths that just look the
@@ -152,13 +180,20 @@ pub fn decide(raw: &[u8], src: SocketAddr, ctx: &Arc<DnsCtx>) -> Decision {
     let client_text = client_scoped.then(|| ip_to_string(client_addr));
     let client_ip = client_text.as_deref().unwrap_or_default();
     let filtering_enabled = blocking_enabled
+        && !device.as_deref().is_some_and(|d| {
+            client_scoped && ctx.blocklist.client_filtering_off_normalized(d, None)
+        })
         && !ctx
             .blocklist
             .client_filtering_off_normalized(client_ip, client_mac.as_deref());
     // The per-device profile (subset of lists) for this client, if any. When
     // present it replaces the default all-lists FST for every block check below.
     let profile = if filtering_enabled {
-        ctx.blocklist.profile_for(client_ip, client_mac.as_deref())
+        device
+            .as_deref()
+            .filter(|_| client_scoped)
+            .and_then(|d| ctx.blocklist.profile_for(d, None))
+            .or_else(|| ctx.blocklist.profile_for(client_ip, client_mac.as_deref()))
     } else {
         None
     };
@@ -182,7 +217,7 @@ pub fn decide(raw: &[u8], src: SocketAddr, ctx: &Arc<DnsCtx>) -> Decision {
         ctx.dns_cache
             .insert(&name, qtype, want_dnssec, custom_resp.clone());
         if !log_ignored {
-            emit(ctx, QueryStatus::Allowed, |status| {
+            emit(ctx, device.as_deref(), QueryStatus::Allowed, |status| {
                 make_entry(
                     name,
                     qtype,
@@ -209,7 +244,7 @@ pub fn decide(raw: &[u8], src: SocketAddr, ctx: &Arc<DnsCtx>) -> Decision {
     // off to its own DoH until the next network change.
     if let Some(reason) = anti_doh::canary(&name, &ctx.switches) {
         if !log_ignored {
-            emit(ctx, QueryStatus::Blocked, |status| {
+            emit(ctx, device.as_deref(), QueryStatus::Blocked, |status| {
                 make_entry(
                     name,
                     qtype,
@@ -237,7 +272,7 @@ pub fn decide(raw: &[u8], src: SocketAddr, ctx: &Arc<DnsCtx>) -> Decision {
         let (answer, rcode) =
             build_blocked(&query, qtype, client_ttl, ctx.blocklist.block_answer());
         if !log_ignored {
-            emit(ctx, QueryStatus::Blocked, |status| {
+            emit(ctx, device.as_deref(), QueryStatus::Blocked, |status| {
                 make_entry(
                     name,
                     qtype,
@@ -263,7 +298,7 @@ pub fn decide(raw: &[u8], src: SocketAddr, ctx: &Arc<DnsCtx>) -> Decision {
             && let Some(bytes) = safesearch::rewrite_answer(&query, &name, target, &cached.bytes)
         {
             if !log_ignored {
-                emit(ctx, QueryStatus::Cached, |status| {
+                emit(ctx, device.as_deref(), QueryStatus::Cached, |status| {
                     make_entry(
                         name,
                         qtype,
@@ -287,6 +322,7 @@ pub fn decide(raw: &[u8], src: SocketAddr, ctx: &Arc<DnsCtx>) -> Decision {
             profile,
             client_addr,
             client_text,
+            device,
             log_ignored,
             client_ttl,
             start,
@@ -304,7 +340,7 @@ pub fn decide(raw: &[u8], src: SocketAddr, ctx: &Arc<DnsCtx>) -> Decision {
             .maybe_intercept(&query, &name, qtype, client_ip, client_mac.as_deref())
     {
         if !log_ignored {
-            emit(ctx, QueryStatus::Routed, |status| {
+            emit(ctx, device.as_deref(), QueryStatus::Routed, |status| {
                 make_entry(
                     name,
                     qtype,
@@ -348,7 +384,7 @@ pub fn decide(raw: &[u8], src: SocketAddr, ctx: &Arc<DnsCtx>) -> Decision {
             let (answer, rcode) =
                 build_blocked(&query, qtype, client_ttl, ctx.blocklist.block_answer());
             if !log_ignored {
-                emit(ctx, QueryStatus::Blocked, |status| {
+                emit(ctx, device.as_deref(), QueryStatus::Blocked, |status| {
                     make_entry(
                         name,
                         qtype,
@@ -364,7 +400,7 @@ pub fn decide(raw: &[u8], src: SocketAddr, ctx: &Arc<DnsCtx>) -> Decision {
         }
 
         if !log_ignored {
-            emit(ctx, QueryStatus::Cached, |status| {
+            emit(ctx, device.as_deref(), QueryStatus::Cached, |status| {
                 make_entry(
                     name,
                     qtype,
@@ -391,6 +427,7 @@ pub fn decide(raw: &[u8], src: SocketAddr, ctx: &Arc<DnsCtx>) -> Decision {
         profile,
         client_addr,
         client_text,
+        device,
         log_ignored,
         client_ttl,
         start,
@@ -410,6 +447,7 @@ pub async fn resolve_upstream(raw: &[u8], pending: Pending, ctx: &DnsCtx) -> Vec
         profile,
         client_addr,
         client_text,
+        device,
         log_ignored,
         client_ttl,
         start,
@@ -419,7 +457,7 @@ pub async fn resolve_upstream(raw: &[u8], pending: Pending, ctx: &DnsCtx) -> Vec
         let bytes = resolve_safe_host(raw, &name, qtype, target, ctx).await;
         let rcode = wire::rcode(&bytes).unwrap_or(2);
         if !log_ignored {
-            emit(ctx, QueryStatus::Upstream, |status| {
+            emit(ctx, device.as_deref(), QueryStatus::Upstream, |status| {
                 make_entry(
                     name,
                     qtype,
@@ -473,7 +511,7 @@ pub async fn resolve_upstream(raw: &[u8], pending: Pending, ctx: &DnsCtx) -> Vec
         let (answer, rcode) =
             build_blocked(&query, qtype, client_ttl, ctx.blocklist.block_answer());
         if !log_ignored {
-            emit(ctx, QueryStatus::Blocked, |status| {
+            emit(ctx, device.as_deref(), QueryStatus::Blocked, |status| {
                 make_entry(
                     name,
                     qtype,
@@ -511,7 +549,7 @@ pub async fn resolve_upstream(raw: &[u8], pending: Pending, ctx: &DnsCtx) -> Vec
     }
 
     if !log_ignored {
-        emit(ctx, QueryStatus::Upstream, |status| {
+        emit(ctx, device.as_deref(), QueryStatus::Upstream, |status| {
             make_entry(
                 name,
                 qtype,
@@ -626,7 +664,12 @@ fn dnssec_ok(query: &LazyQuery) -> bool {
     }
 }
 
-fn emit(ctx: &DnsCtx, status: QueryStatus, entry: impl FnOnce(QueryStatus) -> QueryEntry) {
+fn emit(
+    ctx: &DnsCtx,
+    device: Option<&str>,
+    status: QueryStatus,
+    entry: impl FnOnce(QueryStatus) -> QueryEntry,
+) {
     // The counters are process-lifetime totals in RAM with no domain or client
     // in them, so they keep the dashboard honest even in the strictest privacy
     // mode and are always updated.
@@ -638,7 +681,10 @@ fn emit(ctx: &DnsCtx, status: QueryStatus, entry: impl FnOnce(QueryStatus) -> Qu
     if !ctx.record_switches.scope().records_anything() {
         return;
     }
-    let entry = entry(status);
+    let mut entry = entry(status);
+    if let Some(device) = device {
+        entry.device = device.to_string();
+    }
     // try_send: if the channel is full we drop the stat rather than block DNS,
     // but count the drop and warn (rate-limited) so a stalled writer surfaces
     // instead of silently diverging the persisted log from the live counters.

@@ -62,16 +62,33 @@ pub fn parse_ip(s: &str) -> Option<IpAddr> {
 }
 
 /// Normalize a client identity key accepted by policy/settings APIs.
-/// Supports IP addresses and MAC addresses.
+/// Supports IP addresses, MAC addresses and client IDs (`id:pixel` — the
+/// device name an encrypted-DNS connection carries).
 pub fn normalize_client_key(s: &str) -> Option<String> {
     let s = s.trim();
     if s.is_empty() {
         return None;
     }
+    if let Some(id) = s.strip_prefix("id:").or_else(|| s.strip_prefix("ID:")) {
+        return normalize_client_id(id).map(|id| format!("id:{id}"));
+    }
     if let Some(ip) = parse_ip(s) {
         return Some(unmap_v4(ip).to_string());
     }
     parse_mac(s).map(|mac| format_mac(&mac))
+}
+
+/// A client ID as ferrite keys it: one DNS label — lowercase letters, digits
+/// and hyphens, 1–63 long, not starting or ending with a hyphen.
+pub fn normalize_client_id(s: &str) -> Option<String> {
+    let id = s.trim().to_ascii_lowercase();
+    let ok = (1..=63).contains(&id.len())
+        && !id.starts_with('-')
+        && !id.ends_with('-')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    ok.then_some(id)
 }
 
 /// An address range: `192.168.1.0/24`, `fd00::/8`, or a single address (a
@@ -241,6 +258,21 @@ fn parse_if_inet6(table: &str, iface: &str) -> Vec<std::net::Ipv6Addr> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn client_keys_take_ids_too() {
+        assert_eq!(
+            super::normalize_client_key("id:Pixel-8").as_deref(),
+            Some("id:pixel-8")
+        );
+        assert_eq!(super::normalize_client_key("id:-bad"), None);
+        assert_eq!(super::normalize_client_key("id:a.b"), None);
+        assert_eq!(
+            super::normalize_client_key("AA-BB-CC-DD-EE-FF").as_deref(),
+            Some("aa:bb:cc:dd:ee:ff")
+        );
+        assert_eq!(super::normalize_client_id(&"x".repeat(64)), None);
+    }
+
     #[test]
     fn interface_and_mask_come_from_the_route_table() {
         let table = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\

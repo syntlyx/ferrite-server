@@ -24,6 +24,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 ferrite-storage.workspace = true
+serde_json.workspace = true
 
 # Batched UDP receive/send (recvmmsg/sendmmsg) on the query path.
 [target.'cfg(target_os = "linux")'.dependencies]

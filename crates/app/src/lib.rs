@@ -77,6 +77,8 @@ pub struct AppStateInner {
     pub sync_wake: Arc<Notify>,
     /// The DHCP server and IPv6 DNS announcer, reconfigured live.
     pub dhcp: Arc<dhcp::DhcpService>,
+    /// DNS over TLS / HTTPS for devices, reconfigured live.
+    pub secure_dns: Arc<ferrite_secure::SecureDns>,
 }
 
 /// Cheaply-cloneable application state handle, backed by `Arc<AppStateInner>`.
@@ -535,6 +537,7 @@ impl AppState {
             sync_status: Arc::new(parking_lot::Mutex::new(sync_status::SyncStatus::load())),
             sync_wake: Arc::new(Notify::new()),
             dhcp,
+            secure_dns: ferrite_secure::SecureDns::new(),
             record_switches,
             query_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
         });

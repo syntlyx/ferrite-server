@@ -18,6 +18,7 @@ pub mod profiles;
 pub mod proxy;
 pub mod queries;
 pub mod safesearch;
+pub mod secure_dns;
 pub mod services;
 pub mod settings;
 pub mod stats;
@@ -127,6 +128,10 @@ pub fn build_router(state: AppState) -> Router {
         // Follow a primary ferrite
         .route("/dhcp", get(dhcp::get_dhcp).put(dhcp::put_dhcp))
         .route("/dhcp/leases", get(dhcp::get_leases))
+        .route(
+            "/secure-dns",
+            get(secure_dns::get_secure_dns).put(secure_dns::put_secure_dns),
+        )
         .route("/sync", get(sync::get_sync).put(sync::put_sync))
         .route("/sync/now", post(sync::sync_now))
         // Bring a Pi-hole or AdGuard Home setup over (a Teleporter archive

@@ -494,3 +494,20 @@ domains = [
 # rdnss          = ["fd00::10"]
 # rdnss_lifetime = 1800
 # interval_secs  = 200
+
+# ── Encrypted DNS for devices (DNS over TLS / DNS over HTTPS) ─────────────────
+# Android's "Private DNS" speaks DNS over TLS on 853; iOS profiles and
+# browsers speak DNS over HTTPS. A device can name itself with a client ID —
+# pixel.dns.example.com (TLS) or https://dns.example.com/dns-query/pixel
+# (HTTPS) — and is then that device for profiles, pauses and the log, from
+# wherever it connects. The certificate must cover hostname and *.hostname
+# (for IDs over TLS); renewed files are picked up within ten minutes.
+# Applies without a restart.
+#
+# [secure_dns]
+# enabled   = true
+# hostname  = "dns.example.com"
+# cert_file = "/etc/letsencrypt/live/dns.example.com/fullchain.pem"
+# key_file  = "/etc/letsencrypt/live/dns.example.com/privkey.pem"
+# dot_port  = 853
+# doh_port  = 443     # 0 = off; pick another if Tunnels use 443

@@ -1,0 +1,3 @@
+Self-signed, for tests only: dns.test and *.dns.test, valid 100 years.
+cert.pem/key.pem: RSA (PKCS#8). ec-cert.pem/ec-key.pem: ECDSA P-256 (SEC1).
+other-key.pem is a key that does not match cert.pem.

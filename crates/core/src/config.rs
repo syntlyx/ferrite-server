@@ -71,6 +71,10 @@ pub struct Config {
     /// so IPv6 devices stop asking the router. Off by default.
     #[serde(default, skip_serializing_if = "RaConfig::is_unset")]
     pub ra: RaConfig,
+    /// DNS over TLS and over HTTPS for devices, each able to name itself with
+    /// a client ID. Off by default.
+    #[serde(default, skip_serializing_if = "SecureDnsConfig::is_unset")]
+    pub secure_dns: SecureDnsConfig,
     /// Verbose debug-level logging for the `ferrite` target. **Off by default**:
     /// every DNS query and proxied connection emits a record, and each one costs
     /// two allocations, a process-wide ring-buffer lock and a stdout write — real
@@ -1004,6 +1008,7 @@ impl Default for Config {
             sync: SyncConfig::default(),
             dhcp: DhcpConfig::default(),
             ra: RaConfig::default(),
+            secure_dns: SecureDnsConfig::default(),
             debug_logging: false,
             web_dir: None,
         }
@@ -1125,6 +1130,50 @@ impl Default for RaConfig {
 }
 
 impl RaConfig {
+    /// Nothing set up: left out of the config file.
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// `[secure_dns]`: encrypted DNS for devices — DNS over TLS (Android's
+/// "Private DNS") and DNS over HTTPS (iOS profiles, browsers). A device may
+/// name itself with a client ID: `pixel.dns.example.com` for TLS,
+/// `/dns-query/pixel` for HTTPS; the ID is then its device for profiles,
+/// pauses and the log. Needs a certificate for `hostname` and `*.hostname`.
+/// Applies without a restart.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SecureDnsConfig {
+    pub enabled: bool,
+    /// The name devices connect to, e.g. `dns.example.com`.
+    pub hostname: String,
+    /// PEM certificate chain and private key for `hostname` (and
+    /// `*.hostname`, for client IDs over TLS).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cert_file: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_file: Option<PathBuf>,
+    /// DNS over TLS; 0 = off.
+    pub dot_port: u16,
+    /// DNS over HTTPS; 0 = off.
+    pub doh_port: u16,
+}
+
+impl Default for SecureDnsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hostname: String::new(),
+            cert_file: None,
+            key_file: None,
+            dot_port: 853,
+            doh_port: 443,
+        }
+    }
+}
+
+impl SecureDnsConfig {
     /// Nothing set up: left out of the config file.
     pub fn is_unset(&self) -> bool {
         *self == Self::default()

@@ -16,6 +16,7 @@ ferrite-clients.workspace = true
 ferrite-dhcp.workspace = true
 ferrite-dns.workspace = true
 ferrite-proxy.workspace = true
+ferrite-secure.workspace = true
 ferrite-stats.workspace = true
 ferrite-storage.workspace = true
 ferrite-updater.workspace = true

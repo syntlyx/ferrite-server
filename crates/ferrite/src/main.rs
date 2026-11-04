@@ -261,6 +261,16 @@ async fn run() -> anyhow::Result<()> {
         });
     }
 
+    // Encrypted DNS for devices — off unless switched on.
+    {
+        let secure = state.live_config.read().secure_dns.clone();
+        if secure.enabled {
+            let ctx = Arc::new(state.dns_ctx());
+            let state = state.clone();
+            tokio::spawn(async move { state.inner.secure_dns.apply(&secure, ctx).await });
+        }
+    }
+
     // ── Selective routing / proxy ─────────────────────────────────────────────
     // Detached (not in the try_join! below) so a listener bind failure — :80/:443
     // already in use, or no privilege to bind them — degrades gracefully instead

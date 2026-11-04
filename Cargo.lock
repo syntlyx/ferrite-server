@@ -774,6 +774,7 @@ dependencies = [
  "ferrite-core",
  "ferrite-dns",
  "ferrite-proxy",
+ "ferrite-secure",
  "ferrite-storage",
  "ferrite-updater",
  "ferrite-upstream",
@@ -815,6 +816,7 @@ dependencies = [
  "ferrite-dhcp",
  "ferrite-dns",
  "ferrite-proxy",
+ "ferrite-secure",
  "ferrite-stats",
  "ferrite-storage",
  "ferrite-updater",
@@ -919,6 +921,7 @@ dependencies = [
  "libc",
  "lru",
  "parking_lot",
+ "serde_json",
  "tokio",
  "tracing",
 ]
@@ -954,6 +957,26 @@ dependencies = [
  "socket2",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "ferrite-secure"
+version = "0.1.10"
+dependencies = [
+ "arc-swap",
+ "base64 0.22.1",
+ "bytes",
+ "ferrite-core",
+ "ferrite-dns",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "parking_lot",
+ "serde",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "x509-parser",
 ]
 
 [[package]]

@@ -527,8 +527,8 @@ async fn emit_counts_dropped_stats_when_channel_full() {
     tx.try_send(entry(QueryStatus::Upstream)).unwrap();
     let mut ctx = h.ctx();
     ctx.query_tx = tx.clone();
-    emit(&ctx, QueryStatus::Upstream, entry);
-    emit(&ctx, QueryStatus::Upstream, entry);
+    emit(&ctx, None, QueryStatus::Upstream, entry);
+    emit(&ctx, None, QueryStatus::Upstream, entry);
 
     assert_eq!(h.live_stats.dropped(), 2);
 
@@ -544,7 +544,7 @@ async fn recording_switched_off_counts_the_query_but_sends_nothing() {
     let mut ctx = h.ctx();
     ctx.query_tx = tx;
     ctx.record_switches = RecordSwitches::new(RecordScope::NONE);
-    emit(&ctx, QueryStatus::Blocked, entry);
+    emit(&ctx, None, QueryStatus::Blocked, entry);
 
     // The anonymous counters still move — the dashboard keeps working —
     // but nothing carrying a domain or a client reaches the pipeline.
@@ -555,7 +555,7 @@ async fn recording_switched_off_counts_the_query_but_sends_nothing() {
 
     // Switched back on, the very next query flows again — no restart.
     ctx.record_switches.set_stats(true);
-    emit(&ctx, QueryStatus::Blocked, entry);
+    emit(&ctx, None, QueryStatus::Blocked, entry);
     assert_eq!(rx.try_recv().unwrap().domain, "x.test");
 
     cleanup_sqlite(&h.db_path);
@@ -1476,5 +1476,38 @@ async fn canary_is_answered_while_filtering_is_off() {
         &ctx,
     );
     assert_eq!(answered_rcode(decision), Some(ResponseCode::NXDomain));
+    cleanup_sqlite(&h.db_path);
+}
+
+#[tokio::test]
+async fn a_client_id_is_its_own_device_with_its_own_profile() {
+    let mut h = Harness::new("dns-client-id").await;
+    let profile: ferrite_core::config::BlocklistProfileConfig = serde_json::from_value(
+        serde_json::json!({"id": "kids", "name": "Kids", "clients": ["id:kid"], "block": ["games.test"]}),
+    )
+    .unwrap();
+    h.blocklist.set_profiles(vec![profile]);
+    let src = SocketAddr::from(([192, 0, 2, 10], 53_000));
+
+    // Named as `kid`: the profile applies, and the log files it under id:kid.
+    let response = handle_query_as(
+        query("games.test", RecordType::A).to_bytes().unwrap(),
+        src,
+        Some("kid"),
+        Arc::new(h.ctx()),
+    )
+    .await
+    .unwrap();
+    let msg = Message::from_bytes(&response).unwrap();
+    assert_eq!(msg.metadata.response_code, ResponseCode::NXDomain);
+    let entry = h.rx.try_recv().unwrap();
+    assert_eq!(entry.device, "id:kid");
+    assert_eq!(entry.client_ip, "192.0.2.10");
+
+    // The same address without the ID is not in the profile.
+    let ctx = Arc::new(h.ctx());
+    let decision = decide(&raw_query("games.test", RecordType::A), src, &ctx);
+    assert!(matches!(decision, Decision::Upstream(_)));
+
     cleanup_sqlite(&h.db_path);
 }
