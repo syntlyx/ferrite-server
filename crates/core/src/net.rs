@@ -78,6 +78,90 @@ pub fn normalize_client_key(s: &str) -> Option<String> {
     parse_mac(s).map(|mac| format_mac(&mac))
 }
 
+/// A device name — one DNS label — made from a person's name for it:
+/// "Телефон мами" → `telefon-mamy`, "iPhone Alex" → `iphone-alex`.
+pub fn device_label(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.to_lowercase().chars() {
+        let latin: &str = match c {
+            'a'..='z' | '0'..='9' => {
+                out.push(c);
+                continue;
+            }
+            'а' => "a",
+            'б' => "b",
+            'в' => "v",
+            'г' => "h",
+            'ґ' => "g",
+            'д' => "d",
+            'е' | 'э' => "e",
+            'є' => "ye",
+            'ё' => "yo",
+            'ж' => "zh",
+            'з' => "z",
+            'и' | 'ы' => "y",
+            'і' => "i",
+            'ї' => "yi",
+            'й' => "y",
+            'к' => "k",
+            'л' | 'ł' => "l",
+            'м' => "m",
+            'н' | 'ñ' | 'ń' => "n",
+            'о' | 'ó' | 'ö' | 'ô' => "o",
+            'п' => "p",
+            'р' => "r",
+            'с' | 'ś' | 'š' => "s",
+            'т' => "t",
+            'у' | 'ü' | 'ú' | 'ù' => "u",
+            'ф' => "f",
+            'х' => "kh",
+            'ц' => "ts",
+            'ч' | 'č' => "ch",
+            'ш' => "sh",
+            'щ' => "shch",
+            'ю' => "yu",
+            'я' => "ya",
+            'ä' | 'á' | 'à' | 'â' | 'ą' => "a",
+            'é' | 'è' | 'ê' | 'ę' | 'ë' => "e",
+            'ç' | 'ć' => "c",
+            'ź' | 'ż' | 'ž' => "z",
+            'ß' => "ss",
+            'ь' | 'ъ' | '\'' | '’' | 'ʼ' => continue,
+            _ => "-",
+        };
+        out.push_str(latin);
+    }
+    let mut label = String::new();
+    for part in out.split('-').filter(|p| !p.is_empty()) {
+        if !label.is_empty() {
+            label.push('-');
+        }
+        label.push_str(part);
+    }
+    label.truncate(40);
+    let label = label.trim_end_matches('-').to_string();
+    normalize_client_id(&label).unwrap_or_else(|| "device".into())
+}
+
+/// The device in `devices` named for `label`: `label` itself, or `label`,
+/// a dash and four letters or digits (see [`device_label`]).
+pub fn labelled_device(devices: &[String], label: &str) -> Option<String> {
+    devices
+        .iter()
+        .find(|d| {
+            d.as_str() == label
+                || d.strip_prefix(label)
+                    .and_then(|rest| rest.strip_prefix('-'))
+                    .is_some_and(|tail| {
+                        tail.len() == 4
+                            && tail
+                                .chars()
+                                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                    })
+        })
+        .cloned()
+}
+
 /// A client ID as ferrite keys it: one DNS label — lowercase letters, digits
 /// and hyphens, 1–63 long, not starting or ending with a hyphen.
 pub fn normalize_client_id(s: &str) -> Option<String> {
@@ -428,5 +512,31 @@ mod tests {
             let addr: IpAddr = text.parse().unwrap();
             assert_eq!(ip_to_string(addr), addr.to_string());
         }
+    }
+
+    #[test]
+    fn names_become_device_names() {
+        assert_eq!(device_label("iPhone Alex"), "iphone-alex");
+        assert_eq!(device_label("Телефон мами"), "telefon-mamy");
+        assert_eq!(device_label("Їжачок  Юрко"), "yizhachok-yurko");
+        assert_eq!(device_label("Jürgen's iPad"), "jurgens-ipad");
+        assert_eq!(device_label("---"), "device");
+        assert_eq!(device_label("❤️"), "device");
+        assert!(device_label(&"a".repeat(100)).len() <= 40);
+    }
+
+    #[test]
+    fn a_device_keeps_the_name_it_was_given() {
+        let devices = vec!["pixel".to_string(), "iphone-alex-k7f3".to_string()];
+        assert_eq!(
+            labelled_device(&devices, "iphone-alex").as_deref(),
+            Some("iphone-alex-k7f3")
+        );
+        assert_eq!(labelled_device(&devices, "pixel").as_deref(), Some("pixel"));
+        assert_eq!(labelled_device(&devices, "iphone"), None);
+        assert_eq!(
+            labelled_device(&["iphone-alex-old-k7f3".into()], "iphone-alex"),
+            None
+        );
     }
 }

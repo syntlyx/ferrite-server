@@ -20,7 +20,9 @@ use serde_json::{Value, json};
 
 use ferrite_app::AppState;
 use ferrite_core::config::{SecureDnsConfig, SelfSetup};
-use ferrite_core::net::{format_mac, is_local, parse_ip, parse_mac, unmap_v4};
+use ferrite_core::net::{
+    format_mac, is_local, normalize_client_key, parse_ip, parse_mac, unmap_v4,
+};
 
 type Peer = Option<Extension<ConnectInfo<SocketAddr>>>;
 
@@ -28,8 +30,9 @@ type Peer = Option<Extension<ConnectInfo<SocketAddr>>>;
 struct Asker {
     ip: IpAddr,
     mac: Option<String>,
-    /// Its name in Clients, given by you.
-    alias: Option<String>,
+    /// Its name in Clients, given by you, and the key it's named by (its MAC
+    /// or its IP).
+    alias: Option<(String, String)>,
     /// What it calls itself (DHCP, mDNS, PTR), when it isn't named.
     seen_as: Option<String>,
 }
@@ -54,99 +57,20 @@ async fn who(state: &AppState, ip: IpAddr) -> Asker {
                     || (mac.is_some()
                         && a.mac.as_deref().and_then(parse_mac).map(|m| format_mac(&m)) == mac)
             })
-            .map(|a| a.name.clone())
+            .and_then(|a| {
+                let key = a.mac.as_deref().or(a.ip.as_deref())?;
+                Some((a.name.clone(), normalize_client_key(key)?))
+            })
     };
-    let seen_as = registry.get_name(ip).filter(|n| Some(n) != alias.as_ref());
+    let seen_as = registry
+        .get_name(ip)
+        .filter(|n| Some(n) != alias.as_ref().map(|(name, _)| name));
     Asker {
         ip,
         mac,
         alias,
         seen_as,
     }
-}
-
-/// A device name — one DNS label — made from a person's name for it:
-/// "Телефон мами" → `telefon-mamy`, "iPhone Alex" → `iphone-alex`.
-pub(crate) fn slug(name: &str) -> String {
-    let mut out = String::new();
-    for c in name.to_lowercase().chars() {
-        let latin: &str = match c {
-            'a'..='z' | '0'..='9' => {
-                out.push(c);
-                continue;
-            }
-            'а' => "a",
-            'б' => "b",
-            'в' => "v",
-            'г' => "h",
-            'ґ' => "g",
-            'д' => "d",
-            'е' | 'э' => "e",
-            'є' => "ye",
-            'ё' => "yo",
-            'ж' => "zh",
-            'з' => "z",
-            'и' | 'ы' => "y",
-            'і' => "i",
-            'ї' => "yi",
-            'й' => "y",
-            'к' => "k",
-            'л' | 'ł' => "l",
-            'м' => "m",
-            'н' | 'ñ' | 'ń' => "n",
-            'о' | 'ó' | 'ö' | 'ô' => "o",
-            'п' => "p",
-            'р' => "r",
-            'с' | 'ś' | 'š' => "s",
-            'т' => "t",
-            'у' | 'ü' | 'ú' | 'ù' => "u",
-            'ф' => "f",
-            'х' => "kh",
-            'ц' => "ts",
-            'ч' | 'č' => "ch",
-            'ш' => "sh",
-            'щ' => "shch",
-            'ю' => "yu",
-            'я' => "ya",
-            'ä' | 'á' | 'à' | 'â' | 'ą' => "a",
-            'é' | 'è' | 'ê' | 'ę' | 'ë' => "e",
-            'ç' | 'ć' => "c",
-            'ź' | 'ż' | 'ž' => "z",
-            'ß' => "ss",
-            'ь' | 'ъ' | '\'' | '’' | 'ʼ' => continue,
-            _ => "-",
-        };
-        out.push_str(latin);
-    }
-    let mut label = String::new();
-    for part in out.split('-').filter(|p| !p.is_empty()) {
-        if !label.is_empty() {
-            label.push('-');
-        }
-        label.push_str(part);
-    }
-    label.truncate(40);
-    let label = label.trim_end_matches('-').to_string();
-    ferrite_core::net::normalize_client_id(&label).unwrap_or_else(|| "device".into())
-}
-
-/// The device this name already has: `slug` itself, or `slug-` and four
-/// letters or digits.
-fn existing(devices: &[String], slug: &str) -> Option<String> {
-    devices
-        .iter()
-        .find(|d| {
-            d.as_str() == slug
-                || d.strip_prefix(slug)
-                    .and_then(|rest| rest.strip_prefix('-'))
-                    .is_some_and(|tail| {
-                        tail.len() == 4
-                            && tail
-                                .chars()
-                                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-                    })
-        })
-        .cloned()
 }
 
 /// Four letters or digits, so the name can't be guessed from the outside:
@@ -162,26 +86,51 @@ fn suffix() -> String {
         .collect()
 }
 
-/// The name `name` (a client's, from Clients) goes by in encrypted DNS: the
-/// one it was given before, or — with `make` — a new one, saved and applied
-/// at once. `(id, made now)`.
-pub(crate) async fn device_for(state: &AppState, name: &str, make: bool) -> Option<(String, bool)> {
-    let base = slug(name);
+/// The device a client goes by in encrypted DNS: the one made for it
+/// before — found by `owner`, its MAC or IP, so renaming it in Clients
+/// doesn't lose it, else by its name — or, with `make`, a new one. Made or
+/// found with `make`, it's saved as `owner`'s, so its queries count as that
+/// client's; saved and applied at once. `(id, made now)`.
+pub(crate) async fn device_for(
+    state: &AppState,
+    name: &str,
+    owner: Option<&str>,
+    make: bool,
+) -> Option<(String, bool)> {
+    let owner = owner
+        .and_then(normalize_client_key)
+        .filter(|k| !k.starts_with("id:"));
+    let label = ferrite_core::net::device_label(name);
     // Looked up and added under one lock: two taps make one device.
-    let found = {
+    let (found, changed) = {
         let mut live = state.live_config.write();
-        let devices = &mut live.secure_dns.devices;
-        match existing(devices, &base) {
+        let sd = &mut live.secure_dns;
+        let mine = owner.as_ref().and_then(|o| {
+            sd.owners
+                .iter()
+                .find(|(id, k)| *k == o && sd.devices.contains(id))
+                .map(|(id, _)| id.clone())
+        });
+        let found = match mine.or_else(|| ferrite_core::net::labelled_device(&sd.devices, &label)) {
             Some(id) => Some((id, false)),
             None if make => {
-                let id = format!("{base}-{}", suffix());
-                devices.push(id.clone());
+                let id = format!("{label}-{}", suffix());
+                sd.devices.push(id.clone());
                 Some((id, true))
             }
             None => None,
+        };
+        let mut changed = matches!(found, Some((_, true)));
+        if make
+            && let (Some((id, _)), Some(o)) = (&found, &owner)
+            && sd.owners.get(id) != Some(o)
+        {
+            sd.owners.insert(id.clone(), o.clone());
+            changed = true;
         }
+        (found, changed)
     };
-    if let Some((_, true)) = &found {
+    if changed {
         state.persist_config().await;
         state.apply_secure_dns().await;
     }
@@ -200,6 +149,17 @@ pub(crate) fn how(cfg: &SecureDnsConfig, id: &str) -> Value {
             format!("https://{host}:{}/dns-query/{id}", cfg.doh_port)
         }),
     })
+}
+
+/// Whose a device set up from here is: the key its name in Clients is on,
+/// else its MAC, else its address.
+fn owner_key(asker: &Asker) -> String {
+    asker
+        .alias
+        .as_ref()
+        .map(|(_, key)| key.clone())
+        .or(asker.mac.clone())
+        .unwrap_or_else(|| asker.ip.to_string())
 }
 
 /// The device asking and the mode, or why it can't: `away`, `off` (no
@@ -240,11 +200,18 @@ pub async fn view(State(state): State<AppState>, peer: Peer) -> Response {
     if mode == SelfSetup::Named && asker.alias.is_none() {
         return Json(json!({ "state": "unnamed", "ip": ip, "mac": asker.mac })).into_response();
     }
+    let name = asker
+        .alias
+        .as_ref()
+        .map(|(name, _)| name.clone())
+        .or(asker.seen_as.clone());
+    let id = match &name {
+        Some(n) => device_for(&state, n, Some(&owner_key(&asker)), false)
+            .await
+            .map(|(id, _)| id),
+        None => None,
+    };
     let cfg = state.live_config.read().secure_dns.clone();
-    let name = asker.alias.clone().or(asker.seen_as.clone());
-    let id = name
-        .as_deref()
-        .and_then(|n| existing(&cfg.devices, &slug(n)));
     Json(json!({
         "state": "ready",
         "mode": mode,
@@ -278,7 +245,7 @@ pub async fn claim(State(state): State<AppState>, peer: Peer, Json(req): Json<Cl
         Err(why) => return refuse(StatusCode::CONFLICT, why),
     };
     let name = match (&asker.alias, mode) {
-        (Some(alias), _) => alias.clone(),
+        (Some((alias, _)), _) => alias.clone(),
         (None, SelfSetup::Anyone) => req
             .name
             .map(|n| n.trim().chars().take(64).collect::<String>())
@@ -287,7 +254,7 @@ pub async fn claim(State(state): State<AppState>, peer: Peer, Json(req): Json<Cl
             .unwrap_or_else(|| "device".into()),
         (None, _) => return refuse(StatusCode::FORBIDDEN, "unnamed"),
     };
-    let Some((id, made)) = device_for(&state, &name, true).await else {
+    let Some((id, made)) = device_for(&state, &name, Some(&owner_key(&asker)), true).await else {
         return refuse(StatusCode::CONFLICT, "off");
     };
     if made {
@@ -403,6 +370,11 @@ mod tests {
                 name: "Телефон мами".into(),
             });
         }
+        // As the aliases API does: the running registry learns it too.
+        state
+            .inner
+            .client_registry
+            .set_ip_alias("192.168.1.50".parse().unwrap(), "Телефон мами".into());
         state.apply_secure_dns().await;
 
         // From outside: nothing but that.
@@ -450,6 +422,26 @@ mod tests {
                 .starts_with("/api/secure-dns/profile/")
         );
         assert!(state.live_config.read().secure_dns.devices.contains(&id));
+        // It's the named client's: one row in Clients, under its name.
+        assert_eq!(
+            state
+                .live_config
+                .read()
+                .secure_dns
+                .owners
+                .get(&id)
+                .map(String::as_str),
+            Some("192.168.1.50")
+        );
+        assert_eq!(
+            state
+                .inner
+                .client_registry
+                .describe_device(&format!("id:{id}"))
+                .name
+                .as_deref(),
+            Some("Телефон мами")
+        );
         let (_, again) = body(
             claim(
                 State(state.clone()),
@@ -514,6 +506,28 @@ mod tests {
         assert!(v["id"].as_str().unwrap().starts_with("pixel-8-"), "{v}");
         assert_eq!(v["new"], true);
 
+        // A device set up before owners were kept finds its client by name.
+        {
+            let mut live = state.live_config.write();
+            live.client_aliases.push(ClientAliasConfig {
+                ip: None,
+                mac: Some("aa:bb:cc:dd:ee:02".into()),
+                name: "Kid".into(),
+            });
+            live.secure_dns.devices.push("kid-ab12".into());
+        }
+        state.apply_secure_dns().await;
+        assert_eq!(
+            state
+                .live_config
+                .read()
+                .secure_dns
+                .owners
+                .get("kid-ab12")
+                .map(String::as_str),
+            Some("aa:bb:cc:dd:ee:02")
+        );
+
         // Off: nobody.
         state.live_config.write().secure_dns.self_setup = SelfSetup::Off;
         let (_, v) = body(view(State(state.clone()), at("192.168.1.50")).await).await;
@@ -524,29 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn names_become_device_names() {
-        assert_eq!(slug("iPhone Alex"), "iphone-alex");
-        assert_eq!(slug("Телефон мами"), "telefon-mamy");
-        assert_eq!(slug("Їжачок  Юрко"), "yizhachok-yurko");
-        assert_eq!(slug("Jürgen's iPad"), "jurgens-ipad");
-        assert_eq!(slug("---"), "device");
-        assert_eq!(slug("❤️"), "device");
-        assert!(slug(&"a".repeat(100)).len() <= 40);
-    }
-
-    #[test]
-    fn a_device_keeps_the_name_it_was_given() {
-        let devices = vec!["pixel".to_string(), "iphone-alex-k7f3".to_string()];
-        assert_eq!(
-            existing(&devices, "iphone-alex").as_deref(),
-            Some("iphone-alex-k7f3")
-        );
-        assert_eq!(existing(&devices, "pixel").as_deref(), Some("pixel"));
-        assert_eq!(existing(&devices, "iphone"), None);
-        assert_eq!(
-            existing(&["iphone-alex-old-k7f3".into()], "iphone-alex"),
-            None
-        );
+    fn suffixes_are_four_letters_or_digits() {
         let s = suffix();
         assert_eq!(s.len(), 4);
         assert!(

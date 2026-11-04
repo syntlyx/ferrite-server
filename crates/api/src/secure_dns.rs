@@ -126,6 +126,9 @@ pub async fn profile_link(
 pub struct DeviceName {
     /// A client's name from Clients, or a device name itself.
     name: String,
+    /// The client's key (its MAC or IP), whose the device is.
+    #[serde(default)]
+    client: Option<String>,
 }
 
 /// The device a client goes by in encrypted DNS, and what to type in.
@@ -146,7 +149,7 @@ fn described(state: &AppState, found: Option<(String, bool)>) -> Value {
 /// GET /api/secure-dns/device?name=… — the device name a client from
 /// Clients goes by in encrypted DNS, if it has one yet.
 pub async fn device(State(state): State<AppState>, Query(q): Query<DeviceName>) -> Json<Value> {
-    let found = crate::setup::device_for(&state, &q.name, false).await;
+    let found = crate::setup::device_for(&state, &q.name, q.client.as_deref(), false).await;
     Json(described(&state, found))
 }
 
@@ -165,7 +168,7 @@ pub async fn make_device(
             )));
         }
     }
-    let found = crate::setup::device_for(&state, &q.name, true).await;
+    let found = crate::setup::device_for(&state, &q.name, q.client.as_deref(), true).await;
     Ok(Json(described(&state, found)))
 }
 

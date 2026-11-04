@@ -242,6 +242,7 @@ impl SecureDns {
                 devices: Vec::new(),
                 proxies: Vec::new(),
                 self_setup: Default::default(),
+                owners: Default::default(),
                 ..cfg.clone()
             },
             tunnels_port,

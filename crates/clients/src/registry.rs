@@ -41,6 +41,7 @@ impl ClientRegistry {
             storage,
             switches,
             device_at: DashMap::new(),
+            id_owners: DashMap::new(),
         });
 
         // Manual aliases come from `config.toml`: they are what the operator
@@ -187,6 +188,29 @@ impl ClientRegistry {
         let ip = unmap_v4(ip);
         let e = self.device_at.get(&ip)?;
         (e.1.elapsed() < DEVICE_AT_TTL).then(|| e.0.clone())
+    }
+
+    /// Whose each encrypted DNS device is: device name → client key (a MAC
+    /// or an IP), from `[secure_dns] owners`. Replaces what was there.
+    pub fn set_id_owners(&self, owners: &std::collections::BTreeMap<String, String>) {
+        self.id_owners.clear();
+        for (id, key) in owners {
+            self.id_owners.insert(format!("id:{id}"), key.clone());
+        }
+    }
+
+    /// The client `device` (`id:pixel`) was set up for: its MAC or IP.
+    pub fn owner_of(&self, device: &str) -> Option<String> {
+        self.id_owners.get(device).map(|k| k.clone())
+    }
+
+    /// The MAC of the client `device` was set up for, when it has one: what
+    /// its profile, bypass and routing rules are keyed by, wherever it asks
+    /// from.
+    pub fn owner_mac(&self, device: &str) -> Option<String> {
+        self.owner_of(device)
+            .and_then(|k| parse_mac(&k))
+            .map(|m| format_mac(&m))
     }
 
     pub fn get_mac(&self, ip: IpAddr) -> Option<String> {
@@ -481,6 +505,19 @@ impl ClientRegistry {
                 macs: self.get_mac(ip).into_iter().collect(),
                 is_alias: self.is_aliased(ip),
             };
+        }
+        // A device set up for a client you know is called what that client is,
+        // so the two make one row in Clients; its key stays its one token.
+        if let Some(owner) = self.owner_of(device) {
+            let of = self.describe_device(&owner);
+            if of.name.is_some() {
+                return super::DeviceInfo {
+                    name: of.name,
+                    ips: vec![device.to_string()],
+                    macs: of.macs,
+                    is_alias: of.is_alias,
+                };
+            }
         }
         // A device that named itself over encrypted DNS (`id:pixel`) is called
         // what it said; the key stays its one token, so a pause or a bypass

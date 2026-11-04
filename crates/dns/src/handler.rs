@@ -177,8 +177,13 @@ pub fn decide_as(
     let client_scoped = (blocking_enabled
         && (ctx.blocklist.has_client_exceptions() || ctx.blocklist.has_profiles()))
         || ctx.interceptor.has_client_rules();
+    // A device set up for a client you know is that client wherever it asks
+    // from: its MAC is what the client's profile, bypass and rules key on.
     let client_mac = if client_scoped {
-        ctx.client_registry.get_mac(client_addr)
+        device
+            .as_deref()
+            .and_then(|d| ctx.client_registry.owner_mac(d))
+            .or_else(|| ctx.client_registry.get_mac(client_addr))
     } else {
         None
     };

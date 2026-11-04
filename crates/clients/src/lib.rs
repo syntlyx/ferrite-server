@@ -119,9 +119,13 @@ pub struct ClientRegistry {
     /// in the UI, device attribution); what stops is writing it down.
     switches: Arc<RecordSwitches>,
     /// Which device (client ID, `id:pixel`) last asked over encrypted DNS
-    /// from a home address, and when. Tunnels' listener sees only an address,
-    /// and asks this to apply rules scoped to the device. Memory only.
+    /// from an address, at home or away, and when. Tunnels' listener sees
+    /// only an address, and asks this to apply rules scoped to the device —
+    /// and, from the internet, whether to let it in at all. Memory only.
     device_at: DashMap<IpAddr, (String, Instant)>,
+    /// Whose each encrypted DNS device is (`id:pixel` → the MAC or IP of
+    /// the client it was set up for); see [`ClientRegistry::owner_of`].
+    id_owners: DashMap<String, String>,
 }
 
 // ── Public utilities ──────────────────────────────────────────────────────────

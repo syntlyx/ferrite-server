@@ -358,11 +358,6 @@ async fn splice_through(
     let need_mac = ctx.proxy.has_client_rules()
         || (ctx.blocklist.blocking_enabled()
             && (ctx.blocklist.has_client_exceptions() || ctx.blocklist.has_profiles()));
-    let client_mac = if need_mac {
-        client_addr.and_then(|ip| ctx.client_registry.get_mac(ip))
-    } else {
-        None
-    };
     // From the internet, only one of your devices — at an address it has
     // just asked from over encrypted DNS — is let in, and only for a name
     // routed for it: never a plain forwarder for whoever finds the port.
@@ -371,6 +366,16 @@ async fn splice_through(
     // rules and profiles scoped to it.
     let device = if need_mac || away {
         client_addr.and_then(|ip| ctx.client_registry.device_at(ip))
+    } else {
+        None
+    };
+    // A device set up for a client you know carries that client's MAC, from
+    // home or away, as the DNS answer that sent it here did.
+    let client_mac = if need_mac {
+        device
+            .as_deref()
+            .and_then(|d| ctx.client_registry.owner_mac(d))
+            .or_else(|| client_addr.and_then(|ip| ctx.client_registry.get_mac(ip)))
     } else {
         None
     };

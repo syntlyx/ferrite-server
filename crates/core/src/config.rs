@@ -1198,6 +1198,12 @@ pub struct SecureDnsConfig {
     /// without the password. One that does is added to `devices` under its
     /// own name, and the webhook is told.
     pub self_setup: SelfSetup,
+    /// Whose each device is: a device name → the client (its MAC, or its IP)
+    /// it was set up for. Its queries count as that client's wherever they
+    /// come from — the client's name in Clients, and its profile, pause,
+    /// bypass and routing rules follow it.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub owners: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for SecureDnsConfig {
@@ -1214,6 +1220,7 @@ impl Default for SecureDnsConfig {
             devices: Vec::new(),
             proxies: Vec::new(),
             self_setup: SelfSetup::default(),
+            owners: Default::default(),
         }
     }
 }

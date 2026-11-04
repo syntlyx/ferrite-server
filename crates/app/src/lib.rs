@@ -299,15 +299,53 @@ impl AppState {
     /// Bring encrypted DNS in line with the live config — after its own
     /// settings change, or Tunnels' port does.
     pub async fn apply_secure_dns(&self) {
+        if self.tidy_device_owners() {
+            self.persist_config().await;
+        }
         let (cfg, records) = {
             let live = self.live_config.read();
             (live.secure_dns.clone(), builtin_records(&live))
         };
+        self.inner.client_registry.set_id_owners(&cfg.owners);
         self.inner.custom_records.load_builtin(&records);
         self.inner.dns_cache.forget_name(cfg.hostname.trim());
         let ctx = Arc::new(self.dns_ctx());
         let tunnels = self.tunnels_tls_port();
         self.inner.secure_dns.apply(&cfg, ctx, tunnels).await;
+    }
+
+    /// Keep `[secure_dns] owners` in line with the device list: a device
+    /// that's gone loses its owner, and one without an owner — set up before
+    /// owners were kept — gets the client its name was made from (`pixel-k7f3`
+    /// from the client named "Pixel"). True when it changed.
+    fn tidy_device_owners(&self) -> bool {
+        use ferrite_core::net::{device_label, labelled_device, normalize_client_key};
+        let mut live = self.live_config.write();
+        let aliases = live.client_aliases.clone();
+        let sd = &mut live.secure_dns;
+        let before = sd.owners.clone();
+        let devices = &sd.devices;
+        sd.owners.retain(|id, _| devices.contains(id));
+        for id in &sd.devices {
+            if sd.owners.contains_key(id) {
+                continue;
+            }
+            let owner = aliases
+                .iter()
+                .filter(|a| {
+                    labelled_device(std::slice::from_ref(id), &device_label(&a.name)).is_some()
+                })
+                .find_map(|a| {
+                    a.mac
+                        .as_deref()
+                        .or(a.ip.as_deref())
+                        .and_then(normalize_client_key)
+                });
+            if let Some(owner) = owner {
+                sd.owners.insert(id.clone(), owner);
+            }
+        }
+        sd.owners != before
     }
 
     /// Construct the full application state from configuration.

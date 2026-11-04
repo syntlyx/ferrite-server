@@ -1607,3 +1607,39 @@ async fn a_client_id_is_its_own_device_with_its_own_profile() {
 
     cleanup_sqlite(&h.db_path);
 }
+
+/// A device set up for a client you named is that client wherever it asks
+/// from: the profile given to the client's MAC applies to its encrypted
+/// queries, away from home too.
+#[tokio::test]
+async fn a_device_carries_its_owners_profile_away_from_home() {
+    let h = Harness::new("dns-owner-profile").await;
+    let profile: ferrite_core::config::BlocklistProfileConfig = serde_json::from_value(
+        serde_json::json!({"id": "kids", "name": "Kids", "clients": ["aa:bb:cc:dd:ee:01"], "block": ["games.test"]}),
+    )
+    .unwrap();
+    h.blocklist.set_profiles(vec![profile]);
+    let away = SocketAddr::from(([198, 51, 100, 30], 53_000));
+    let ctx = Arc::new(h.ctx());
+    let ask = || {
+        decide_as(
+            &raw_query("games.test", RecordType::A),
+            away,
+            Some("kid-phone-k7f3"),
+            &ctx,
+        )
+    };
+    // Nobody's yet: the MAC's profile doesn't reach it.
+    assert!(matches!(ask(), Decision::Upstream(_)));
+
+    let owners = [(
+        "kid-phone-k7f3".to_string(),
+        "aa:bb:cc:dd:ee:01".to_string(),
+    )]
+    .into_iter()
+    .collect();
+    h.client_registry.set_id_owners(&owners);
+    assert_eq!(answered_rcode(ask()), Some(ResponseCode::NXDomain));
+
+    cleanup_sqlite(&h.db_path);
+}
