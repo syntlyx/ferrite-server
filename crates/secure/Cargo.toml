@@ -19,6 +19,10 @@ tokio.workspace = true
 tokio-rustls.workspace = true
 tracing.workspace = true
 x509-parser.workspace = true
+hickory-proto.workspace = true
+instant-acme.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
 hyper = { workspace = true, features = ["server", "http1", "http2"] }
 hyper-util = { workspace = true, features = ["tokio", "service", "server-auto", "http1", "http2"] }
 http-body-util = "0.1"

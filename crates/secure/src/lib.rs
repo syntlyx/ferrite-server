@@ -5,35 +5,50 @@
 //!
 //! One TLS setup serves both: after the handshake the negotiated protocol
 //! (ALPN) decides — `h2`/`http/1.1` is DNS over HTTPS, anything else DNS over
-//! TLS — and a client that names none gets what its port is for. The
-//! certificate is read from files and swapped in place when they change.
+//! TLS — and a client that names none gets what its port is for.
+//!
+//! The certificate comes from Let's Encrypt, which ferrite asks itself and
+//! renews (see [`acme`]), or from files kept elsewhere; either way it is
+//! swapped in place, without closing a listener.
+//!
+//! A port Tunnels already listens on (443, usually) is shared rather than
+//! fought over: Tunnels reads the name a connection asks for and hands the
+//! ones for our name here ([`SecureDns::claims`], [`SecureDns::take`]).
 
+mod acme;
 mod cert;
+mod cloudflare;
 mod doh;
 mod dot;
+mod rewind;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use arc_swap::ArcSwapOption;
 use parking_lot::Mutex;
 use serde::Serialize;
-use tokio::net::TcpListener;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls;
 
-use ferrite_core::config::SecureDnsConfig;
+use ferrite_core::config::{AcmeConfig, CertSource, SecureDnsConfig};
 use ferrite_dns::ctx::DnsCtx;
 
 pub use cert::CertInfo;
 
 /// A handshake that hasn't finished in this long is dropped.
 const HANDSHAKE: Duration = Duration::from_secs(10);
-/// How often the certificate files are checked for a renewal.
+/// How often certificate files kept elsewhere are checked for a renewal.
 const CERT_CHECK: Duration = Duration::from_secs(600);
-/// Encrypted connections open at once, across both listeners.
+/// How often a Let's Encrypt certificate is looked at, at the most.
+const RENEW_CHECK: Duration = Duration::from_secs(12 * 3600);
+/// Encrypted connections open at once, across all listeners.
 const MAX_CONNECTIONS: usize = 1024;
 
 /// What the encrypted listeners are doing — the panel's status line.
@@ -46,9 +61,26 @@ pub struct SecureDnsStatus {
     pub doh: bool,
     pub dot_error: Option<String>,
     pub doh_error: Option<String>,
+    /// Comes in through Tunnels' listener on the same port.
+    pub dot_shared: bool,
+    pub doh_shared: bool,
     pub cert: Option<CertInfo>,
     /// The certificate works, but not for everything: a name it doesn't cover.
     pub cert_warning: Option<String>,
+    /// With Let's Encrypt: getting and renewing the certificate.
+    pub acme: Option<AcmeStatus>,
+}
+
+/// Where getting the certificate from Let's Encrypt stands.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AcmeStatus {
+    /// `working`, `ok` or `error`.
+    pub state: &'static str,
+    /// What it is doing while `working`.
+    pub step: Option<&'static str>,
+    pub error: Option<String>,
+    /// Unix seconds: the next attempt after an error, or when renewal is due.
+    pub next: Option<i64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -67,22 +99,69 @@ pub fn client_id_from_sni(sni: &str, hostname: &str) -> Option<String> {
     ferrite_core::net::normalize_client_id(label)
 }
 
+/// Is a connection asking for `sni` one for `hostname` — itself or a name
+/// under it?
+fn is_ours(sni: &str, hostname: &str) -> bool {
+    let sni = sni.trim_end_matches('.').to_ascii_lowercase();
+    sni == hostname
+        || sni
+            .strip_suffix(hostname)
+            .is_some_and(|front| front.ends_with('.'))
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// What serving one connection takes, wherever it was accepted.
+struct Serving {
+    acceptor: TlsAcceptor,
+    hostname: String,
+    ctx: Arc<DnsCtx>,
+    connections: Arc<Semaphore>,
+}
+
+/// A port shared with Tunnels.
+struct Shared {
+    serving: Arc<Serving>,
+    default: Default_,
+}
+
+/// What to renew, started once the listeners are up.
+struct Renewal {
+    hostname: String,
+    acme: AcmeConfig,
+    dir: PathBuf,
+}
+
 /// The encrypted listeners; [`SecureDns::apply`] brings them in line with the
 /// config.
 pub struct SecureDns {
+    /// Where Let's Encrypt certificates and the account are kept.
+    dir: PathBuf,
     certs: Arc<cert::CertStore>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     status: Mutex<SecureDnsStatus>,
     apply_lock: tokio::sync::Mutex<()>,
+    shared: ArcSwapOption<Shared>,
+    /// Pinged to ask Let's Encrypt again right away.
+    retry: Notify,
 }
 
 impl SecureDns {
-    pub fn new() -> Arc<Self> {
+    /// `dir` keeps what Let's Encrypt hands out.
+    pub fn new(dir: PathBuf) -> Arc<Self> {
         Arc::new(Self {
+            dir,
             certs: Arc::new(cert::CertStore::default()),
             tasks: Mutex::new(Vec::new()),
             status: Mutex::new(SecureDnsStatus::default()),
             apply_lock: tokio::sync::Mutex::new(()),
+            shared: ArcSwapOption::empty(),
+            retry: Notify::new(),
         })
     }
 
@@ -90,8 +169,19 @@ impl SecureDns {
         self.status.lock().clone()
     }
 
-    /// Stop what runs and start what `cfg` asks for.
-    pub async fn apply(self: &Arc<Self>, cfg: &SecureDnsConfig, ctx: Arc<DnsCtx>) {
+    /// Ask Let's Encrypt again now rather than at the next try.
+    pub fn retry_now(&self) {
+        self.retry.notify_one();
+    }
+
+    /// Stop what runs and start what `cfg` asks for. `tunnels_port` is the
+    /// port Tunnels listens on, when it does: that one is shared, not bound.
+    pub async fn apply(
+        self: &Arc<Self>,
+        cfg: &SecureDnsConfig,
+        ctx: Arc<DnsCtx>,
+        tunnels_port: Option<u16>,
+    ) {
         let _guard = self.apply_lock.lock().await;
         // Taken out first: the lock mustn't be held across the awaits below.
         let running = std::mem::take(&mut *self.tasks.lock());
@@ -99,25 +189,37 @@ impl SecureDns {
             task.abort();
             let _ = task.await;
         }
+        self.shared.store(None);
         let mut status = SecureDnsStatus::default();
+        let mut renewal = None;
         if cfg.enabled {
-            match self.start(cfg, ctx, &mut status).await {
-                Ok(()) => status.running = status.dot || status.doh,
+            match self.start(cfg, ctx, tunnels_port, &mut status).await {
+                Ok(r) => {
+                    status.running = status.dot || status.doh;
+                    renewal = r;
+                }
                 Err(e) => {
                     tracing::warn!("secure dns: not started — {e}");
                     status.error = Some(e);
                 }
             }
+        } else {
+            self.certs.clear();
         }
         *self.status.lock() = status;
+        if let Some(r) = renewal {
+            let task = tokio::spawn(Arc::clone(self).renew(r));
+            self.tasks.lock().push(task);
+        }
     }
 
     async fn start(
         self: &Arc<Self>,
         cfg: &SecureDnsConfig,
         ctx: Arc<DnsCtx>,
+        tunnels_port: Option<u16>,
         status: &mut SecureDnsStatus,
-    ) -> Result<(), String> {
+    ) -> Result<Option<Renewal>, String> {
         let hostname = cfg
             .hostname
             .trim()
@@ -126,22 +228,58 @@ impl SecureDns {
         if hostname.is_empty() {
             return Err("set the name devices connect to".into());
         }
-        let (Some(cert_file), Some(key_file)) = (cfg.cert_file.clone(), cfg.key_file.clone())
-        else {
-            return Err("set the certificate and its key".into());
-        };
-        let (key, info) = cert::load(&cert_file, &key_file)?;
-        status.cert_warning = if !info.covers(&hostname) {
-            Some(format!("the certificate isn't for {hostname}"))
-        } else if !info.covers(&format!("x.{hostname}")) {
-            Some(format!(
-                "the certificate has no *.{hostname} — client IDs work over HTTPS only"
-            ))
-        } else {
-            None
-        };
-        status.cert = Some(info);
-        self.certs.set(key);
+
+        let mut tasks = Vec::new();
+        let mut renewal = None;
+        match cfg.certificate {
+            CertSource::Files => {
+                let (Some(cert_file), Some(key_file)) =
+                    (cfg.cert_file.clone(), cfg.key_file.clone())
+                else {
+                    return Err("set the certificate and its key".into());
+                };
+                let (key, info) = cert::load(&cert_file, &key_file)?;
+                status.cert_warning = coverage_warning(&info, &hostname);
+                status.cert = Some(info);
+                self.certs.set(key);
+                tasks.push(tokio::spawn(
+                    Arc::clone(self).watch_cert(cert_file, key_file),
+                ));
+            }
+            CertSource::Letsencrypt => {
+                if cfg
+                    .acme
+                    .cloudflare_token
+                    .as_deref()
+                    .is_none_or(|t| t.trim().is_empty())
+                {
+                    return Err("set a Cloudflare API token for Let's Encrypt".into());
+                }
+                let dir = if cfg.acme.staging {
+                    self.dir.join("staging")
+                } else {
+                    self.dir.clone()
+                };
+                let (cert_file, key_file) = acme::files(&dir, &hostname);
+                match cert::load(&cert_file, &key_file) {
+                    Ok((key, info)) => {
+                        self.certs.set(key);
+                        status.cert = Some(info);
+                    }
+                    // Not got yet: handshakes fail until it is.
+                    Err(_) => self.certs.clear(),
+                }
+                status.acme = Some(AcmeStatus {
+                    state: "working",
+                    ..AcmeStatus::default()
+                });
+                renewal = Some(Renewal {
+                    hostname: hostname.clone(),
+                    acme: cfg.acme.clone(),
+                    dir,
+                });
+            }
+        }
 
         let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
@@ -151,10 +289,13 @@ impl SecureDns {
         .with_no_client_auth()
         .with_cert_resolver(Arc::clone(&self.certs) as Arc<dyn rustls::server::ResolvesServerCert>);
         tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"dot".to_vec()];
-        let acceptor = TlsAcceptor::from(Arc::new(tls));
-        let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+        let serving = Arc::new(Serving {
+            acceptor: TlsAcceptor::from(Arc::new(tls)),
+            hostname: hostname.clone(),
+            ctx,
+            connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+        });
 
-        let mut tasks = Vec::new();
         let mut ports: Vec<(u16, Default_)> = Vec::new();
         if cfg.dot_port != 0 {
             ports.push((cfg.dot_port, Default_::Tls));
@@ -162,17 +303,33 @@ impl SecureDns {
         if cfg.doh_port != 0 && cfg.doh_port != cfg.dot_port {
             ports.push((cfg.doh_port, Default_::Https));
         }
+        // One port serving both protocols: whatever comes of it, comes of both.
+        let both = cfg.doh_port == cfg.dot_port;
         for (port, default) in ports {
+            let mark =
+                |status: &mut SecureDnsStatus, up: bool, shared: bool, err: Option<String>| {
+                    if default == Default_::Tls || both {
+                        status.dot = up;
+                        status.dot_shared = shared;
+                        status.dot_error = err.clone();
+                    }
+                    if default == Default_::Https || both {
+                        status.doh = up;
+                        status.doh_shared = shared;
+                        status.doh_error = err;
+                    }
+                };
+            if tunnels_port == Some(port) {
+                tracing::info!("secure dns: sharing :{port} with Tunnels as {hostname}");
+                self.shared.store(Some(Arc::new(Shared {
+                    serving: Arc::clone(&serving),
+                    default,
+                })));
+                mark(status, true, true, None);
+                continue;
+            }
             match bind(port).await {
                 Ok(listener) => {
-                    match default {
-                        Default_::Tls => status.dot = true,
-                        Default_::Https => status.doh = true,
-                    }
-                    // One port serving both protocols: both are up.
-                    if cfg.doh_port == cfg.dot_port {
-                        status.doh = true;
-                    }
                     tracing::info!(
                         "secure dns: {} on :{port} as {hostname}",
                         if default == Default_::Tls {
@@ -181,13 +338,11 @@ impl SecureDns {
                             "DNS over HTTPS"
                         }
                     );
+                    mark(status, true, false, None);
                     tasks.push(tokio::spawn(accept_loop(
                         listener,
-                        acceptor.clone(),
+                        Arc::clone(&serving),
                         default,
-                        hostname.clone(),
-                        Arc::clone(&ctx),
-                        Arc::clone(&connections),
                     )));
                 }
                 Err(e) => {
@@ -198,18 +353,41 @@ impl SecureDns {
                         }
                         _ => format!("couldn't open port {port}: {e}"),
                     };
-                    match default {
-                        Default_::Tls => status.dot_error = Some(msg),
-                        Default_::Https => status.doh_error = Some(msg),
-                    }
+                    mark(status, false, false, Some(msg));
                 }
             }
         }
-        tasks.push(tokio::spawn(
-            Arc::clone(self).watch_cert(cert_file, key_file),
-        ));
         *self.tasks.lock() = tasks;
-        Ok(())
+        Ok(renewal)
+    }
+
+    /// Whether a TLS connection asking for `sni` is ours. Asked by Tunnels'
+    /// listener for every connection on the port it shares with us.
+    pub fn claims(&self, sni: &str) -> bool {
+        self.shared
+            .load()
+            .as_ref()
+            .is_some_and(|s| is_ours(sni, &s.serving.hostname))
+    }
+
+    /// Serve a connection Tunnels' listener accepted; `peeked` is what it
+    /// already read of it.
+    pub async fn take(&self, stream: TcpStream, peeked: Vec<u8>, peer: SocketAddr) {
+        let Some(shared) = self.shared.load_full() else {
+            return;
+        };
+        let Ok(slot) = Arc::clone(&shared.serving.connections).try_acquire_owned() else {
+            return;
+        };
+        let _ = stream.set_nodelay(true);
+        serve(
+            rewind::Rewind::new(peeked, stream),
+            peer,
+            &shared.serving,
+            shared.default,
+        )
+        .await;
+        drop(slot);
     }
 
     /// Swap in a renewed certificate when its files change.
@@ -234,9 +412,100 @@ impl SecureDns {
             }
         }
     }
+
+    fn set_acme(&self, acme: AcmeStatus) {
+        self.status.lock().acme = Some(acme);
+    }
+
+    /// Get the certificate from Let's Encrypt when there is none for the name
+    /// or it is due, and look again when it next could be.
+    async fn renew(self: Arc<Self>, r: Renewal) {
+        let wildcard = format!("x.{}", r.hostname);
+        let mut failures: u32 = 0;
+        loop {
+            let now = unix_now();
+            let current = self.status.lock().cert.clone();
+            let wait = match current {
+                Some(c) if c.covers(&r.hostname) && c.covers(&wildcard) && !c.due(now) => {
+                    failures = 0;
+                    let due = c.not_after - (c.not_after - c.not_before).max(0) / 3;
+                    self.set_acme(AcmeStatus {
+                        state: "ok",
+                        next: Some(due),
+                        ..AcmeStatus::default()
+                    });
+                    Duration::from_secs((due - now).max(60) as u64).min(RENEW_CHECK)
+                }
+                _ => {
+                    self.set_acme(AcmeStatus {
+                        state: "working",
+                        ..AcmeStatus::default()
+                    });
+                    let me = Arc::clone(&self);
+                    let step = move |s: &'static str| {
+                        if let Some(a) = me.status.lock().acme.as_mut() {
+                            a.step = Some(s);
+                        }
+                    };
+                    tracing::info!("secure dns: asking Let's Encrypt for {}", r.hostname);
+                    let issued = acme::issue(&r.dir, &r.hostname, &r.acme, &step).await;
+                    let (cert_file, key_file) = acme::files(&r.dir, &r.hostname);
+                    match issued.and_then(|()| cert::load(&cert_file, &key_file)) {
+                        Ok((key, info)) => {
+                            tracing::info!(
+                                "secure dns: certificate for {} from Let's Encrypt",
+                                r.hostname
+                            );
+                            self.certs.set(key);
+                            let mut st = self.status.lock();
+                            st.cert_warning = None;
+                            st.cert = Some(info);
+                            continue; // the loop above says when to renew
+                        }
+                        Err(e) => {
+                            failures += 1;
+                            // Let's Encrypt allows a few failures an hour for
+                            // a name; back off well inside that.
+                            let backoff = Duration::from_secs(15 * 60)
+                                .saturating_mul(2u32.saturating_pow(failures - 1))
+                                .min(RENEW_CHECK);
+                            tracing::warn!(
+                                "secure dns: no certificate from Let's Encrypt — {e}; trying again in {} min",
+                                backoff.as_secs() / 60
+                            );
+                            self.set_acme(AcmeStatus {
+                                state: "error",
+                                error: Some(e),
+                                next: Some(now + backoff.as_secs() as i64),
+                                ..AcmeStatus::default()
+                            });
+                            backoff
+                        }
+                    }
+                }
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = self.retry.notified() => {}
+            }
+        }
+    }
 }
 
-async fn bind(port: u16) -> std::io::Result<TcpListener> {
+/// The certificate works but leaves a name out.
+fn coverage_warning(info: &CertInfo, hostname: &str) -> Option<String> {
+    if !info.covers(hostname) {
+        Some(format!("the certificate isn't for {hostname}"))
+    } else if !info.covers(&format!("x.{hostname}")) {
+        Some(format!(
+            "the certificate has no *.{hostname} — client IDs work over HTTPS only"
+        ))
+    } else {
+        None
+    }
+}
+
+async fn bind_once(port: u16) -> std::io::Result<TcpListener> {
     match TcpListener::bind(SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port))).await {
         Ok(l) => Ok(l),
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Err(e),
@@ -244,14 +513,22 @@ async fn bind(port: u16) -> std::io::Result<TcpListener> {
     }
 }
 
-async fn accept_loop(
-    listener: TcpListener,
-    acceptor: TlsAcceptor,
-    default: Default_,
-    hostname: String,
-    ctx: Arc<DnsCtx>,
-    connections: Arc<tokio::sync::Semaphore>,
-) {
+/// A port Tunnels (or the previous setup) is letting go of may take a moment
+/// to come free.
+async fn bind(port: u16) -> std::io::Result<TcpListener> {
+    let mut tries = 0;
+    loop {
+        match bind_once(port).await {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && tries < 12 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+async fn accept_loop(listener: TcpListener, serving: Arc<Serving>, default: Default_) {
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(c) => c,
@@ -261,37 +538,46 @@ async fn accept_loop(
                 continue;
             }
         };
-        let Ok(slot) = Arc::clone(&connections).try_acquire_owned() else {
+        let Ok(slot) = Arc::clone(&serving.connections).try_acquire_owned() else {
             continue; // full: drop the connection
         };
         let _ = stream.set_nodelay(true);
-        let (acceptor, hostname, ctx) = (acceptor.clone(), hostname.clone(), Arc::clone(&ctx));
+        let serving = Arc::clone(&serving);
         tokio::spawn(async move {
-            let peer = SocketAddr::new(ferrite_core::net::unmap_v4(peer.ip()), peer.port());
-            let tls = match tokio::time::timeout(HANDSHAKE, acceptor.accept(stream)).await {
-                Ok(Ok(tls)) => tls,
-                _ => return,
-            };
-            let (sni_id, alpn) = {
-                let (_, conn) = tls.get_ref();
-                (
-                    conn.server_name()
-                        .and_then(|s| client_id_from_sni(s, &hostname)),
-                    conn.alpn_protocol().map(<[u8]>::to_vec),
-                )
-            };
-            let https = match alpn.as_deref() {
-                Some(b"h2") | Some(b"http/1.1") => true,
-                Some(_) => false,
-                None => default == Default_::Https,
-            };
-            if https {
-                doh::serve(tls, peer, sni_id, ctx).await;
-            } else {
-                dot::serve(tls, peer, sni_id, ctx).await;
-            }
+            serve(stream, peer, &serving, default).await;
             drop(slot);
         });
+    }
+}
+
+/// The handshake, then DNS over HTTPS or over TLS as it negotiated.
+async fn serve<S>(stream: S, peer: SocketAddr, serving: &Serving, default: Default_)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let peer = SocketAddr::new(ferrite_core::net::unmap_v4(peer.ip()), peer.port());
+    let tls = match tokio::time::timeout(HANDSHAKE, serving.acceptor.accept(stream)).await {
+        Ok(Ok(tls)) => tls,
+        _ => return,
+    };
+    let (sni_id, alpn) = {
+        let (_, conn) = tls.get_ref();
+        (
+            conn.server_name()
+                .and_then(|s| client_id_from_sni(s, &serving.hostname)),
+            conn.alpn_protocol().map(<[u8]>::to_vec),
+        )
+    };
+    let https = match alpn.as_deref() {
+        Some(b"h2") | Some(b"http/1.1") => true,
+        Some(_) => false,
+        None => default == Default_::Https,
+    };
+    let ctx = Arc::clone(&serving.ctx);
+    if https {
+        doh::serve(tls, peer, sni_id, ctx).await;
+    } else {
+        dot::serve(tls, peer, sni_id, ctx).await;
     }
 }
 
@@ -314,5 +600,16 @@ mod tests {
         assert_eq!(client_id_from_sni("a.b.dns.example.com", h), None);
         assert_eq!(client_id_from_sni("xdns.example.com", h), None);
         assert_eq!(client_id_from_sni("other.com", h), None);
+    }
+
+    #[test]
+    fn only_our_name_and_names_under_it_are_ours() {
+        let h = "dns.example.com";
+        assert!(is_ours("dns.example.com", h));
+        assert!(is_ours("Pixel.dns.example.com.", h));
+        assert!(is_ours("a.b.dns.example.com", h));
+        assert!(!is_ours("xdns.example.com", h));
+        assert!(!is_ours("example.com", h));
+        assert!(!is_ours("www.youtube.com", h));
     }
 }

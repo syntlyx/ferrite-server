@@ -19,6 +19,7 @@ pub struct CertInfo {
     pub names: Vec<String>,
     pub issuer: String,
     /// Unix seconds.
+    pub not_before: i64,
     pub not_after: i64,
 }
 
@@ -34,6 +35,13 @@ impl CertInfo {
                 })
         })
     }
+
+    /// Time to get a new one: a third of its life left, as Let's Encrypt
+    /// advises — 30 days of a 90-day certificate.
+    pub fn due(&self, now: i64) -> bool {
+        let life = (self.not_after - self.not_before).max(0);
+        self.not_after - now < life / 3
+    }
 }
 
 /// The certificate every handshake gets; replaced in place on reload, so the
@@ -44,6 +52,10 @@ pub struct CertStore(ArcSwapOption<CertifiedKey>);
 impl CertStore {
     pub fn set(&self, key: Arc<CertifiedKey>) {
         self.0.store(Some(key));
+    }
+
+    pub fn clear(&self) {
+        self.0.store(None);
     }
 }
 
@@ -108,6 +120,7 @@ fn describe(der: &CertificateDer<'_>) -> Result<CertInfo, String> {
             .and_then(|o| o.as_str().ok())
             .map(str::to_string)
             .unwrap_or_else(|| x.issuer().to_string()),
+        not_before: x.validity().not_before.timestamp(),
         not_after: x.validity().not_after.timestamp(),
     })
 }
@@ -120,6 +133,7 @@ mod tests {
         CertInfo {
             names: names.iter().map(|s| s.to_string()).collect(),
             issuer: String::new(),
+            not_before: 0,
             not_after: 0,
         }
     }
@@ -132,6 +146,19 @@ mod tests {
         assert!(!c.covers("a.b.dns.example.com"));
         assert!(!c.covers("example.com"));
         assert!(!info(&["*.example.com"]).covers("example.com"));
+    }
+
+    #[test]
+    fn renewal_is_due_with_a_third_of_the_life_left() {
+        let day = 86_400;
+        let mut c = info(&["a.test"]);
+        c.not_before = 0;
+        c.not_after = 90 * day;
+        assert!(!c.due(59 * day));
+        assert!(c.due(61 * day));
+        c.not_after = 45 * day;
+        assert!(!c.due(29 * day));
+        assert!(c.due(31 * day));
     }
 
     #[test]

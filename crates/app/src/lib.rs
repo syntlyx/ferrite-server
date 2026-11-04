@@ -210,7 +210,7 @@ impl AppState {
     /// built-in DNS record, the host names the shared HTTP listener serves the
     /// panel for, and any cached answer for the old or new name.
     pub fn apply_panel(&self, previous: &Config, config: &Config) {
-        let records = builtin_panel_records(config);
+        let records = builtin_records(config);
         self.inner.custom_records.load_builtin(&records);
         self.inner.panel_hosts.store(Arc::new(panel_hosts(config)));
         self.inner.dns_cache.forget_name(&panel_domain(previous));
@@ -252,7 +252,29 @@ impl AppState {
             upstream_pool: Arc::clone(&self.inner.upstream_pool),
             live_config: Arc::clone(&self.live_config),
             api_port: self.inner.config.api.bind_addr.port(),
+            tls_handoff: Some(Arc::new(SecureHandoff(Arc::clone(&self.inner.secure_dns)))),
         }
+    }
+
+    /// The port Tunnels listens for TLS on, when it does: encrypted DNS
+    /// shares that one instead of binding it.
+    pub fn tunnels_tls_port(&self) -> Option<u16> {
+        let live = self.live_config.read();
+        live.proxy.enabled.then_some(live.proxy.https_port)
+    }
+
+    /// Bring encrypted DNS in line with the live config — after its own
+    /// settings change, or Tunnels' port does.
+    pub async fn apply_secure_dns(&self) {
+        let (cfg, records) = {
+            let live = self.live_config.read();
+            (live.secure_dns.clone(), builtin_records(&live))
+        };
+        self.inner.custom_records.load_builtin(&records);
+        self.inner.dns_cache.forget_name(cfg.hostname.trim());
+        let ctx = Arc::new(self.dns_ctx());
+        let tunnels = self.tunnels_tls_port();
+        self.inner.secure_dns.apply(&cfg, ctx, tunnels).await;
     }
 
     /// Construct the full application state from configuration.
@@ -451,8 +473,9 @@ impl AppState {
         let custom_records = CustomRecords::new();
         custom_records.load_from_config(&config.custom_records);
         let builtin_records = builtin_panel_records(config);
+        custom_records
+            .load_builtin(&[builtin_records.clone(), builtin_secure_records(config)].concat());
         if let Some(record) = builtin_records.first() {
-            custom_records.load_builtin(&builtin_records);
             let panel_url = panel_url(config, &record.domain);
             tracing::info!(
                 "built-in panel DNS record enabled: {} A {} ({})",
@@ -537,7 +560,7 @@ impl AppState {
             sync_status: Arc::new(parking_lot::Mutex::new(sync_status::SyncStatus::load())),
             sync_wake: Arc::new(Notify::new()),
             dhcp,
-            secure_dns: ferrite_secure::SecureDns::new(),
+            secure_dns: ferrite_secure::SecureDns::new(acme_dir(config)),
             record_switches,
             query_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
         });
@@ -696,6 +719,67 @@ fn fold_legacy_rows(cfg: &mut Config, rows: &LegacyConfigRows) {
     }
 }
 
+/// Where Let's Encrypt certificates for encrypted DNS are kept: beside the
+/// database.
+fn acme_dir(config: &Config) -> std::path::PathBuf {
+    config
+        .storage
+        .path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(ferrite_core::config::data_dir)
+        .join("acme")
+}
+
+/// Encrypted DNS as the proxy sees it on a shared TLS port.
+struct SecureHandoff(Arc<ferrite_secure::SecureDns>);
+
+impl ferrite_proxy::TlsHandoff for SecureHandoff {
+    fn claims(&self, sni: &str) -> bool {
+        self.0.claims(sni)
+    }
+
+    fn take(
+        &self,
+        stream: tokio::net::TcpStream,
+        peeked: Vec<u8>,
+        peer: SocketAddr,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(self.0.take(stream, peeked, peer))
+    }
+}
+
+/// The records ferrite answers for itself: the panel's name, and the name
+/// devices use for encrypted DNS (with the names under it, which carry their
+/// client IDs) — so at home they reach this box directly, not through the
+/// router's public address.
+fn builtin_records(config: &Config) -> Vec<CustomRecordConfig> {
+    let mut records = builtin_panel_records(config);
+    records.extend(builtin_secure_records(config));
+    records
+}
+
+fn builtin_secure_records(config: &Config) -> Vec<CustomRecordConfig> {
+    let secure = &config.secure_dns;
+    let host = secure.hostname.trim().trim_end_matches('.');
+    if !secure.enabled || host.is_empty() {
+        return Vec::new();
+    }
+    let Some(ip) = panel_ipv4(config) else {
+        return Vec::new();
+    };
+    [host.to_string(), format!("*.{host}")]
+        .into_iter()
+        .map(|domain| CustomRecordConfig {
+            domain,
+            record_type: "A".to_string(),
+            value: ip.to_string(),
+            ttl: BUILTIN_PANEL_TTL,
+        })
+        .collect()
+}
+
 fn builtin_panel_records(config: &Config) -> Vec<CustomRecordConfig> {
     if !config.panel.enabled {
         tracing::info!("built-in panel DNS record disabled by config");
@@ -823,6 +907,19 @@ mod tests {
         assert_eq!(records[0].domain, "panel.home");
         assert_eq!(records[0].value, "192.168.1.5");
         assert_eq!(records[0].ttl, BUILTIN_PANEL_TTL);
+    }
+
+    #[test]
+    fn encrypted_dns_names_point_here_while_it_is_on() {
+        let mut cfg = Config::default();
+        cfg.panel.ipv4 = Some("192.168.1.5".parse().unwrap());
+        cfg.secure_dns.hostname = "dns.example.com".to_string();
+        assert!(builtin_secure_records(&cfg).is_empty());
+        cfg.secure_dns.enabled = true;
+        let records = builtin_secure_records(&cfg);
+        let names: Vec<&str> = records.iter().map(|r| r.domain.as_str()).collect();
+        assert_eq!(names, ["dns.example.com", "*.dns.example.com"]);
+        assert!(records.iter().all(|r| r.value == "192.168.1.5"));
     }
 
     #[test]

@@ -1140,20 +1140,27 @@ impl RaConfig {
 /// "Private DNS") and DNS over HTTPS (iOS profiles, browsers). A device may
 /// name itself with a client ID: `pixel.dns.example.com` for TLS,
 /// `/dns-query/pixel` for HTTPS; the ID is then its device for profiles,
-/// pauses and the log. Needs a certificate for `hostname` and `*.hostname`.
-/// Applies without a restart.
+/// pauses and the log. Needs a certificate for `hostname` and `*.hostname`:
+/// ferrite gets one from Let's Encrypt itself, or reads files you keep.
+/// DNS over HTTPS may share Tunnels' port: connections for `hostname` are
+/// told apart by the name they ask for. Applies without a restart.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct SecureDnsConfig {
     pub enabled: bool,
     /// The name devices connect to, e.g. `dns.example.com`.
     pub hostname: String,
-    /// PEM certificate chain and private key for `hostname` (and
-    /// `*.hostname`, for client IDs over TLS).
+    /// Where the certificate comes from.
+    pub certificate: CertSource,
+    /// With `certificate = "files"`: PEM certificate chain and private key
+    /// for `hostname` (and `*.hostname`, for client IDs over TLS).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cert_file: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_file: Option<PathBuf>,
+    /// With `certificate = "letsencrypt"`.
+    #[serde(skip_serializing_if = "AcmeConfig::is_unset")]
+    pub acme: AcmeConfig,
     /// DNS over TLS; 0 = off.
     pub dot_port: u16,
     /// DNS over HTTPS; 0 = off.
@@ -1165,11 +1172,49 @@ impl Default for SecureDnsConfig {
         Self {
             enabled: false,
             hostname: String::new(),
+            certificate: CertSource::default(),
             cert_file: None,
             key_file: None,
+            acme: AcmeConfig::default(),
             dot_port: 853,
             doh_port: 443,
         }
+    }
+}
+
+/// Where encrypted DNS gets its certificate.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CertSource {
+    /// Files you keep up to date yourself (certbot, a reverse proxy, …).
+    #[default]
+    Files,
+    /// ferrite asks Let's Encrypt and renews it, proving the name through
+    /// the DNS provider's API (DNS-01), so no port has to be open for it.
+    Letsencrypt,
+}
+
+/// `[secure_dns.acme]`: getting the certificate from Let's Encrypt.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AcmeConfig {
+    /// Contact address given to Let's Encrypt; optional.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub email: String,
+    /// A Cloudflare API token that may edit the zone's DNS (the "Edit zone
+    /// DNS" template): ferrite adds the `_acme-challenge` TXT record with it
+    /// and removes it once the name is proven.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloudflare_token: Option<String>,
+    /// Let's Encrypt's staging service, for trying things out: higher rate
+    /// limits, but nothing trusts its certificates.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub staging: bool,
+}
+
+impl AcmeConfig {
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
     }
 }
 

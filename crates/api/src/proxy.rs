@@ -180,6 +180,7 @@ pub async fn put_proxy(
 
     // Apply live — routing snapshot swaps and the listeners rebind if their
     // settings changed (no restart) — then persist.
+    let tunnels_before = state.tunnels_tls_port();
     state.inner.proxy.reload(&new);
     {
         let mut live = state.live_config.write();
@@ -187,6 +188,11 @@ pub async fn put_proxy(
         if let Some(url) = moved_webhook {
             live.notifications.webhook = Some(url);
         }
+    }
+    // Encrypted DNS shares Tunnels' TLS port: when that port comes or goes,
+    // it binds the port itself or hands it over.
+    if state.live_config.read().secure_dns.enabled && state.tunnels_tls_port() != tunnels_before {
+        state.apply_secure_dns().await;
     }
     let saved_to = state.persist_config().await;
 

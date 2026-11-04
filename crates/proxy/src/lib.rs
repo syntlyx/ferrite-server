@@ -84,6 +84,24 @@ pub struct ProxyCtx {
     /// The API listener port: when the proxy's HTTP port equals it, the panel
     /// listener owns :80 and demuxes to the proxy instead of a second bind.
     pub api_port: u16,
+    /// A service sharing the TLS port: connections that ask for its names are
+    /// its own, handed over before any routing (encrypted DNS on :443).
+    pub tls_handoff: Option<Arc<dyn TlsHandoff>>,
+}
+
+/// Something else served on the proxy's TLS port, told apart by the name a
+/// connection asks for. The proxy has read the ClientHello by then, so it
+/// hands those bytes over with the connection.
+pub trait TlsHandoff: Send + Sync {
+    /// Is a connection asking for `sni` (lowercase, no trailing dot) yours?
+    fn claims(&self, sni: &str) -> bool;
+    /// Serve it; `peeked` is what was already read from it.
+    fn take(
+        &self,
+        stream: tokio::net::TcpStream,
+        peeked: Vec<u8>,
+        peer: std::net::SocketAddr,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
 }
 
 /// Shared proxy state: a hot-swappable routing snapshot, per-egress circuit
@@ -103,6 +121,8 @@ pub struct ProxyState {
     /// Egresses currently observed unhealthy by the alert watcher, with when
     /// each went down and whether its down alert already fired.
     down: DashMap<String, DownState>,
+    /// The TLS listener is bound right now.
+    https_up: std::sync::atomic::AtomicBool,
 }
 
 /// Per-egress downtime bookkeeping for the alert watcher.
@@ -187,7 +207,13 @@ impl ProxyState {
             upstream,
             stats: ProxyStats::new(switches),
             down: DashMap::new(),
+            https_up: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Whether the TLS listener is up — for a service sharing its port.
+    pub fn https_listening(&self) -> bool {
+        self.https_up.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Hot-rebuild everything from a new config: the routing snapshot

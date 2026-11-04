@@ -500,14 +500,31 @@ domains = [
 # browsers speak DNS over HTTPS. A device can name itself with a client ID —
 # pixel.dns.example.com (TLS) or https://dns.example.com/dns-query/pixel
 # (HTTPS) — and is then that device for profiles, pauses and the log, from
-# wherever it connects. The certificate must cover hostname and *.hostname
-# (for IDs over TLS); renewed files are picked up within ten minutes.
-# Applies without a restart.
+# wherever it connects. At home, ferrite answers hostname and *.hostname with
+# its own address, so devices reach it directly. Applies without a restart.
+#
+# The certificate must cover hostname and *.hostname (for IDs over TLS).
+# With certificate = "letsencrypt" ferrite gets it and renews it itself,
+# proving the name through Cloudflare's API — no port has to be open for
+# that. The token needs the "Edit zone DNS" permission for the zone.
+# With certificate = "files" it reads cert_file/key_file and picks renewed
+# files up within ten minutes.
+#
+# DNS over HTTPS can share 443 with Tunnels: connections asking for
+# hostname are answered here, everything else is routed as before.
 #
 # [secure_dns]
-# enabled   = true
-# hostname  = "dns.example.com"
+# enabled     = true
+# hostname    = "dns.example.com"
+# certificate = "letsencrypt"   # or "files"
+# dot_port    = 853
+# doh_port    = 443             # 0 = off
+#
+# [secure_dns.acme]
+# cloudflare_token = "…"
+# email            = "you@example.com"   # optional
+# staging          = false               # true = test certificates
+#
+# or, with certificate = "files":
 # cert_file = "/etc/letsencrypt/live/dns.example.com/fullchain.pem"
 # key_file  = "/etc/letsencrypt/live/dns.example.com/privkey.pem"
-# dot_port  = 853
-# doh_port  = 443     # 0 = off; pick another if Tunnels use 443

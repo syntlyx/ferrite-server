@@ -2,18 +2,31 @@
 //! settings, what the listeners are doing, and what to type into a device.
 //! A change applies at once, no restart.
 
-use std::sync::Arc;
-
 use axum::{Json, extract::State};
 use serde_json::{Value, json};
 
 use crate::ApiError;
 use ferrite_app::AppState;
-use ferrite_core::config::{Config, SecureDnsConfig};
+use ferrite_core::config::{CertSource, Config, SecureDnsConfig};
 use ferrite_core::error::FeriteError;
 
 fn view(state: &AppState) -> Value {
-    let cfg = state.live_config.read().secure_dns.clone();
+    let mut cfg = state.live_config.read().secure_dns.clone();
+    // The token is never sent back; the panel learns only that there is one.
+    let token_set = cfg.acme.cloudflare_token.take().is_some();
+    let mut status = state.inner.secure_dns.status();
+    // A shared port is only as up as Tunnels' listener on it.
+    if !state.inner.proxy.https_listening() {
+        let down = "Tunnels isn't listening on this port".to_string();
+        if status.doh_shared {
+            status.doh = false;
+            status.doh_error = Some(down.clone());
+        }
+        if status.dot_shared {
+            status.dot = false;
+            status.dot_error = Some(down);
+        }
+    }
     let host = cfg.hostname.clone();
     let doh_url = (!host.is_empty() && cfg.doh_port != 0).then(|| {
         if cfg.doh_port == 443 {
@@ -24,7 +37,8 @@ fn view(state: &AppState) -> Value {
     });
     json!({
         "config": cfg,
-        "status": state.inner.secure_dns.status(),
+        "token_set": token_set,
+        "status": status,
         // What a device is told: Android's Private DNS takes a name only, so
         // DNS over TLS has to be on 853 for it.
         "setup": {
@@ -41,20 +55,34 @@ pub async fn get_secure_dns(State(state): State<AppState>) -> Json<Value> {
 }
 
 /// PUT /api/secure-dns — the whole section; checked, saved, applied at once.
+/// A blank Cloudflare token keeps the one already saved.
 pub async fn put_secure_dns(
     State(state): State<AppState>,
     Json(mut cfg): Json<SecureDnsConfig>,
 ) -> Result<Json<Value>, ApiError> {
     tidy(&mut cfg);
-    {
+    let previous = {
         let live = state.live_config.read();
+        if cfg.acme.cloudflare_token.is_none() {
+            cfg.acme.cloudflare_token = live.secure_dns.acme.cloudflare_token.clone();
+        }
         validate(&cfg, &live).map_err(|m| ApiError(FeriteError::Config(m)))?;
-    }
-    state.live_config.write().secure_dns = cfg.clone();
+        live.secure_dns.hostname.clone()
+    };
+    state.live_config.write().secure_dns = cfg;
     state.persist_config().await;
-    let ctx = Arc::new(state.dns_ctx());
-    state.inner.secure_dns.apply(&cfg, ctx).await;
+    state.inner.dns_cache.forget_name(&previous);
+    state.apply_secure_dns().await;
     Ok(Json(view(&state)))
+}
+
+/// POST /api/secure-dns/renew — ask Let's Encrypt again now, not at the next
+/// try after a failure.
+pub async fn renew_secure_dns(State(state): State<AppState>) -> Json<Value> {
+    state.inner.secure_dns.retry_now();
+    // A moment for the attempt to start, so the answer shows it working.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    Json(view(&state))
 }
 
 fn tidy(cfg: &mut SecureDnsConfig) {
@@ -70,6 +98,13 @@ fn tidy(cfg: &mut SecureDnsConfig) {
             .filter(|p| !p.is_empty())
             .map(Into::into);
     }
+    cfg.acme.email = cfg.acme.email.trim().to_string();
+    cfg.acme.cloudflare_token = cfg
+        .acme
+        .cloudflare_token
+        .take()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
 }
 
 fn valid_hostname(h: &str) -> bool {
@@ -85,6 +120,7 @@ fn valid_hostname(h: &str) -> bool {
 }
 
 /// What would keep the listeners from coming up, said before it is saved.
+/// A port Tunnels listens on is fine: it is shared.
 pub(crate) fn validate(cfg: &SecureDnsConfig, live: &Config) -> Result<(), String> {
     if !cfg.hostname.is_empty() && !valid_hostname(&cfg.hostname) {
         return Err(format!(
@@ -92,14 +128,28 @@ pub(crate) fn validate(cfg: &SecureDnsConfig, live: &Config) -> Result<(), Strin
             cfg.hostname
         ));
     }
+    let email = &cfg.acme.email;
+    if !email.is_empty()
+        && !email
+            .split_once('@')
+            .is_some_and(|(user, domain)| !user.is_empty() && domain.contains('.'))
+    {
+        return Err(format!("{email} isn't an email address"));
+    }
     if !cfg.enabled {
         return Ok(());
     }
     if cfg.hostname.is_empty() {
         return Err("set the name devices connect to, like dns.example.com".into());
     }
-    if cfg.cert_file.is_none() || cfg.key_file.is_none() {
-        return Err("set the certificate and its key".into());
+    match cfg.certificate {
+        CertSource::Files if cfg.cert_file.is_none() || cfg.key_file.is_none() => {
+            return Err("set the certificate and its key".into());
+        }
+        CertSource::Letsencrypt if cfg.acme.cloudflare_token.is_none() => {
+            return Err("set a Cloudflare API token for Let's Encrypt".into());
+        }
+        _ => {}
     }
     if cfg.dot_port == 0 && cfg.doh_port == 0 {
         return Err("turn on DNS over TLS, DNS over HTTPS, or both".into());
@@ -115,11 +165,6 @@ pub(crate) fn validate(cfg: &SecureDnsConfig, live: &Config) -> Result<(), Strin
         if let Some((_, what)) = taken.iter().find(|(p, _)| *p == port) {
             return Err(format!("port {port} is {what}'s"));
         }
-        if live.proxy.enabled && live.proxy.https_port == port {
-            return Err(format!(
-                "port {port} is used by Tunnels — pick another port, like 8443"
-            ));
-        }
     }
     Ok(())
 }
@@ -129,6 +174,7 @@ mod tests {
     use super::*;
     use std::net::SocketAddr;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_rustls::rustls;
@@ -143,10 +189,12 @@ mod tests {
         SecureDnsConfig {
             enabled: true,
             hostname: "dns.test".into(),
+            certificate: CertSource::Files,
             cert_file: Some(testdata("cert.pem")),
             key_file: Some(testdata("key.pem")),
             dot_port: port_dot,
             doh_port: port_doh,
+            ..SecureDnsConfig::default()
         }
     }
 
@@ -171,14 +219,49 @@ mod tests {
                 .contains("plain DNS")
         );
 
+        // Tunnels' port is shared, not a clash.
         let mut tunnels = Config::default();
         tunnels.proxy.enabled = true;
         tunnels.proxy.https_port = 443;
-        assert!(
-            validate(&on(853, 443), &tunnels)
-                .unwrap_err()
-                .contains("Tunnels")
-        );
+        assert_eq!(validate(&on(853, 443), &tunnels), Ok(()));
+
+        let mut le = on(853, 443);
+        le.certificate = CertSource::Letsencrypt;
+        le.cert_file = None;
+        assert!(validate(&le, &live).unwrap_err().contains("Cloudflare"));
+        le.acme.cloudflare_token = Some("t".into());
+        assert_eq!(validate(&le, &live), Ok(()));
+        le.acme.email = "nobody".into();
+        assert!(validate(&le, &live).unwrap_err().contains("email"));
+    }
+
+    #[tokio::test]
+    async fn the_token_is_kept_but_never_shown() {
+        let (state, db, config_path) =
+            ferrite_app::test_support::app_state_with_config_path("secure-dns-token").await;
+        let mut cfg = on(0, 0);
+        cfg.enabled = false;
+        cfg.certificate = CertSource::Letsencrypt;
+        cfg.acme.cloudflare_token = Some(" secret ".into());
+        let Json(v) = put_secure_dns(State(state.clone()), Json(cfg.clone()))
+            .await
+            .unwrap();
+        assert_eq!(v["token_set"], true);
+        assert!(v["config"]["acme"]["cloudflare_token"].is_null(), "{v}");
+        assert!(!v.to_string().contains("secret"));
+
+        // Sent back blank, as the panel does: the saved one stays.
+        cfg.acme.cloudflare_token = None;
+        cfg.acme.email = "me@example.com".into();
+        let _ = put_secure_dns(State(state.clone()), Json(cfg))
+            .await
+            .unwrap();
+        let live = state.live_config.read().secure_dns.acme.clone();
+        assert_eq!(live.cloudflare_token.as_deref(), Some("secret"));
+        assert_eq!(live.email, "me@example.com");
+
+        ferrite_app::test_support::cleanup_sqlite(&db);
+        let _ = std::fs::remove_file(&config_path);
     }
 
     /// Accepts any certificate — the test one is self-signed.
@@ -360,6 +443,84 @@ mod tests {
                 .await
                 .is_err()
         );
+
+        ferrite_app::test_support::cleanup_sqlite(&db);
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    async fn doh_get(port: u16, sni: &str, path: &str, id: u16) -> Vec<u8> {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(home_query(id));
+        let mut https = connect(port, sni, b"http/1.1").await;
+        https
+            .write_all(
+                format!(
+                    "GET {path}?dns={b64} HTTP/1.1\r\nHost: {sni}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        let _ = https.read_to_end(&mut response).await;
+        response
+    }
+
+    #[tokio::test]
+    async fn https_shares_the_tunnels_port_by_name() {
+        let (state, db, config_path) =
+            ferrite_app::test_support::app_state_with_config_path("secure-dns-shared").await;
+        state
+            .inner
+            .custom_records
+            .add(&ferrite_core::config::CustomRecordConfig {
+                domain: "home.test".into(),
+                record_type: "A".into(),
+                value: "10.0.0.7".into(),
+                ttl: 60,
+            })
+            .unwrap();
+        let mut log = state.query_rx.lock().take().unwrap();
+
+        // Tunnels on: it owns the TLS port.
+        let shared = free_port();
+        let mut tunnels = state.live_config.read().proxy.clone();
+        tunnels.enabled = true;
+        tunnels.https_port = shared;
+        tunnels.http_port = free_port();
+        state.inner.proxy.reload(&tunnels);
+        state.live_config.write().proxy = tunnels.clone();
+        tokio::spawn(ferrite_proxy::run(state.proxy_ctx()));
+        for _ in 0..100 {
+            if state.inner.proxy.https_listening() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let Json(v) = put_secure_dns(State(state.clone()), Json(on(free_port(), shared)))
+            .await
+            .unwrap();
+        assert_eq!(v["status"]["doh"], true, "{v}");
+        assert_eq!(v["status"]["doh_shared"], true, "{v}");
+
+        // Our name on Tunnels' port: answered here, device named in the TLS name.
+        let response = doh_get(shared, "tv.dns.test", "/dns-query", 11).await;
+        let head = String::from_utf8_lossy(&response[..response.len().min(64)]).to_string();
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(&response[response.len() - 4..], &[10, 0, 0, 7]);
+        assert_eq!(log.recv().await.unwrap().device, "id:tv");
+
+        // Tunnels off: encrypted DNS takes the port over itself.
+        tunnels.enabled = false;
+        state.inner.proxy.reload(&tunnels);
+        state.live_config.write().proxy = tunnels;
+        state.apply_secure_dns().await;
+        let Json(v) = get_secure_dns(State(state.clone())).await;
+        assert_eq!(v["status"]["doh"], true, "{v}");
+        assert_eq!(v["status"]["doh_shared"], false, "{v}");
+        let response = doh_get(shared, "dns.test", "/dns-query/tv", 12).await;
+        assert_eq!(&response[response.len() - 4..], &[10, 0, 0, 7]);
 
         ferrite_app::test_support::cleanup_sqlite(&db);
         let _ = std::fs::remove_file(&config_path);

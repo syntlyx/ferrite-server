@@ -9,6 +9,7 @@
 //! for a host we don't route).
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -83,6 +84,7 @@ pub async fn run(ctx: ProxyCtx) {
         for h in session {
             let _ = h.await;
         }
+        ctx.proxy.https_up.store(false, Ordering::Relaxed);
     }
 }
 
@@ -114,6 +116,7 @@ async fn start_session(ctx: &ProxyCtx) -> Vec<tokio::task::JoinHandle<()>> {
         return Vec::new();
     }
 
+    ctx.proxy.https_up.store(https.is_some(), Ordering::Relaxed);
     let mut handles = Vec::new();
     if let Some(listener) = https {
         tracing::info!("proxy: TLS/SNI listener on 0.0.0.0:{}", cfg.https_port);
@@ -137,11 +140,20 @@ async fn start_session(ctx: &ProxyCtx) -> Vec<tokio::task::JoinHandle<()>> {
 }
 
 async fn bind(port: u16) -> Option<TcpListener> {
-    match TcpListener::bind(("0.0.0.0", port)).await {
-        Ok(l) => Some(l),
-        Err(e) => {
-            tracing::warn!("proxy: failed to bind 0.0.0.0:{port}: {e}");
-            None
+    // A port another listener is letting go of — encrypted DNS handing :443
+    // over when Tunnels comes on — may take a moment to come free.
+    let mut tries = 0;
+    loop {
+        match TcpListener::bind(("0.0.0.0", port)).await {
+            Ok(l) => return Some(l),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && tries < 12 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(e) => {
+                tracing::warn!("proxy: failed to bind 0.0.0.0:{port}: {e}");
+                return None;
+            }
         }
     }
 }
@@ -213,6 +225,18 @@ async fn handle(mut client: TcpStream, ctx: ProxyCtx, proto: Protocol) -> std::i
             return Ok(());
         }
     };
+
+    // Another service's name on the shared TLS port: its connection, not ours
+    // to route (and forwarding it "direct" would only come back here).
+    if matches!(proto, Protocol::Tls)
+        && let Some(handoff) = &ctx.tls_handoff
+        && handoff.claims(&host)
+    {
+        if let Ok(peer) = client.peer_addr() {
+            handoff.take(client, buf, peer).await;
+        }
+        return Ok(());
+    }
 
     splice_through(client, ctx, proto, host, buf).await
 }

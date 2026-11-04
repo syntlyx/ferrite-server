@@ -132,6 +132,7 @@ pub fn build_router(state: AppState) -> Router {
             "/secure-dns",
             get(secure_dns::get_secure_dns).put(secure_dns::put_secure_dns),
         )
+        .route("/secure-dns/renew", post(secure_dns::renew_secure_dns))
         .route("/sync", get(sync::get_sync).put(sync::put_sync))
         .route("/sync/now", post(sync::sync_now))
         // Bring a Pi-hole or AdGuard Home setup over (a Teleporter archive

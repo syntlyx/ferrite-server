@@ -262,13 +262,9 @@ async fn run() -> anyhow::Result<()> {
     }
 
     // Encrypted DNS for devices — off unless switched on.
-    {
-        let secure = state.live_config.read().secure_dns.clone();
-        if secure.enabled {
-            let ctx = Arc::new(state.dns_ctx());
-            let state = state.clone();
-            tokio::spawn(async move { state.inner.secure_dns.apply(&secure, ctx).await });
-        }
+    if state.live_config.read().secure_dns.enabled {
+        let state = state.clone();
+        tokio::spawn(async move { state.apply_secure_dns().await });
     }
 
     // ── Selective routing / proxy ─────────────────────────────────────────────
