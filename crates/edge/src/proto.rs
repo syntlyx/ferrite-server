@@ -11,7 +11,14 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// The protocol a box speaks; a relay turns away one it doesn't know.
-pub const PROTOCOL: u32 = 1;
+/// 2 added the challenge a box publishes through the relay's DNS.
+pub const PROTOCOL: u32 = 2;
+/// The oldest a relay still lets in.
+pub const PROTOCOL_MIN: u32 = 1;
+/// A challenge holds this many values at most (a name and its wildcard need
+/// two), each this long at most.
+pub const CHALLENGE_VALUES: usize = 4;
+pub const CHALLENGE_VALUE_LEN: usize = 255;
 /// A control line longer than this is a broken peer.
 const MAX_LINE: usize = 64 * 1024;
 const OPENING_VERSION: u8 = 1;
@@ -22,14 +29,27 @@ pub enum Control {
     /// Box → relay, first thing.
     Hello { protocol: u32, software: String },
     /// Relay → box: it's in. `name` is the box's own name under the relay's
-    /// zone; `names` everything the relay passes on to it.
+    /// zone; `names` everything the relay passes on to it. `dns`: the relay
+    /// answers its zone's DNS, so the box can get a certificate for its
+    /// name through it ([`Control::Challenge`]).
     Welcome {
         id: String,
         name: String,
         names: Vec<String>,
+        #[serde(default)]
+        dns: bool,
     },
     /// Relay → box: not now, and why. The relay closes the connection.
     Refused { reason: String },
+    /// Box → relay: answer `_acme-challenge.<name>` with these TXT values
+    /// (none: stop answering it). A box can only set its own.
+    Challenge { values: Vec<String> },
+    /// Relay → box, to a [`Control::Challenge`]: it is answered now, or why
+    /// not.
+    Published {
+        #[serde(default)]
+        error: Option<String>,
+    },
 }
 
 pub async fn send<W: AsyncWrite + Unpin>(w: &mut W, msg: &Control) -> io::Result<()> {
@@ -138,7 +158,12 @@ mod tests {
                 id: "abc".into(),
                 name: "abc.r.test".into(),
                 names: vec!["abc.r.test".into(), "*.abc.r.test".into()],
+                dns: true,
             },
+            Control::Challenge {
+                values: vec!["v1".into(), "v2".into()],
+            },
+            Control::Published { error: None },
         ];
         let mut wire = Vec::new();
         for m in &msgs {
@@ -149,5 +174,15 @@ mod tests {
             assert_eq!(recv(&mut r).await.unwrap().as_ref(), Some(m));
         }
         assert_eq!(recv(&mut r).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_welcome_without_dns_is_a_relay_without_it() {
+        let line = b"{\"type\":\"welcome\",\"id\":\"a\",\"name\":\"a.r\",\"names\":[]}\n";
+        let mut r = tokio::io::BufReader::new(&line[..]);
+        assert!(matches!(
+            recv(&mut r).await.unwrap(),
+            Some(Control::Welcome { dns: false, .. })
+        ));
     }
 }

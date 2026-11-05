@@ -509,6 +509,10 @@ domains = [
 # that. The token needs the "Edit zone DNS" permission for the zone.
 # With certificate = "files" it reads cert_file/key_file and picks renewed
 # files up within ten minutes.
+# With certificate = "relay" there's nothing to own: the box is named
+# <id>.<zone> under its relay's zone (see [relay]), which fills in hostname,
+# and gets its Let's Encrypt certificate with the relay answering the
+# challenge. The key never leaves the box.
 #
 # DNS over HTTPS can share 443 with Tunnels: connections asking for
 # hostname are answered here, everything else is routed as before.
@@ -516,7 +520,7 @@ domains = [
 # [secure_dns]
 # enabled     = true
 # hostname    = "dns.example.com"
-# certificate = "letsencrypt"   # or "files"
+# certificate = "letsencrypt"   # or "files", or "relay"
 # dot_port    = 853
 # doh_port    = 443             # 0 = off
 # http3       = true            # DoH over HTTP/3 too, on UDP doh_port

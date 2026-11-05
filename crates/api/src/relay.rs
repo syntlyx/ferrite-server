@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use crate::ApiError;
 use ferrite_app::AppState;
-use ferrite_core::config::RelayConfig;
+use ferrite_core::config::{CertSource, RelayConfig};
 use ferrite_core::error::FeriteError;
 
 fn view(state: &AppState) -> Value {
@@ -63,6 +63,10 @@ pub async fn put_relay(
     state
         .apply_relay()
         .map_err(|e| ApiError(FeriteError::Config(e)))?;
+    // Encrypted DNS named through the relay follows it, gone or changed.
+    if state.live_config.read().secure_dns.certificate == CertSource::Relay {
+        state.apply_secure_dns().await;
+    }
     Ok(Json(view(&state)))
 }
 
@@ -173,6 +177,7 @@ mod tests {
                 id: id.clone(),
                 name: format!("{id}.r.test"),
                 names: vec![],
+                dns: false,
             },
         )
         .await

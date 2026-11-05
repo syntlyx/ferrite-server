@@ -1010,6 +1010,7 @@ dependencies = [
  "bytes",
  "ferrite-core",
  "ferrite-dns",
+ "ferrite-edge",
  "h3",
  "h3-quinn",
  "hex",

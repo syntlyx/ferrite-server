@@ -152,6 +152,8 @@ struct Renewal {
     hostname: String,
     acme: AcmeConfig,
     dir: PathBuf,
+    /// Let's Encrypt through Cloudflare, or through the relay.
+    source: CertSource,
 }
 
 /// The encrypted listeners; [`SecureDns::apply`] brings them in line with the
@@ -175,6 +177,8 @@ pub struct SecureDns {
     applied: Mutex<Option<(SecureDnsConfig, Option<u16>)>>,
     /// Profile links handed out: token → (device, made at).
     links: Mutex<HashMap<String, (String, Instant)>>,
+    /// The relay the box is connected to, for a certificate through it.
+    relay: ArcSwapOption<ferrite_edge::client::Client>,
 }
 
 impl SecureDns {
@@ -192,7 +196,14 @@ impl SecureDns {
             gate: Arc::new(gate::Gate::default()),
             applied: Mutex::new(None),
             links: Mutex::new(HashMap::new()),
+            relay: ArcSwapOption::empty(),
         })
+    }
+
+    /// The relay the box is connected to now, if any: where a certificate
+    /// through the relay comes from.
+    pub fn set_relay(&self, client: Option<Arc<ferrite_edge::client::Client>>) {
+        self.relay.store(client);
     }
 
     pub fn status(&self) -> SecureDnsStatus {
@@ -333,14 +344,31 @@ impl SecureDns {
                     Arc::clone(self).watch_cert(cert_file, key_file),
                 ));
             }
-            CertSource::Letsencrypt => {
-                if cfg
-                    .acme
-                    .cloudflare_token
-                    .as_deref()
-                    .is_none_or(|t| t.trim().is_empty())
+            CertSource::Letsencrypt | CertSource::Relay => {
+                if cfg.certificate == CertSource::Letsencrypt
+                    && cfg
+                        .acme
+                        .cloudflare_token
+                        .as_deref()
+                        .is_none_or(|t| t.trim().is_empty())
                 {
                     return Err("set a Cloudflare API token for Let's Encrypt".into());
+                }
+                if cfg.certificate == CertSource::Relay {
+                    let Some(relay) = self.relay.load_full() else {
+                        return Err("connect to a relay first (Settings → Relay)".into());
+                    };
+                    // The name is the relay's to give: until it has, the
+                    // one kept from last time serves.
+                    let st = relay.status();
+                    if let Some(name) = st.name.as_deref()
+                        && name != hostname
+                    {
+                        return Err(format!("the name through the relay is {name}"));
+                    }
+                    if st.connected && !st.dns {
+                        return Err("the relay doesn't give certificates: its DNS is off".into());
+                    }
                 }
                 let dir = if cfg.acme.staging {
                     self.dir.join("staging")
@@ -364,6 +392,7 @@ impl SecureDns {
                     hostname: hostname.clone(),
                     acme: cfg.acme.clone(),
                     dir,
+                    source: cfg.certificate,
                 });
             }
         }
@@ -522,7 +551,7 @@ impl SecureDns {
         } else {
             Default_::Https
         };
-        serve(stream, from, &serving, default).await;
+        serve(stream, from, &serving, default, true).await;
         drop(slot);
     }
 
@@ -541,6 +570,7 @@ impl SecureDns {
             peer,
             &shared.serving,
             shared.default,
+            false,
         )
         .await;
         drop(slot);
@@ -604,7 +634,22 @@ impl SecureDns {
                         }
                     };
                     tracing::info!("secure dns: asking Let's Encrypt for {}", r.hostname);
-                    let issued = acme::issue(&r.dir, &r.hostname, &r.acme, &step).await;
+                    // The relay as it is now: it may have been set up anew
+                    // since this started.
+                    let proof = match r.source {
+                        CertSource::Relay => self
+                            .relay
+                            .load_full()
+                            .map(acme::Proof::Relay)
+                            .ok_or_else(|| "not connected to a relay".to_string()),
+                        _ => Ok(acme::Proof::Cloudflare(
+                            r.acme.cloudflare_token.clone().unwrap_or_default(),
+                        )),
+                    };
+                    let issued = match &proof {
+                        Ok(proof) => acme::issue(&r.dir, &r.hostname, &r.acme, proof, &step).await,
+                        Err(e) => Err(e.clone()),
+                    };
                     let (cert_file, key_file) = acme::files(&r.dir, &r.hostname);
                     match issued.and_then(|()| cert::load(&cert_file, &key_file)) {
                         Ok((key, info)) => {
@@ -700,14 +745,16 @@ async fn accept_loop(listener: TcpListener, serving: Arc<Serving>, default: Defa
         let _ = stream.set_nodelay(true);
         let serving = Arc::clone(&serving);
         tokio::spawn(async move {
-            serve(stream, peer, &serving, default).await;
+            serve(stream, peer, &serving, default, false).await;
             drop(slot);
         });
     }
 }
 
 /// The handshake, then DNS over HTTPS or over TLS as it negotiated.
-async fn serve<S>(stream: S, peer: SocketAddr, serving: &Serving, default: Default_)
+/// `relayed`: it came through a relay, which passes TCP only — so no
+/// pointing the device at HTTP/3 it couldn't reach.
+async fn serve<S>(stream: S, peer: SocketAddr, serving: &Serving, default: Default_, relayed: bool)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -731,7 +778,11 @@ where
     };
     let (ctx, gate) = (Arc::clone(&serving.ctx), Arc::clone(&serving.gate));
     if https {
-        let h3 = Arc::clone(&serving.h3_port);
+        let h3 = if relayed {
+            Arc::new(AtomicU16::new(0))
+        } else {
+            Arc::clone(&serving.h3_port)
+        };
         doh::serve(tls, peer, sni_id, ctx, gate, h3).await;
     } else {
         dot::serve(tls, peer, sni_id, ctx, gate).await;

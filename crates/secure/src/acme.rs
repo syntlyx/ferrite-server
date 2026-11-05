@@ -1,8 +1,9 @@
 //! Certificates from Let's Encrypt, proven over DNS (DNS-01): the challenge
-//! goes into a TXT record through the DNS provider's API, ferrite waits until
-//! the zone's own name servers answer with it, and then asks for the
-//! certificate for the name and `*.name`. No port has to be open for this,
-//! and a wildcard — client IDs over TLS — can only be had this way.
+//! goes into a TXT record — through the DNS provider's API, waiting until
+//! the zone's own name servers answer with it, or handed to the relay whose
+//! zone the name is in, which answers it at once — and then ferrite asks
+//! for the certificate for the name and `*.name`. No port has to be open
+//! for this, and a wildcard — client IDs over TLS — can only be had this way.
 //!
 //! What it keeps, in its own directory (one for production, another for
 //! staging): the Let's Encrypt account, and per name the certificate chain
@@ -11,6 +12,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hickory_proto::op::{Message, MessageType, OpCode, Query};
@@ -24,6 +26,14 @@ use instant_acme::{
 use ferrite_core::config::AcmeConfig;
 
 use crate::cloudflare::{Cloudflare, Zone};
+
+/// How the name is proven: who puts the challenge in DNS.
+pub(crate) enum Proof {
+    /// Through Cloudflare's API, with this token.
+    Cloudflare(String),
+    /// The relay the box is connected to, which answers its zone's DNS.
+    Relay(Arc<ferrite_edge::client::Client>),
+}
 
 /// How long the TXT record may take to reach the zone's name servers.
 const PROPAGATION: Duration = Duration::from_secs(180);
@@ -126,19 +136,33 @@ pub(crate) async fn issue(
     dir: &Path,
     hostname: &str,
     cfg: &AcmeConfig,
+    proof: &Proof,
     step: &(dyn Fn(&'static str) + Send + Sync),
 ) -> Result<(), String> {
-    let token = cfg
-        .cloudflare_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .ok_or("set a Cloudflare API token")?;
-    let cf = Cloudflare::new(token);
-    // The token is checked before Let's Encrypt is asked anything: its
-    // failed attempts count against a limit, Cloudflare's don't.
-    step("finding the zone");
-    let zone = cf.zone_for(hostname).await?;
+    // What proving the name takes is checked before Let's Encrypt is asked
+    // anything: its failed attempts count against a limit.
+    let cloudflare = match proof {
+        Proof::Cloudflare(token) => {
+            let token = token.trim();
+            if token.is_empty() {
+                return Err("set a Cloudflare API token".into());
+            }
+            let cf = Cloudflare::new(token);
+            step("finding the zone");
+            let zone = cf.zone_for(hostname).await?;
+            Some((cf, zone))
+        }
+        Proof::Relay(client) => {
+            let st = client.status();
+            if !st.connected {
+                return Err("not connected to the relay".into());
+            }
+            if !st.dns {
+                return Err("the relay doesn't answer its zone's DNS".into());
+            }
+            None
+        }
+    };
     step("opening the request");
     let account = account(dir, cfg).await?;
     let names = [
@@ -170,17 +194,30 @@ pub(crate) async fn issue(
     }
 
     let mut added = Vec::new();
+    let mut published = false;
     let outcome = async {
         if !values.is_empty() {
-            step("adding the TXT record");
-            for id in cf.leftovers(&zone, &record).await.unwrap_or_default() {
-                let _ = cf.delete(&zone, &id).await;
+            match (&cloudflare, proof) {
+                (Some((cf, zone)), _) => {
+                    step("adding the TXT record");
+                    for id in cf.leftovers(zone, &record).await.unwrap_or_default() {
+                        let _ = cf.delete(zone, &id).await;
+                    }
+                    for value in &values {
+                        added.push(cf.add_txt(zone, &record, value).await?);
+                    }
+                    step("waiting for the record to show up");
+                    visible(zone, &record, &values).await?;
+                }
+                (None, Proof::Relay(client)) => {
+                    // The relay is the zone's name server: answered as
+                    // soon as it says so.
+                    step("handing the challenge to the relay");
+                    client.publish(values.clone()).await?;
+                    published = true;
+                }
+                (None, Proof::Cloudflare(_)) => unreachable!("checked above"),
             }
-            for value in &values {
-                added.push(cf.add_txt(&zone, &record, value).await?);
-            }
-            step("waiting for the record to show up");
-            visible(&zone, &record, &values).await?;
             let mut authorizations = order.authorizations();
             while let Some(authz) = authorizations.next().await {
                 let mut authz = authz.map_err(acme_err)?;
@@ -210,10 +247,18 @@ pub(crate) async fn issue(
     }
     .await;
 
-    for id in added {
-        if let Err(e) = cf.delete(&zone, &id).await {
-            tracing::warn!("acme: couldn't remove the challenge record from {record}: {e}");
+    if let Some((cf, zone)) = &cloudflare {
+        for id in added {
+            if let Err(e) = cf.delete(zone, &id).await {
+                tracing::warn!("acme: couldn't remove the challenge record from {record}: {e}");
+            }
         }
+    }
+    if published
+        && let Proof::Relay(client) = proof
+        && let Err(e) = client.publish(Vec::new()).await
+    {
+        tracing::warn!("acme: the relay still answers the challenge: {e}");
     }
     let (chain, key) = outcome?;
     let (cert_file, key_file) = files(dir, hostname);

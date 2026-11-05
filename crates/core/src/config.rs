@@ -1280,6 +1280,10 @@ pub enum CertSource {
     /// ferrite asks Let's Encrypt and renews it, proving the name through
     /// the DNS provider's API (DNS-01), so no port has to be open for it.
     Letsencrypt,
+    /// The box's name under its relay's zone, `<id>.<zone>`, with a Let's
+    /// Encrypt certificate the relay's DNS helps prove: no domain or DNS
+    /// provider of your own. The key stays on the box.
+    Relay,
 }
 
 /// `[secure_dns.acme]`: getting the certificate from Let's Encrypt.

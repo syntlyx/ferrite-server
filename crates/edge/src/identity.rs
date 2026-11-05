@@ -43,6 +43,13 @@ pub fn id_of(public_key: &[u8]) -> String {
         .to_ascii_lowercase()
 }
 
+/// Could `s` be a box's ID: 16 of base32's letters and digits, lowercase.
+pub fn is_id(s: &str) -> bool {
+    s.len() == 16
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
+}
+
 /// How a key is pinned: `sha256:` and its hash in hex.
 pub fn pin_of(key_hash: &[u8; 32]) -> String {
     format!("sha256:{}", hex::encode(key_hash))

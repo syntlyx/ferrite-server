@@ -67,6 +67,22 @@ pub async fn put_secure_dns(
     Json(mut cfg): Json<SecureDnsConfig>,
 ) -> Result<Json<Value>, ApiError> {
     tidy(&mut cfg);
+    // Named through the relay: its name is the relay's to give, or the one
+    // it gave last time.
+    if cfg.certificate == CertSource::Relay {
+        let given = state
+            .inner
+            .relay
+            .lock()
+            .as_ref()
+            .and_then(|r| r.client.status().name);
+        let kept = state.live_config.read().secure_dns.hostname.clone();
+        if let Some(name) = given {
+            cfg.hostname = name;
+        } else if !kept.is_empty() {
+            cfg.hostname = kept;
+        }
+    }
     let previous = {
         let live = state.live_config.read();
         if cfg.acme.cloudflare_token.is_none() {
@@ -288,8 +304,14 @@ pub(crate) fn validate(cfg: &SecureDnsConfig, live: &Config) -> Result<(), Strin
     if !cfg.enabled {
         return Ok(());
     }
+    if cfg.certificate == CertSource::Relay && !live.relay.enabled {
+        return Err("connect to a relay first (Settings → Relay)".into());
+    }
     if cfg.hostname.is_empty() {
-        return Err("set the name devices connect to, like dns.example.com".into());
+        return Err(match cfg.certificate {
+            CertSource::Relay => "the relay hasn't given this box its name yet".into(),
+            _ => "set the name devices connect to, like dns.example.com".into(),
+        });
     }
     match cfg.certificate {
         CertSource::Files if cfg.cert_file.is_none() || cfg.key_file.is_none() => {
@@ -382,6 +404,16 @@ mod tests {
         assert_eq!(validate(&le, &live), Ok(()));
         le.acme.email = "nobody".into();
         assert!(validate(&le, &live).unwrap_err().contains("email"));
+
+        // Through the relay: only with one, and with the name it gave.
+        let mut via = on(853, 443);
+        via.certificate = CertSource::Relay;
+        assert!(validate(&via, &live).unwrap_err().contains("relay"));
+        let mut with_relay = live.clone();
+        with_relay.relay.enabled = true;
+        assert_eq!(validate(&via, &with_relay), Ok(()));
+        via.hostname.clear();
+        assert!(validate(&via, &with_relay).unwrap_err().contains("name"));
 
         // Device names are read as client IDs, each once.
         let mut named = on(853, 443);

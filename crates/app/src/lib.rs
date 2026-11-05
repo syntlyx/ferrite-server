@@ -89,6 +89,8 @@ pub struct RelayRun {
     /// What it was started with: a change starts it over.
     pub config: ferrite_core::config::RelayConfig,
     task: tokio::task::JoinHandle<()>,
+    /// Follows the connection, for encrypted DNS named through the relay.
+    watcher: tokio::task::JoinHandle<()>,
 }
 
 /// What a relay passes on: devices' encrypted DNS, to be served here.
@@ -358,7 +360,9 @@ impl AppState {
         }
         if let Some(old) = slot.take() {
             old.task.abort();
+            old.watcher.abort();
         }
+        self.inner.secure_dns.set_relay(None);
         if !cfg.enabled {
             return Ok(());
         }
@@ -373,12 +377,55 @@ impl AppState {
         tracing::info!("relay: connecting to {} as box {}", cfg.server, client.id());
         let inbound = Arc::new(RelayInbound(Arc::clone(&self.inner.secure_dns)));
         let task = tokio::spawn(Arc::clone(&client).run(inbound));
+        self.inner.secure_dns.set_relay(Some(Arc::clone(&client)));
+        let watcher = {
+            let state = self.clone();
+            let mut rx = client.subscribe();
+            tokio::spawn(async move {
+                let mut last = None;
+                while rx.changed().await.is_ok() {
+                    let st = rx.borrow_and_update().clone();
+                    let now = (st.connected, st.name.clone(), st.dns);
+                    if last.as_ref() != Some(&now) {
+                        last = Some(now);
+                        state.relay_changed(&st).await;
+                    }
+                }
+            })
+        };
         *slot = Some(RelayRun {
             client,
             config: cfg,
             task,
+            watcher,
         });
         Ok(())
+    }
+
+    /// The relay connection came or went. Encrypted DNS named through the
+    /// relay takes the name the relay gives — kept in the config, so it
+    /// serves the same name while the relay is away — and is applied again,
+    /// which gets its certificate going once the relay is there.
+    async fn relay_changed(&self, st: &ferrite_edge::client::Status) {
+        let renamed = {
+            let mut live = self.live_config.write();
+            let sd = &mut live.secure_dns;
+            if sd.certificate != ferrite_core::config::CertSource::Relay {
+                return;
+            }
+            match st.name.as_deref() {
+                Some(name) if sd.hostname != name => {
+                    tracing::info!("secure dns: named {name} through the relay");
+                    sd.hostname = name.to_string();
+                    true
+                }
+                _ => false,
+            }
+        };
+        if renamed {
+            self.persist_config().await;
+        }
+        self.apply_secure_dns().await;
     }
 
     /// Keep `[secure_dns] owners` in line with the device list: a device
