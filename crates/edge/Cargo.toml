@@ -9,8 +9,9 @@ publish.workspace = true
 # What a box and the relay share, kept apart from the rest of ferrite so the
 # relay (its own project) needs only this: reading a connection's first bytes
 # without opening it (the name a TLS connection asks for, a PROXY header),
-# the keys boxes and relays are known by, the relay protocol, and the client
-# a box runs to keep its connection to a relay.
+# the keys boxes and relays are known by, the relay protocol, the client a
+# box runs to keep its connection to a relay, and how a box signs what it
+# asks the ferrite cloud.
 
 [dependencies]
 data-encoding.workspace = true
