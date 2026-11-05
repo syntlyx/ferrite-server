@@ -398,7 +398,7 @@ fail_closed = true        # if the egress is down, refuse rather than leak the c
 clients = []              # empty = all devices; or restrict by IP/MAC
 ```
 
-A rule can name a catalog service instead of a pattern — `service = "netflix"` —
+A rule can name a catalog service instead of a pattern — `service = "reddit"` —
 for every domain the service uses.
 
 The HTTP listener is shared with the panel on `:80` (demuxed by `Host`); TLS is
