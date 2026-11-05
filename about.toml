@@ -1,0 +1,31 @@
+# Licence notices for the third-party crates compiled into ferrite, shipped
+# as THIRD-PARTY-LICENSES.txt in every release archive:
+#   cargo about generate --locked about.hbs -o THIRD-PARTY-LICENSES.txt
+# All four release targets, so one file covers every archive.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "0BSD",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+]
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+ignore-build-dependencies = false
+ignore-dev-dependencies = true
+workarounds = ["ring", "rustls"]
+# ferrite's own crates are covered by its LICENSE, not listed as third party.
+private = { ignore = true }

@@ -12,6 +12,8 @@ version = "0.2.0"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
+# Not on crates.io: ferrite ships as a binary.
+publish = false
 
 # One authoritative version/feature spec per dependency; member crates opt in
 # with `<name>.workspace = true`.

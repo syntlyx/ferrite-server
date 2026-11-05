@@ -3,6 +3,8 @@ name = "ferrite-app"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
 
 [features]
 # Un-gates the AppState test builder (test_support) for other crates' tests.

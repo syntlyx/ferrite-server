@@ -39,3 +39,13 @@ jobs:
 
       - name: cargo test
         run: cargo test --all --locked
+
+      # A new dependency under a licence about.toml doesn't accept fails
+      # here, not on release day.
+      - name: Install cargo-about
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+
+      - name: Third-party licence notices
+        run: cargo about generate --locked about.hbs -o THIRD-PARTY-LICENSES.txt

@@ -3,6 +3,8 @@ name = "ferrite-storage"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
 
 [features]
 # Exposes `SqliteStorage::seed_legacy_config_tables` so other crates can test

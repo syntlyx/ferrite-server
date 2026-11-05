@@ -61,6 +61,17 @@ jobs:
         if: runner.os == 'macOS'
         run: cargo build --profile dist --locked --target "${{ matrix.target }}"
 
+      - name: Install cargo-about
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+
+      # The licences of the crates compiled in, which they ask to travel with
+      # the binary. about.toml covers all four targets, so every archive gets
+      # the same file.
+      - name: Third-party licence notices
+        run: cargo about generate --locked about.hbs -o THIRD-PARTY-LICENSES.txt
+
       - name: Package archive
         shell: bash
         env:
@@ -70,7 +81,10 @@ jobs:
           set -euo pipefail
           mkdir -p artifacts
           archive="artifacts/ferrite-${VERSION}-${TARGET}.tar.gz"
-          tar -czf "$archive" -C "target/${TARGET}/dist" ferrite
+          # The binary stays at the top: installers and the updater look for
+          # `ferrite` by name and pass over the rest.
+          tar -czf "$archive" -C "target/${TARGET}/dist" ferrite \
+            -C "$GITHUB_WORKSPACE" LICENSE THIRD-PARTY-LICENSES.txt
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$archive" > "${archive}.sha256"
           else

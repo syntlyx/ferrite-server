@@ -3,6 +3,8 @@ name = "ferrite-edge"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
 
 # What a box and the relay share, kept apart from the rest of ferrite so the
 # relay (its own project) needs only this: reading a connection's first bytes
