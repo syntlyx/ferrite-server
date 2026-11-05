@@ -187,6 +187,25 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
+    // ── SIGHUP: restart in place ─────────────────────────────────────────────
+    // What a service manager's "reload" sends (systemd's ExecReload, OpenRC's
+    // `reload`): a fresh process from the binary on disk, keeping the DNS and
+    // panel sockets, so not a query is dropped.
+    #[cfg(unix)]
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let Ok(mut hup) = signal(SignalKind::hangup()) else {
+                return;
+            };
+            if hup.recv().await.is_some() {
+                tracing::info!("SIGHUP: restarting in place");
+                state.restart_in_place();
+            }
+        });
+    }
+
     // ── Shutdown handler ─────────────────────────────────────────────────────
     {
         let state_for_shutdown = state.clone();

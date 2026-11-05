@@ -530,6 +530,9 @@ User=${SERVICE_USER}
 Group=${SERVICE_GROUP}
 
 ExecStart=${SERVICE_BIN}
+# Reload = restart in place: a fresh process from the binary on disk, keeping
+# the DNS and panel sockets, so not a query is dropped.
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
 RestartSec=5
 TimeoutStopSec=30
@@ -611,6 +614,15 @@ error_log="/var/log/ferrite.log"
 depend() {
     need net
     after firewall
+}
+
+# Reload = restart in place: a fresh process from the binary on disk, keeping
+# the DNS and panel sockets, so not a query is dropped.
+extra_started_commands="reload"
+reload() {
+    ebegin "Restarting \${RC_SVCNAME} in place"
+    supervise-daemon "\${RC_SVCNAME}" --signal HUP
+    eend \$?
 }
 EOF
     chmod +x "$OPENRC_SERVICE"

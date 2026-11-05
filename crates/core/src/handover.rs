@@ -169,6 +169,8 @@ fn exec() -> std::io::Error {
     for (_, fd) in &held {
         set_cloexec(*fd, false);
     }
+    #[cfg(target_os = "linux")]
+    keep_capabilities();
     tracing::info!("restarting in place, handing over {}", render(&held));
     let err = std::process::Command::new(&exe)
         .args(std::env::args_os().skip(1))
@@ -179,6 +181,71 @@ fn exec() -> std::io::Error {
         set_cloexec(*fd, true);
     }
     err
+}
+
+/// Carry this process's capabilities over to the next image. Granted as the
+/// binary's own (`setcap` on the file), they belong to that file: a
+/// self-update writes a new one without them, and the image `exec`ed from it
+/// would start with none — no port 443 or 853, no DHCP, no kernel WireGuard.
+/// Raised into the ambient set they go with the process instead, whatever the
+/// new file carries. Granted by the service manager (systemd's
+/// `AmbientCapabilities`, OpenRC's `capabilities=`) they are ambient already,
+/// and this changes nothing. Best effort: a refusal leaves things as they were.
+#[cfg(target_os = "linux")]
+fn keep_capabilities() {
+    #[repr(C)]
+    struct Header {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Data {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    const VERSION_3: u32 = 0x2008_0522;
+    let mut header = Header {
+        version: VERSION_3,
+        pid: 0,
+    };
+    let mut data = [Data::default(); 2];
+    // SAFETY: capget/capset with a version-3 header and the two data words it
+    // takes; prctl with plain integers.
+    unsafe {
+        if libc::syscall(
+            libc::SYS_capget,
+            &mut header as *mut Header,
+            data.as_mut_ptr(),
+        ) != 0
+        {
+            return;
+        }
+        if data.iter().all(|d| d.permitted == 0) {
+            return;
+        }
+        // A capability is raised into the ambient set only once it's
+        // inheritable as well as permitted.
+        for d in &mut data {
+            d.inheritable |= d.permitted;
+        }
+        if libc::syscall(libc::SYS_capset, &mut header as *mut Header, data.as_ptr()) != 0 {
+            tracing::warn!("couldn't keep capabilities across the restart: capset refused");
+            return;
+        }
+        for cap in 0..64u32 {
+            if data[(cap / 32) as usize].permitted & (1 << (cap % 32)) != 0 {
+                libc::prctl(
+                    libc::PR_CAP_AMBIENT,
+                    libc::PR_CAP_AMBIENT_RAISE as libc::c_ulong,
+                    cap as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -219,5 +286,26 @@ mod tests {
         assert_eq!(got.local_addr().unwrap(), addr_b);
         assert!(take_udp("t-udp", addr_b).is_none(), "taken once");
         let _ = addr;
+    }
+
+    /// Whatever capabilities the process holds end up ambient, so an `exec`
+    /// keeps them. Without any (an ordinary test run) it's a no-op.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capabilities_held_are_kept_for_the_next_image() {
+        keep_capabilities();
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix(name))
+                .map(|v| u64::from_str_radix(v.trim(), 16).unwrap())
+                .unwrap()
+        };
+        let (permitted, ambient) = (field("CapPrm:"), field("CapAmb:"));
+        // Root holds every capability, and may not raise them all.
+        if permitted != 0 && field("CapBnd:") != permitted {
+            assert_eq!(ambient & permitted, permitted);
+        }
     }
 }
