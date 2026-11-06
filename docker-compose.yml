@@ -10,7 +10,7 @@
 # Then point your router's DHCP DNS at this host and open http://fe.te
 services:
   ferrite:
-    image: ghcr.io/syntlyx/ferrite-server:latest
+    image: ghcr.io/koroblabs/ferrite-server:latest
     container_name: ferrite
     restart: unless-stopped
     network_mode: host
@@ -31,7 +31,7 @@ volumes:
 #
 # services:
 #   ferrite:
-#     image: ghcr.io/syntlyx/ferrite-server:latest
+#     image: ghcr.io/koroblabs/ferrite-server:latest
 #     container_name: ferrite
 #     restart: unless-stopped
 #     ports:

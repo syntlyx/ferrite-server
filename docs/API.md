@@ -1490,7 +1490,7 @@ URL; DNS A records cannot encode a non-80 web UI port.
 
 ### `GET /api/update/check` — check for new versions
 
-Queries GitHub releases for both the server binary (`syntlyx/ferrite-server`) and the web UI package (`syntlyx/ferrite-web`). Version labels are kept for display, but update availability also considers the GitHub release asset digest (`sha256:<hex>`). The release workflow publishes package archives and `.sha256` sidecars so checks can still verify artifacts when GitHub's release API digest is unavailable.
+Queries GitHub releases for both the server binary (`koroblabs/ferrite-server`) and the web UI package (`koroblabs/ferrite-web`). Version labels are kept for display, but update availability also considers the GitHub release asset digest (`sha256:<hex>`). The release workflow publishes package archives and `.sha256` sidecars so checks can still verify artifacts when GitHub's release API digest is unavailable.
 
 Web UI releases also publish `dist.manifest.json` with a `server_compat` range.
 Ferrite only offers the newest web release compatible with the running server.
@@ -1516,7 +1516,7 @@ repos or higher API limits.
   "current_web_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "server_update": {
     "version": "0.2.0",
-    "download_url": "https://github.com/syntlyx/ferrite-server/releases/download/v0.2.0/ferrite-v0.2.0-x86_64-unknown-linux-musl.tar.gz",
+    "download_url": "https://github.com/koroblabs/ferrite-server/releases/download/v0.2.0/ferrite-v0.2.0-x86_64-unknown-linux-musl.tar.gz",
     "release_notes": "...",
     "sha256": "6a9f..."
   },

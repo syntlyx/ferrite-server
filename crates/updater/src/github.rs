@@ -5,7 +5,7 @@ use crate::checksum;
 use ferrite_core::error::{FeriteError, Result};
 
 pub const RELEASE_API_BASE: &str = "https://api.github.com";
-pub const RELEASE_OWNER: &str = "syntlyx";
+pub const RELEASE_OWNER: &str = "koroblabs";
 pub const RELEASE_REPO_SERVER: &str = "ferrite-server";
 pub const RELEASE_REPO_WEB: &str = "ferrite-web";
 
@@ -380,16 +380,16 @@ mod tests {
     fn parses_latest_release_redirect_location() {
         assert_eq!(
             latest_tag_from_location(
-                "https://github.com/syntlyx/ferrite-server/releases/tag/v0.1.0"
+                "https://github.com/koroblabs/ferrite-server/releases/tag/v0.1.0"
             )
             .as_deref(),
             Some("v0.1.0")
         );
         assert_eq!(
-            latest_tag_from_location("/syntlyx/ferrite-server/releases/tag/v0.1.1").as_deref(),
+            latest_tag_from_location("/koroblabs/ferrite-server/releases/tag/v0.1.1").as_deref(),
             Some("v0.1.1")
         );
-        assert!(latest_tag_from_location("/syntlyx/ferrite-server/releases").is_none());
+        assert!(latest_tag_from_location("/koroblabs/ferrite-server/releases").is_none());
     }
 
     #[test]

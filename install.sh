@@ -3,10 +3,10 @@
 # Downloads pre-built Linux binaries from GitHub Releases and sets up the system service.
 #
 # Usage (Linux, run as root):
-#   curl -fsSL https://raw.githubusercontent.com/syntlyx/ferrite-server/main/install.sh | sudo sh
+#   curl -fsSL https://raw.githubusercontent.com/koroblabs/ferrite-server/main/install.sh | sudo sh
 #
 # Or download and inspect first:
-#   curl -fsSL https://raw.githubusercontent.com/syntlyx/ferrite-server/main/install.sh -o install.sh
+#   curl -fsSL https://raw.githubusercontent.com/koroblabs/ferrite-server/main/install.sh -o install.sh
 #   sudo sh install.sh
 
 set -eu
@@ -15,7 +15,7 @@ set -eu
 
 GITHUB_BASE_URL="${GITHUB_BASE_URL:-https://github.com}"
 GITHUB_API_BASE="${GITHUB_API_BASE:-https://api.github.com}"
-GITHUB_OWNER="${GITHUB_OWNER:-syntlyx}"
+GITHUB_OWNER="${GITHUB_OWNER:-koroblabs}"
 GITHUB_REPO_SERVER="${GITHUB_REPO_SERVER:-ferrite-server}"
 GITHUB_REPO_WEB="${GITHUB_REPO_WEB:-ferrite-web}"
 

@@ -6,7 +6,7 @@ FROM alpine:${ALPINE_VERSION}
 
 LABEL org.opencontainers.image.title="ferrite" \
       org.opencontainers.image.description="Self-hosted DNS that blocks ads & trackers and routes chosen domains or devices through WireGuard, SOCKS5/Tor, or DPI evasion" \
-      org.opencontainers.image.source="https://github.com/syntlyx/ferrite-server" \
+      org.opencontainers.image.source="https://github.com/koroblabs/ferrite-server" \
       org.opencontainers.image.licenses="MIT"
 
 RUN apk add --no-cache ca-certificates curl libcap su-exec tar tini && \

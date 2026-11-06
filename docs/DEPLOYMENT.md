@@ -7,14 +7,14 @@ Operator-level detail that the [README](../README.md) keeps out of the way.
 Images are published to GitHub Container Registry, not Docker Hub:
 
 ```bash
-docker pull ghcr.io/syntlyx/ferrite-server:latest
+docker pull ghcr.io/koroblabs/ferrite-server:latest
 
 docker run -d --name ferrite \
   --restart unless-stopped \
   -p 53:53/tcp -p 53:53/udp \
   -p 80:80/tcp \
   -v ferrite-data:/var/lib/ferrite \
-  ghcr.io/syntlyx/ferrite-server:latest
+  ghcr.io/koroblabs/ferrite-server:latest
 ```
 
 - Docker publishes TCP and UDP with separate rules — keep both DNS rules on the
@@ -83,7 +83,7 @@ binary replace.
 Re-run the installer to update a source/macOS/root-owned install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/syntlyx/ferrite-server/main/install.sh | sudo sh
+curl -fsSL https://raw.githubusercontent.com/koroblabs/ferrite-server/main/install.sh | sudo sh
 ```
 
 ## Updates

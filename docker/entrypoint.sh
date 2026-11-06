@@ -3,7 +3,7 @@ set -eu
 
 GITHUB_BASE_URL="${GITHUB_BASE_URL:-https://github.com}"
 GITHUB_API_BASE="${GITHUB_API_BASE:-https://api.github.com}"
-GITHUB_OWNER="${GITHUB_OWNER:-syntlyx}"
+GITHUB_OWNER="${GITHUB_OWNER:-koroblabs}"
 GITHUB_REPO_SERVER="${GITHUB_REPO_SERVER:-ferrite-server}"
 GITHUB_REPO_WEB="${GITHUB_REPO_WEB:-ferrite-web}"
 FERRITE_SERVER_VERSION="${FERRITE_SERVER_VERSION:-latest}"

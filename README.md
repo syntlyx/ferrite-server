@@ -94,13 +94,13 @@ a Docker image, and an Unraid template.
 
 ## Screenshots
 
-> Images live in the [web UI repo](https://github.com/syntlyx/ferrite-web/tree/main/screenshots).
+> Images live in the [web UI repo](https://github.com/koroblabs/ferrite-web/tree/main/screenshots).
 
-![Dashboard](https://raw.githubusercontent.com/syntlyx/ferrite-web/main/screenshots/dashboard.png)
-![Profiles](https://raw.githubusercontent.com/syntlyx/ferrite-web/main/screenshots/profiles.png)
-![Device panel](https://raw.githubusercontent.com/syntlyx/ferrite-web/main/screenshots/device.png)
-![Tunnels](https://raw.githubusercontent.com/syntlyx/ferrite-web/main/screenshots/tunnels.png)
-![Encrypted DNS](https://raw.githubusercontent.com/syntlyx/ferrite-web/main/screenshots/encrypted-dns.png)
+![Dashboard](https://raw.githubusercontent.com/koroblabs/ferrite-web/main/screenshots/dashboard.png)
+![Profiles](https://raw.githubusercontent.com/koroblabs/ferrite-web/main/screenshots/profiles.png)
+![Device panel](https://raw.githubusercontent.com/koroblabs/ferrite-web/main/screenshots/device.png)
+![Tunnels](https://raw.githubusercontent.com/koroblabs/ferrite-web/main/screenshots/tunnels.png)
+![Encrypted DNS](https://raw.githubusercontent.com/koroblabs/ferrite-web/main/screenshots/encrypted-dns.png)
 
 ## Privacy
 
@@ -180,7 +180,7 @@ listener ports **hot-reload** — no restart.
 ```yaml
 services:
   ferrite:
-    image: ghcr.io/syntlyx/ferrite-server:latest
+    image: ghcr.io/koroblabs/ferrite-server:latest
     container_name: ferrite
     restart: unless-stopped
     network_mode: host          # so ferrite sees real client IPs (see note below)
@@ -198,7 +198,7 @@ docker run -d --name ferrite \
   --network host \
   --cap-add=NET_BIND_SERVICE \
   -v ferrite-data:/var/lib/ferrite \
-  ghcr.io/syntlyx/ferrite-server:latest
+  ghcr.io/koroblabs/ferrite-server:latest
 ```
 
 **Static binary.** Every release ships musl binaries for `x86_64` and `aarch64`
@@ -206,7 +206,7 @@ with a `.sha256` next to each, so you can verify before running anything:
 
 ```bash
 VER=v0.2.0; ARCH=$(uname -m)-unknown-linux-musl
-BASE=https://github.com/syntlyx/ferrite-server/releases/download/$VER
+BASE=https://github.com/koroblabs/ferrite-server/releases/download/$VER
 curl -fsSLO $BASE/ferrite-$VER-$ARCH.tar.gz
 curl -fsSL  $BASE/ferrite-$VER-$ARCH.tar.gz.sha256 | sha256sum -c -
 tar -xzf ferrite-$VER-$ARCH.tar.gz && sudo install -m755 ferrite /usr/local/bin/ferrite
@@ -216,7 +216,7 @@ tar -xzf ferrite-$VER-$ARCH.tar.gz && sudo install -m755 ferrite /usr/local/bin/
 Read it before you run it; it is not piped into a shell here on purpose:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/syntlyx/ferrite-server/main/install.sh
+curl -fsSLO https://raw.githubusercontent.com/koroblabs/ferrite-server/main/install.sh
 less install.sh          # see what it does
 sudo sh install.sh
 ```
@@ -465,7 +465,7 @@ configured. The full reference is [docs/API.md](docs/API.md); the main groups:
 - **Deployment & Docker, updates, service install** → [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
 - **Build from source, the CI gate, contributing** → [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)
 - **Full guide & API reference** → [ferrite.me/docs](https://ferrite.me/docs.html) · [ferrite.me/api](https://ferrite.me/api.html)
-- **Web UI** → [ferrite-web](https://github.com/syntlyx/ferrite-web)
+- **Web UI** → [ferrite-web](https://github.com/koroblabs/ferrite-web)
 
 ## Data files
 

@@ -68,7 +68,7 @@ git diff --check
 
 ## Web UI
 
-The web UI lives in a separate repo, [ferrite-web](https://github.com/syntlyx/ferrite-web)
+The web UI lives in a separate repo, [ferrite-web](https://github.com/koroblabs/ferrite-web)
 (React + Vite + Tailwind). During frontend work, point a running ferrite at your
 local build output instead of redeploying:
 
