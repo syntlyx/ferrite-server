@@ -147,19 +147,26 @@ impl LiveStats {
     }
 
     /// Reset all in-memory stats to zero. Called when the query log is cleared via the API.
+    ///
+    /// Goes through [`LiveStats::forget_history`] and [`LiveStats::forget_recent`]
+    /// rather than listing the structures again: a hand-kept second list once
+    /// missed `client_blocked`, so after a clear each device's total restarted
+    /// from zero while its blocked count kept all history, and the dashboard
+    /// showed blocked shares in the thousands of percent.
     pub fn reset_all(&self) {
-        self.total_queries.store(0, Ordering::Relaxed);
-        self.total_blocked.store(0, Ordering::Relaxed);
-        self.total_allowed.store(0, Ordering::Relaxed);
-        self.total_cached.store(0, Ordering::Relaxed);
-        self.total_upstream.store(0, Ordering::Relaxed);
-        self.total_routed.store(0, Ordering::Relaxed);
-        self.total_dropped.store(0, Ordering::Relaxed);
-        self.top_domains.clear();
-        self.top_blocked.clear();
-        self.top_clients.clear();
-        self.recent_queries.clear();
-        self.timeseries.clear();
+        for counter in [
+            &self.total_queries,
+            &self.total_blocked,
+            &self.total_allowed,
+            &self.total_cached,
+            &self.total_upstream,
+            &self.total_routed,
+            &self.total_dropped,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+        self.forget_history();
+        self.forget_recent();
     }
 
     pub fn total(&self) -> u64 {
@@ -247,6 +254,24 @@ mod tests {
         assert_eq!(live.client_blocked.get(device), 1);
         live.forget_history();
         assert_eq!(live.client_blocked.get(device), 0);
+    }
+
+    /// Clearing the query log empties every per-device counter together, so a
+    /// device's blocked count can never outlive its total and read above 100%.
+    #[test]
+    fn reset_all_clears_every_per_device_counter() {
+        let live = push_with(RecordScope::ALL);
+        live.record_query(QueryStatus::Blocked);
+        let device = "aa:bb:cc:dd:ee:ff";
+        assert_eq!(live.client_blocked.get(device), 1);
+        live.reset_all();
+        assert_eq!(live.top_clients.get(device), 0);
+        assert_eq!(live.client_blocked.get(device), 0);
+        assert!(live.top_domains.top(10).is_empty());
+        assert!(live.top_blocked.top(10).is_empty());
+        assert!(live.recent_queries.recent(10).is_empty());
+        assert!(live.timeseries.buckets_24h().iter().all(|b| b.total == 0));
+        assert_eq!(live.total(), 0);
     }
 
     #[test]
