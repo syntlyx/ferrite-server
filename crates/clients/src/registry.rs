@@ -204,6 +204,20 @@ impl ClientRegistry {
         self.id_owners.get(device).map(|k| k.clone())
     }
 
+    /// The MACs whose learned name — the one a device gave itself over DHCP,
+    /// PTR or mDNS, not an alias — `matches`, sorted. A phone with private
+    /// Wi-Fi addresses has several under one name.
+    pub fn macs_named(&self, matches: impl Fn(&str) -> bool) -> Vec<String> {
+        let mut macs: Vec<String> = self
+            .mac_to_name
+            .iter()
+            .filter(|e| matches(&e.value().0))
+            .map(|e| format_mac(e.key()))
+            .collect();
+        macs.sort();
+        macs
+    }
+
     /// The MAC of the client `device` was set up for, when it has one: what
     /// its profile, bypass and routing rules are keyed by, wherever it asks
     /// from.

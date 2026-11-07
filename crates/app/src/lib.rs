@@ -329,7 +329,8 @@ impl AppState {
     /// Bring encrypted DNS in line with the live config — after its own
     /// settings change, or Tunnels' port does.
     pub async fn apply_secure_dns(&self) {
-        if self.tidy_device_owners() {
+        let learned = self.learned_device_owners().await;
+        if self.tidy_device_owners(&learned) {
             self.persist_config().await;
         }
         let (cfg, records) = {
@@ -428,11 +429,56 @@ impl AppState {
         self.apply_secure_dns().await;
     }
 
+    /// For each encrypted DNS device without an owner, a client its name could
+    /// have been made from by the name that client gave itself (DHCP, PTR,
+    /// mDNS) rather than one you gave it: a phone nobody named in Clients is
+    /// still in there under what it told the router. Of several MACs under
+    /// that name — a phone's private Wi-Fi addresses — the one that asked
+    /// last.
+    async fn learned_device_owners(&self) -> std::collections::BTreeMap<String, String> {
+        use ferrite_core::net::{device_label, labelled_device};
+        let unowned: Vec<String> = {
+            let live = self.live_config.read();
+            let sd = &live.secure_dns;
+            sd.devices
+                .iter()
+                .filter(|id| !sd.owners.contains_key(*id))
+                .cloned()
+                .collect()
+        };
+        let mut found = std::collections::BTreeMap::new();
+        for id in unowned {
+            let macs = self.inner.client_registry.macs_named(|name| {
+                labelled_device(std::slice::from_ref(&id), &device_label(name)).is_some()
+            });
+            let mut last: Option<(i64, String)> = None;
+            for mac in macs {
+                let seen = self
+                    .inner
+                    .storage
+                    .client_stats(std::slice::from_ref(&mac))
+                    .await
+                    .ok()
+                    .flatten()
+                    .map_or(0, |s| s.last_seen);
+                if last.as_ref().is_none_or(|(t, _)| seen > *t) {
+                    last = Some((seen, mac));
+                }
+            }
+            if let Some((_, mac)) = last {
+                found.insert(id, mac);
+            }
+        }
+        found
+    }
+
     /// Keep `[secure_dns] owners` in line with the device list: a device
     /// that's gone loses its owner, and one without an owner — set up before
-    /// owners were kept — gets the client its name was made from (`pixel-k7f3`
-    /// from the client named "Pixel"). True when it changed.
-    fn tidy_device_owners(&self) -> bool {
+    /// owners were kept, or added by name in Settings — gets the client its
+    /// name was made from (`pixel-k7f3` from the client named "Pixel"): one
+    /// you named, else one that named itself (`learned`). True when it
+    /// changed.
+    fn tidy_device_owners(&self, learned: &std::collections::BTreeMap<String, String>) -> bool {
         use ferrite_core::net::{device_label, labelled_device, normalize_client_key};
         let mut live = self.live_config.write();
         let aliases = live.client_aliases.clone();
@@ -454,7 +500,8 @@ impl AppState {
                         .as_deref()
                         .or(a.ip.as_deref())
                         .and_then(normalize_client_key)
-                });
+                })
+                .or_else(|| learned.get(id).cloned());
             if let Some(owner) = owner {
                 sd.owners.insert(id.clone(), owner);
             }
@@ -1363,6 +1410,98 @@ mod tests {
         assert_eq!(cfg.blocklist.domains, vec!["ads.test", "new.test"]);
         assert_eq!(cfg.client_aliases.len(), 1);
         assert_eq!(cfg.client_aliases[0].name, "Renamed in the file");
+    }
+
+    /// An encrypted DNS device set up before owners were kept, for a phone
+    /// nobody named in Clients, still joins that phone's row: its owner is
+    /// the MAC the phone's own name is on — of its private addresses the one
+    /// that asked last. A name you gave a client still wins, and a device no
+    /// client's name fits stays without one.
+    #[tokio::test]
+    async fn a_device_without_an_owner_finds_the_client_that_named_itself() {
+        let (state, db, config_path) =
+            crate::test_support::app_state_with_config_path("app-learned-owner").await;
+        let registry = &state.inner.client_registry;
+        let old_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let new_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+        let kid_alias = "aa:bb:cc:dd:ee:02";
+        let kid_learned = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x03];
+        registry
+            .record_dhcp_lease(
+                old_mac,
+                "192.168.1.155".parse().unwrap(),
+                Some("Galaxy-M31".into()),
+            )
+            .await;
+        registry
+            .record_dhcp_lease(
+                new_mac,
+                "192.168.1.156".parse().unwrap(),
+                Some("Galaxy-M31".into()),
+            )
+            .await;
+        registry
+            .record_dhcp_lease(
+                kid_learned,
+                "192.168.1.157".parse().unwrap(),
+                Some("kid".into()),
+            )
+            .await;
+
+        // The newer address asked last.
+        let ts = chrono::Utc::now().timestamp();
+        let asked = |at: i64, mac: [u8; 6]| QueryEntry {
+            device: ferrite_core::net::format_mac(&mac),
+            ..query_entry(at, "site.test", "192.168.1.155", QueryStatus::Upstream)
+        };
+        state
+            .inner
+            .storage
+            .write_batch(
+                vec![
+                    asked(ts - 7200, old_mac),
+                    asked(ts - 60, new_mac),
+                    asked(ts - 3600, old_mac),
+                ],
+                ferrite_core::recording::RecordScope::ALL,
+            )
+            .await
+            .unwrap();
+
+        {
+            let mut live = state.live_config.write();
+            live.client_aliases.push(ClientAliasConfig {
+                ip: None,
+                mac: Some(kid_alias.into()),
+                name: "Kid".into(),
+            });
+            live.secure_dns.devices = vec![
+                "galaxy-m31-ab12".into(),
+                "kid-cd34".into(),
+                "tv-ef56".into(),
+            ];
+        }
+        state.apply_secure_dns().await;
+
+        let owners = state.live_config.read().secure_dns.owners.clone();
+        assert_eq!(
+            owners.get("galaxy-m31-ab12").map(String::as_str),
+            Some("02:00:00:00:00:02")
+        );
+        assert_eq!(owners.get("kid-cd34").map(String::as_str), Some(kid_alias));
+        assert!(!owners.contains_key("tv-ef56"), "{owners:?}");
+        // One row in Clients: the device is called what the phone is.
+        assert_eq!(
+            registry
+                .describe_device("id:galaxy-m31-ab12")
+                .name
+                .as_deref(),
+            Some("Galaxy-M31")
+        );
+
+        drop(state);
+        crate::test_support::cleanup_sqlite(&db);
+        let _ = std::fs::remove_file(&config_path);
     }
 
     fn query_entry(ts: i64, domain: &str, client_ip: &str, status: QueryStatus) -> QueryEntry {
